@@ -5,7 +5,7 @@ from pathlib import Path
 # Find the root Mairon project directory
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# Mairon's private runtime data will live here
+# Mairon's private runtime data
 DATA_DIR = PROJECT_ROOT / "data"
 DB_PATH = DATA_DIR / "mairon.db"
 
@@ -46,7 +46,7 @@ def save_memory(memory):
     }
 
 
-def search_memories(query, limit=5):
+def list_memories():
     init_memory_db()
 
     with sqlite3.connect(DB_PATH) as connection:
@@ -58,6 +58,21 @@ def search_memories(query, limit=5):
             """
         ).fetchall()
 
+    return [
+        {
+            "id": memory_id,
+            "memory": memory,
+            "created_at": created_at
+        }
+        for memory_id, memory, created_at in rows
+    ]
+
+
+def search_memories(query, limit=5):
+    init_memory_db()
+
+    memories = list_memories()
+
     search_terms = [
         word.lower().strip(".,!?")
         for word in query.split()
@@ -66,8 +81,8 @@ def search_memories(query, limit=5):
 
     matches = []
 
-    for memory_id, memory, created_at in rows:
-        memory_lower = memory.lower()
+    for item in memories:
+        memory_lower = item["memory"].lower()
 
         score = sum(
             term in memory_lower
@@ -77,9 +92,7 @@ def search_memories(query, limit=5):
         if score > 0:
             matches.append(
                 {
-                    "id": memory_id,
-                    "memory": memory,
-                    "created_at": created_at,
+                    **item,
                     "score": score
                 }
             )
@@ -90,3 +103,34 @@ def search_memories(query, limit=5):
     )
 
     return matches[:limit]
+
+
+def delete_memory(query):
+    matches = search_memories(query)
+
+    if len(matches) == 0:
+        return {
+            "success": False,
+            "message": "No matching memory was found."
+        }
+
+    if len(matches) > 1:
+        return {
+            "success": False,
+            "message": "Multiple memories matched. Nothing was deleted.",
+            "matches": matches
+        }
+
+    memory_to_delete = matches[0]
+
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            "DELETE FROM memories WHERE id = ?",
+            (memory_to_delete["id"],)
+        )
+
+    return {
+        "success": True,
+        "message": "Memory deleted.",
+        "deleted_memory": memory_to_delete["memory"]
+    }

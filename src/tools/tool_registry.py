@@ -1,4 +1,9 @@
-from memory.memory_store import save_memory, search_memories
+from memory.memory_store import (
+    delete_memory,
+    list_memories,
+    save_memory,
+    search_memories,
+)
 from tools.desktop_tools import launch_application
 from tools.system_tools import get_system_info
 
@@ -87,6 +92,42 @@ TOOLS = [
             "additionalProperties": False
         },
         "strict": True
+    },
+    {
+        "type": "function",
+        "name": "list_memories",
+        "description": (
+            "List all information currently stored in Mairon's persistent local memory. "
+            "Use this when Oliver explicitly asks what Mairon remembers or has stored about him."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False
+        },
+        "strict": True
+    },
+    {
+        "type": "function",
+        "name": "delete_memory",
+        "description": (
+            "Delete a persistent memory that Oliver explicitly asks Mairon to forget. "
+            "The deletion system is conservative and will not delete anything when multiple "
+            "memories match the request."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Description of the memory Oliver explicitly wants forgotten."
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False
+        },
+        "strict": True
     }
 ]
 
@@ -105,5 +146,11 @@ def execute_tool(tool_name, arguments=None):
 
     if tool_name == "search_memory":
         return search_memories(arguments["query"])
+
+    if tool_name == "list_memories":
+        return list_memories()
+
+    if tool_name == "delete_memory":
+        return delete_memory(arguments["query"])
 
     raise ValueError(f"Unknown tool: {tool_name}")

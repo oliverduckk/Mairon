@@ -23,4 +23,3 @@ def launch_application(app_name):
         "message": f"Launched {app_name}."
     }
 
-print(launch_application("powershell"))

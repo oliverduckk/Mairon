@@ -64,6 +64,9 @@ Persistent memory:
 - When Oliver asks about a personal fact, preference, or information that may have been saved previously, search persistent memory before saying that you do not know.
 - If persistent memory contains no relevant result, say that you do not remember rather than inventing an answer.
 - Do not claim that something has been saved unless the memory tool successfully saves it.
+
+- When Oliver asks what you remember about him, use the persistent memory tools rather than relying only on the current conversation.
+- Only delete persistent information when Oliver explicitly asks you to forget or delete it. If deletion is ambiguous, do not guess.
 """
 
 
