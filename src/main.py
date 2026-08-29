@@ -3,7 +3,11 @@ import os
 from dotenv import load_dotenv
 
 from ai.provider import create_provider
-from core.router import route_message
+from core.router import (
+    approve_cloud_escalation,
+    decline_cloud_escalation,
+    route_message,
+)
 
 
 # --------------------------------------------------
@@ -13,13 +17,12 @@ from core.router import route_message
 load_dotenv()
 
 api_key = os.getenv("OPENAI_API_KEY")
-
+input_name = os.getenv("MAIRON_USER_NAME")
 
 # --------------------------------------------------
 # AI providers
 # --------------------------------------------------
 
-# Mairon's local AI is the default and must be available.
 try:
     local_ai = create_provider("ollama")
 except Exception as error:
@@ -27,7 +30,6 @@ except Exception as error:
     raise SystemExit
 
 
-# Cloud AI is optional.
 cloud_ai = None
 
 if api_key:
@@ -57,7 +59,10 @@ print()
 # User
 # --------------------------------------------------
 
-input_name = input("What is your name? ").strip()
+input_name = os.getenv("MAIRON_USER_NAME")
+
+if not input_name:
+    input_name = input("What is your name? ").strip()
 
 print(f"Good evening, {input_name}.\n")
 
@@ -105,6 +110,8 @@ Safety and accuracy:
   prioritise clear and accurate communication over humour.
 - Do not invent facts simply to provide an answer.
 - If you genuinely do not know something, say so.
+- Do not claim to observe things you cannot actually observe. You may make playful
+  guesses, but clearly treat them as guesses rather than facts.
 
 Capabilities:
 - Never claim or suggest that you can perform an action unless one of your currently
@@ -114,6 +121,10 @@ Capabilities:
   do it.
 - Never pretend that a tool succeeded when it did not.
 - The availability of a real tool determines what actions you can perform.
+- Do not mention, advertise, or offer tools unless they are genuinely relevant to the
+  current conversation or the user has asked for an action that a tool can perform.
+- Do not force available capabilities into casual conversation simply because you
+  have access to them.
 
 Persistent memory:
 - Only save information to persistent memory when {input_name} explicitly asks you
@@ -130,6 +141,22 @@ Persistent memory:
 - Only delete persistent information when {input_name} explicitly asks you to forget
   or delete it.
 - If a memory deletion request is ambiguous, do not guess.
+
+Cloud processing:
+- Local processing is the default.
+- Cloud processing requires explicit approval from {input_name}.
+- You may request cloud escalation when a task is genuinely beyond what you can
+  confidently handle locally and a stronger model would materially improve the result.
+- Do not request cloud processing for ordinary questions, casual conversation,
+  normal explanations, routine coding help, memory operations, or device-control tasks.
+- Requesting cloud escalation does not grant you permission to use the cloud.
+- Never claim that cloud processing has occurred unless Mairon Core actually performs it.
+- You can never authorise cloud processing yourself.
+- You may only request permission to use cloud processing.
+- If cloud permission is denied, accept the decision and continue locally without
+  claiming that you will escalate automatically.
+- Say that you can request cloud processing, never that you will use or trigger it
+  without approval.
 """
 
 
@@ -137,8 +164,6 @@ Persistent memory:
 # Conversation state
 # --------------------------------------------------
 
-# Local and cloud providers intentionally maintain separate
-# short-term conversation histories.
 local_state = None
 cloud_state = None
 
@@ -157,7 +182,7 @@ while True:
         print("Mairon: Shutting down.")
         break
 
-    answer, local_state, cloud_state = route_message(
+    result = route_message(
         user_input,
         local_ai,
         cloud_ai,
@@ -166,4 +191,40 @@ while True:
         cloud_state
     )
 
-    print(f"Mairon: {answer}\n")
+    local_state = result.local_state
+    cloud_state = result.cloud_state
+
+    # --------------------------------------------------
+    # Human approval required
+    # --------------------------------------------------
+
+    if result.status == "cloud_approval_required":
+        print()
+        print("[Router] Mairon recommends cloud processing.")
+        print(f"Reason: {result.reason}")
+        print()
+
+        approval = input("Use GPT-5.6 Luna? [y/N]: ").strip().lower()
+
+        if approval in ("y", "yes"):
+            result = approve_cloud_escalation(
+                result.pending_prompt,
+                cloud_ai,
+                mairon_instructions,
+                local_state,
+                cloud_state
+            )
+
+        else:
+            result = decline_cloud_escalation(
+                result.pending_prompt,
+                local_ai,
+                mairon_instructions,
+                local_state,
+                cloud_state
+            )
+
+        local_state = result.local_state
+        cloud_state = result.cloud_state
+
+    print(f"Mairon: {result.answer}\n")

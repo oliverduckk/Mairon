@@ -12,7 +12,13 @@ def create_client(api_key):
     return OpenAI(api_key=api_key)
 
 
-def get_response(client, user_input, instructions, previous_response_id=None):
+def get_response(
+    client,
+    user_input,
+    instructions,
+    previous_response_id=None,
+    allow_cloud_escalation=False
+):
     response = client.responses.create(
         model=MODEL,
         instructions=instructions,
@@ -48,6 +54,6 @@ def get_response(client, user_input, instructions, previous_response_id=None):
                 ]
             )
 
-            return final_response.output_text, final_response.id
+            return final_response.output_text, final_response.id, None
 
-    return response.output_text, response.id
+    return response.output_text, response.id, None
