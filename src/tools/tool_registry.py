@@ -1,3 +1,4 @@
+from memory.memory_store import save_memory, search_memories
 from tools.desktop_tools import launch_application
 from tools.system_tools import get_system_info
 
@@ -42,6 +43,50 @@ TOOLS = [
             "additionalProperties": False
         },
         "strict": True
+    },
+    {
+        "type": "function",
+        "name": "save_memory",
+        "description": (
+            "Save information into Mairon's persistent local memory. "
+            "Only use this when Oliver explicitly asks you to remember, save, or store something. "
+            "Do not save ordinary conversation, jokes, hypothetical examples, temporary information, "
+            "or facts that Oliver did not explicitly ask to remember."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory": {
+                    "type": "string",
+                    "description": (
+                        "The concise fact or information Oliver explicitly asked Mairon to remember."
+                    )
+                }
+            },
+            "required": ["memory"],
+            "additionalProperties": False
+        },
+        "strict": True
+    },
+    {
+        "type": "function",
+        "name": "search_memory",
+        "description": (
+            "Search Mairon's persistent local memory for information previously saved by Oliver. "
+            "Use this when Oliver asks about something he may have previously asked Mairon to remember."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What information to search Mairon's memory for."
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False
+        },
+        "strict": True
     }
 ]
 
@@ -54,5 +99,11 @@ def execute_tool(tool_name, arguments=None):
 
     if tool_name == "launch_application":
         return launch_application(arguments["app_name"])
+
+    if tool_name == "save_memory":
+        return save_memory(arguments["memory"])
+
+    if tool_name == "search_memory":
+        return search_memories(arguments["query"])
 
     raise ValueError(f"Unknown tool: {tool_name}")
