@@ -4,8 +4,10 @@ from memory.memory_store import (
     save_memory,
     search_memories,
 )
+
 from tools.desktop_tools import launch_application
 from tools.system_tools import get_system_info
+from tools.weather_tools import get_weather
 
 
 TOOLS = [
@@ -25,6 +27,7 @@ TOOLS = [
         },
         "strict": True
     },
+
     {
         "type": "function",
         "name": "launch_application",
@@ -49,6 +52,33 @@ TOOLS = [
         },
         "strict": True
     },
+
+    {
+        "type": "function",
+        "name": "get_weather",
+        "description": (
+            "Get live current weather and a short forecast for a real-world location "
+            "using an internet weather service. Use this when Oliver asks about current "
+            "weather, today's weather, tomorrow's weather, temperature, rain, or similar "
+            "weather information."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": (
+                        "The city or location to retrieve weather for, "
+                        "for example 'Sydney, Australia'."
+                    )
+                }
+            },
+            "required": ["location"],
+            "additionalProperties": False
+        },
+        "strict": True
+    },
+
     {
         "type": "function",
         "name": "save_memory",
@@ -73,6 +103,7 @@ TOOLS = [
         },
         "strict": True
     },
+
     {
         "type": "function",
         "name": "search_memory",
@@ -93,6 +124,7 @@ TOOLS = [
         },
         "strict": True
     },
+
     {
         "type": "function",
         "name": "list_memories",
@@ -108,6 +140,7 @@ TOOLS = [
         },
         "strict": True
     },
+
     {
         "type": "function",
         "name": "delete_memory",
@@ -140,6 +173,9 @@ def execute_tool(tool_name, arguments=None):
 
     if tool_name == "launch_application":
         return launch_application(arguments["app_name"])
+
+    if tool_name == "get_weather":
+        return get_weather(arguments["location"])
 
     if tool_name == "save_memory":
         return save_memory(arguments["memory"])
