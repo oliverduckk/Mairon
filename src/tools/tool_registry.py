@@ -9,7 +9,7 @@ from tools.desktop_tools import launch_application
 from tools.route_tools import get_route
 from tools.system_tools import get_system_info
 from tools.weather_tools import get_weather
-from tools.web_tools import web_search
+from tools.web_tools import web_read, web_search
 
 
 TOOLS = [
@@ -138,11 +138,13 @@ TOOLS = [
             "Use this when Oliver asks about recent events, news, current information, "
             "software versions, documentation, product announcements, changing facts, "
             "or something that requires information beyond the model's training knowledge. "
+            "This tool returns search results and snippets. "
+            "If an exact or authoritative answer requires reading a source in detail, "
+            "use web_read on the most relevant result after searching. "
             "Do not use web search unnecessarily for stable facts that can be answered confidently "
             "without current information. "
-            "The search query is sent to an external search provider. Never include passwords, "
-            "API keys, private addresses, secret information, or private memory content in a "
-            "web search query unless Oliver has explicitly authorised that disclosure."
+            "Never include passwords, API keys, private addresses, secret information, "
+            "or private memory content in a search query unless Oliver explicitly authorises it."
         ),
         "parameters": {
             "type": "object",
@@ -185,6 +187,46 @@ TOOLS = [
                 "query",
                 "topic",
                 "time_range"
+            ],
+            "additionalProperties": False
+        },
+        "strict": True
+    },
+
+    {
+        "type": "function",
+        "name": "web_read",
+        "description": (
+            "Read and extract useful content from a specific public webpage. "
+            "Use this after web_search when a search result appears authoritative or relevant "
+            "and the actual webpage needs to be examined before answering. "
+            "Prefer official documentation, primary sources, developers, manufacturers, "
+            "government sources, or other authoritative sources when available. "
+            "Do not invent URLs. Normally use a URL obtained from web_search or explicitly "
+            "provided by Oliver. "
+            "The focus should describe the specific information being verified. "
+            "This tool is for public HTTP or HTTPS webpages only."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": (
+                        "The complete HTTP or HTTPS URL of the public webpage to read."
+                    )
+                },
+                "focus": {
+                    "type": "string",
+                    "description": (
+                        "The specific question or information to focus on while reading. "
+                        "Use an empty string if no specific focus is necessary."
+                    )
+                }
+            },
+            "required": [
+                "url",
+                "focus"
             ],
             "additionalProperties": False
         },
@@ -284,18 +326,43 @@ def execute_tool(tool_name, arguments=None):
         return get_system_info()
 
     if tool_name == "launch_application":
-        return launch_application(arguments["app_name"])
+        app_name = arguments.get("app_name")
+
+        if not app_name:
+            return {
+                "success": False,
+                "message": "No application name was provided."
+            }
+
+        return launch_application(app_name)
 
     if tool_name == "get_weather":
-        return get_weather(arguments["location"])
+        location = arguments.get("location")
+
+        if not location:
+            return {
+                "success": False,
+                "message": "No weather location was provided."
+            }
+
+        return get_weather(location)
 
     if tool_name == "get_route":
-        origin = arguments["origin"]
-        destination = arguments["destination"]
-        mode = arguments["mode"]
+        origin = arguments.get("origin")
+        destination = arguments.get("destination")
+        mode = arguments.get("mode")
 
-        # Any home → public transport journey requires
-        # driving to a transit interchange first.
+        if not origin or not destination or not mode:
+            return {
+                "success": False,
+                "message": (
+                    "Route request is missing an origin, "
+                    "destination, or travel mode."
+                )
+            }
+
+        # Any public transport journey beginning from home
+        # requires driving to a transit interchange first.
         if (
             origin.lower().strip() == "home"
             and mode == "transit"
@@ -309,28 +376,99 @@ def execute_tool(tool_name, arguments=None):
         )
 
     if tool_name == "web_search":
-        time_range = arguments["time_range"]
+        query = arguments.get("query")
+
+        if not query:
+            return {
+                "success": False,
+                "message": "No web search query was provided."
+            }
+
+        topic = arguments.get(
+            "topic",
+            "general"
+        )
+
+        time_range = arguments.get(
+            "time_range",
+            "none"
+        )
 
         if time_range == "none":
             time_range = None
 
         return web_search(
-            query=arguments["query"],
-            topic=arguments["topic"],
+            query=query,
+            topic=topic,
             time_range=time_range,
             max_results=5
         )
 
+    if tool_name == "web_read":
+        url = arguments.get("url")
+
+        if not url:
+            return {
+                "success": False,
+                "message": "No webpage URL was provided."
+            }
+
+        # Models may omit focus despite the schema requesting it.
+        # Treat a missing or empty focus as a general page read
+        # instead of crashing Mairon.
+        focus = arguments.get(
+            "focus",
+            ""
+        )
+
+        if isinstance(focus, str):
+            focus = focus.strip()
+
+        if not focus:
+            focus = None
+
+        return web_read(
+            url=url,
+            focus=focus
+        )
+
     if tool_name == "save_memory":
-        return save_memory(arguments["memory"])
+        memory = arguments.get("memory")
+
+        if not memory:
+            return {
+                "success": False,
+                "message": "No memory content was provided."
+            }
+
+        return save_memory(memory)
 
     if tool_name == "search_memory":
-        return search_memories(arguments["query"])
+        query = arguments.get("query")
+
+        if not query:
+            return {
+                "success": False,
+                "message": "No memory search query was provided."
+            }
+
+        return search_memories(query)
 
     if tool_name == "list_memories":
         return list_memories()
 
     if tool_name == "delete_memory":
-        return delete_memory(arguments["query"])
+        query = arguments.get("query")
 
-    raise ValueError(f"Unknown tool: {tool_name}")
+        if not query:
+            return {
+                "success": False,
+                "message": "No memory deletion query was provided."
+            }
+
+        return delete_memory(query)
+
+    return {
+        "success": False,
+        "message": f"Unknown tool: {tool_name}"
+    }

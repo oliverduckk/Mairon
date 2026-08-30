@@ -23,6 +23,15 @@ VALID_TIME_RANGES = {
 }
 
 
+def create_client():
+    if not TAVILY_API_KEY:
+        return None
+
+    return TavilyClient(
+        api_key=TAVILY_API_KEY
+    )
+
+
 def web_search(
     query,
     topic="general",
@@ -30,26 +39,15 @@ def web_search(
     max_results=5
 ):
     """
-    Search the live web using Tavily.
+    Search the live public web using Tavily.
 
-    Supported topics:
-        general
-        news
-        finance
-
-    Supported time ranges:
-        None
-        day
-        week
-        month
-        year
-
-    The function deliberately returns search evidence rather than
-    asking Tavily to generate an answer. Mairon's AI provider should
-    reason over the returned sources itself.
+    Returns search evidence for Mairon's AI provider
+    to reason over. Tavily does not generate the final answer.
     """
 
-    if not TAVILY_API_KEY:
+    client = create_client()
+
+    if client is None:
         return {
             "success": False,
             "message": "Tavily API key is not configured."
@@ -82,15 +80,12 @@ def web_search(
                 )
             }
 
-    # Prevent the AI from requesting a ridiculous number
-    # of results and dumping half the internet into context.
-    max_results = max(1, min(int(max_results), 8))
+    max_results = max(
+        1,
+        min(int(max_results), 8)
+    )
 
     try:
-        client = TavilyClient(
-            api_key=TAVILY_API_KEY
-        )
-
         search_arguments = {
             "query": query,
             "search_depth": "basic",
@@ -122,8 +117,6 @@ def web_search(
                 "score": result.get("score"),
             }
 
-            # Tavily includes this for news results
-            # when the publication date is available.
             if result.get("published_date"):
                 cleaned_result["published_date"] = (
                     result["published_date"]
@@ -152,11 +145,128 @@ def web_search(
         }
 
 
+def web_read(
+    url,
+    focus=None
+):
+    """
+    Read content from one public webpage.
+
+    If a focus/question is supplied, Tavily returns
+    the sections most relevant to that topic rather
+    than unnecessarily retrieving the whole page.
+    """
+
+    client = create_client()
+
+    if client is None:
+        return {
+            "success": False,
+            "message": "Tavily API key is not configured."
+        }
+
+    url = url.strip()
+
+    if not url:
+        return {
+            "success": False,
+            "message": "A URL is required."
+        }
+
+    if not (
+        url.startswith("https://")
+        or url.startswith("http://")
+    ):
+        return {
+            "success": False,
+            "message": "Only HTTP or HTTPS URLs can be read."
+        }
+
+    try:
+        extract_arguments = {
+            "urls": url,
+            "extract_depth": "basic",
+            "format": "markdown",
+            "include_images": False,
+        }
+
+        if focus:
+            focus = focus.strip()
+
+            if focus:
+                extract_arguments["query"] = focus
+                extract_arguments["chunks_per_source"] = 3
+
+        response = client.extract(
+            **extract_arguments
+        )
+
+        results = response.get(
+            "results",
+            []
+        )
+
+        if not results:
+            failed_results = response.get(
+                "failed_results",
+                []
+            )
+
+            if failed_results:
+                return {
+                    "success": False,
+                    "message": (
+                        "The webpage could not be extracted."
+                    ),
+                    "details": failed_results
+                }
+
+            return {
+                "success": False,
+                "message": "No webpage content was returned."
+            }
+
+        result = results[0]
+
+        content = result.get(
+            "raw_content",
+            ""
+        )
+
+        if not content:
+            return {
+                "success": False,
+                "message": "The webpage contained no readable content."
+            }
+
+        # Hard context-size safety limit.
+        # Query-focused extraction should normally be much smaller,
+        # but this prevents huge pages from overwhelming the model.
+        MAX_CONTENT_CHARACTERS = 15000
+
+        if len(content) > MAX_CONTENT_CHARACTERS:
+            content = content[
+                :MAX_CONTENT_CHARACTERS
+            ]
+
+        return {
+            "success": True,
+            "url": result.get("url", url),
+            "focus": focus,
+            "content": content
+        }
+
+    except Exception as error:
+        return {
+            "success": False,
+            "message": f"Webpage extraction failed: {error}"
+        }
+
+
 if __name__ == "__main__":
-    result = web_search(
-        query="latest NVIDIA news",
-        topic="news",
-        time_range="week"
+    result = web_read(
+        url="https://docs.tavily.com/sdk/python/quick-start",
+        focus="What functionality does the Tavily Python SDK provide?"
     )
 
     print(result)
