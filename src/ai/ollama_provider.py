@@ -8,6 +8,15 @@ from ollama import Client
 
 from tools.tool_registry import TOOLS, execute_tool
 
+from routine.night_routine import (
+    complete_night_routine_work_location,
+    prepare_night_routine,
+)
+
+from routine.morning_routine import (
+    prepare_morning_routine,
+)
+
 
 MODEL = "qwen3:14b"
 
@@ -22,6 +31,12 @@ MAIRON_TIMEZONE = os.getenv(
 
 LOCAL_TIMEZONE = ZoneInfo(
     MAIRON_TIMEZONE
+)
+
+
+MAIRON_WEATHER_LOCATION = os.getenv(
+    "MAIRON_WEATHER_LOCATION",
+    "Sydney, Australia"
 )
 
 
@@ -71,6 +86,11 @@ def get_ollama_tool(tool_name):
 
 READ_EMAIL_ONLY_TOOL = get_ollama_tool(
     "read_email"
+)
+
+
+ROUTE_ONLY_TOOL = get_ollama_tool(
+    "get_route"
 )
 
 
@@ -189,6 +209,134 @@ def get_runtime_context():
         f"({now.strftime('%A')}) in timezone {MAIRON_TIMEZONE}. "
         "Use this when resolving relative dates and times."
     )
+
+
+# --------------------------------------------------
+# Core date resolution / isolated finalisation
+# --------------------------------------------------
+
+DATE_SCOPED_TOOLS = {
+    "get_routine_context",
+    "set_work_location",
+    "get_wake_alarm",
+    "set_wake_alarm",
+    "disable_wake_alarm",
+}
+
+
+def get_core_resolved_relative_date(
+    user_input
+):
+    """
+    Resolve simple relative day references in Core.
+
+    Qwen may suggest tool arguments, but it is not authoritative
+    for today's date. Core is. This prevents stale model knowledge
+    from producing dates such as 2023 when the runtime is in 2026.
+    """
+
+    text = user_input.lower()
+
+    today = datetime.now(
+        LOCAL_TIMEZONE
+    ).date()
+
+    if "day after tomorrow" in text:
+        return (
+            today
+            + timedelta(days=2)
+        ).isoformat()
+
+    if "tomorrow" in text:
+        return (
+            today
+            + timedelta(days=1)
+        ).isoformat()
+
+    if (
+        "today" in text
+        or "tonight" in text
+    ):
+        return today.isoformat()
+
+    return None
+
+
+def enforce_core_date_for_tool(
+    tool_name,
+    arguments,
+    user_input
+):
+    """
+    Override model-supplied dates for simple today/tomorrow requests.
+
+    Explicit absolute dates are left alone when the user did not use a
+    supported relative-day phrase.
+    """
+
+    fixed_arguments = dict(
+        arguments or {}
+    )
+
+    if tool_name not in DATE_SCOPED_TOOLS:
+        return fixed_arguments
+
+    resolved_date = (
+        get_core_resolved_relative_date(
+            user_input
+        )
+    )
+
+    if not resolved_date:
+        return fixed_arguments
+
+    supplied_date = fixed_arguments.get(
+        "date"
+    )
+
+    fixed_arguments[
+        "date"
+    ] = resolved_date
+
+    if supplied_date != resolved_date:
+        print(
+            "[Core] Corrected relative date for "
+            f"{tool_name}: {resolved_date}"
+        )
+
+    return fixed_arguments
+
+
+def get_isolated_system_context(
+    conversation
+):
+    """
+    Keep Mairon's main personality/system instructions while excluding
+    stale prior turns from deterministic workflow finalisation.
+
+    This lets Core pass fresh authoritative data to Qwen without old
+    assistant guesses competing with the current tool results.
+    """
+
+    if not conversation:
+        return []
+
+    for message in conversation:
+        if isinstance(message, dict):
+            role = message.get(
+                "role"
+            )
+        else:
+            role = getattr(
+                message,
+                "role",
+                None
+            )
+
+        if role == "system":
+            return [message]
+
+    return []
 
 
 # --------------------------------------------------
@@ -338,6 +486,1233 @@ def get_inbox_review_days(
 
 
 # --------------------------------------------------
+# Night-routine detection / workflow
+# --------------------------------------------------
+
+PENDING_NIGHT_ROUTINE_PREFIX = (
+    "MAIRON_PENDING_NIGHT_ROUTINE:"
+)
+
+RESOLVED_NIGHT_ROUTINE_PREFIX = (
+    "MAIRON_RESOLVED_NIGHT_ROUTINE:"
+)
+
+
+def get_message_role(
+    message
+):
+    """
+    Read a chat message role from either a normal dict or
+    an Ollama message object.
+    """
+
+    if isinstance(
+        message,
+        dict
+    ):
+        return message.get(
+            "role"
+        )
+
+    return getattr(
+        message,
+        "role",
+        None
+    )
+
+
+def get_message_content(
+    message
+):
+    """
+    Read message content from either a dict or an Ollama
+    message object.
+    """
+
+    if isinstance(
+        message,
+        dict
+    ):
+        return message.get(
+            "content"
+        ) or ""
+
+    return getattr(
+        message,
+        "content",
+        ""
+    ) or ""
+
+
+def is_night_routine_request(
+    user_input
+):
+    """
+    Detect phrases that explicitly mean Oliver is going
+    to bed / sleep now.
+
+    Keep this intentionally narrower than generic words
+    such as "tired" so Core does not start bedtime logic
+    from casual conversation.
+    """
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        user_input.lower().strip()
+    )
+
+    bedtime_phrases = [
+        "i'm going to bed",
+        "im going to bed",
+        "i am going to bed",
+        "i'm heading to bed",
+        "im heading to bed",
+        "i am heading to bed",
+        "i'm off to bed",
+        "im off to bed",
+        "i am off to bed",
+        "i'm going to sleep",
+        "im going to sleep",
+        "i am going to sleep",
+        "i'm heading to sleep",
+        "im heading to sleep",
+        "i am heading to sleep",
+        "time for bed",
+        "bedtime",
+        "goodnight mairon",
+        "good night mairon",
+        "night mairon",
+    ]
+
+    return any(
+        phrase in text
+        for phrase in bedtime_phrases
+    )
+
+
+def parse_work_location_reply(
+    user_input
+):
+    """
+    Interpret a short answer to the night routine's
+    office-vs-home question.
+
+    Returns "office", "home", or None.
+    """
+
+    text = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        user_input.lower()
+    ).strip()
+
+    office_phrases = [
+        "office",
+        "the office",
+        "in the office",
+        "going to the office",
+        "going into the office",
+        "work",
+        "going to work",
+    ]
+
+    home_phrases = [
+        "home",
+        "wfh",
+        "work from home",
+        "working from home",
+        "at home",
+    ]
+
+    if (
+        text in office_phrases
+        or "office" in text.split()
+    ):
+        return "office"
+
+    if (
+        text in home_phrases
+        or "wfh" in text.split()
+        or "work from home" in text
+        or "working from home" in text
+    ):
+        return "home"
+
+    return None
+
+
+def get_pending_night_routine(
+    conversation
+):
+    """
+    Find the newest unresolved night-routine marker in
+    local conversation state.
+
+    The marker contains only the target date. Routine and
+    alarm facts are re-read from SQLite when Oliver answers
+    rather than trusting stale conversational state.
+    """
+
+    if not conversation:
+        return None
+
+    for message in reversed(
+        conversation
+    ):
+        if get_message_role(
+            message
+        ) != "system":
+            continue
+
+        content = get_message_content(
+            message
+        )
+
+        if content.startswith(
+            RESOLVED_NIGHT_ROUTINE_PREFIX
+        ):
+            return None
+
+        if content.startswith(
+            PENDING_NIGHT_ROUTINE_PREFIX
+        ):
+            payload_text = content[
+                len(
+                    PENDING_NIGHT_ROUTINE_PREFIX
+                ):
+            ].strip()
+
+            try:
+                payload = json.loads(
+                    payload_text
+                )
+            except Exception:
+                return None
+
+            if isinstance(
+                payload,
+                dict
+            ):
+                return payload
+
+            return None
+
+    return None
+
+
+def get_calendar_for_night_routine(
+    target_date
+):
+    """
+    Fetch tomorrow's calendar only when the night routine's
+    target date is still Core's current tomorrow.
+
+    This avoids accidentally querying the wrong day if a
+    pending office/home question were somehow answered after
+    midnight.
+    """
+
+    tomorrow = (
+        datetime.now(
+            LOCAL_TIMEZONE
+        ).date()
+        + timedelta(days=1)
+    ).isoformat()
+
+    if target_date != tomorrow:
+        return {
+            "success": True,
+            "available": False,
+            "reason": (
+                "Target date is no longer the current local tomorrow, "
+                "so no relative Calendar query was performed."
+            )
+        }
+
+    print(
+        "[Tool] Mairon Core required: get_calendar_events"
+    )
+
+    return execute_tool(
+        "get_calendar_events",
+        {
+            "period": "tomorrow"
+        }
+    )
+
+
+def finalise_night_routine(
+    client,
+    user_input,
+    conversation,
+    night_result,
+    resolved_marker=False
+):
+    """
+    Produce a short tool-free bedtime response grounded in
+    authoritative routine, alarm, and Calendar state.
+    """
+
+    target_date = night_result.get(
+        "date"
+    )
+
+    calendar_result = (
+        get_calendar_for_night_routine(
+            target_date
+        )
+    )
+
+    final_messages = get_isolated_system_context(
+        conversation
+    )
+
+    final_messages.append({
+        "role": "system",
+        "content": get_runtime_context()
+    })
+
+    final_messages.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    final_messages.append({
+        "role": "system",
+        "content": (
+            "Mairon Core has completed Night Routine v1 using private local state. "
+            "Use ONLY the authoritative data below for factual claims.\n\n"
+
+            f"TARGET DATE: {target_date}\n\n"
+
+            "NIGHT ROUTINE RESULT:\n"
+            f"{json.dumps(night_result, ensure_ascii=False)}\n\n"
+
+            "GOOGLE CALENDAR FOR TOMORROW:\n"
+            f"{json.dumps(calendar_result, ensure_ascii=False)}\n\n"
+
+            "Give Oliver a brief natural goodnight response, normally one to three "
+            "sentences. Mention tomorrow's work location/day type when useful and any "
+            "specific Calendar event worth knowing. Use the ACTUAL alarm state, not merely "
+            "recommended_wake_time. If an enabled manual alarm differs from the routine "
+            "recommendation, make clear the manual alarm was preserved. If the alarm is "
+            "disabled, do not claim an active wake alarm exists. If there is no actual "
+            "alarm, do not pretend one was set. "
+
+            "The bedtime event has been recorded in recent local context when the result "
+            "contains bedtime_context. Do not mention databases or implementation details. "
+
+            "Do NOT claim lights, PC, PS5, speakers, or any other devices were checked or "
+            "changed: Night Routine v1 does not control them yet. The current alarm system "
+            "stores alarm state but does not yet have audible Pi/OS playback attached, so "
+            "do not promise a physical alarm will ring. "
+
+            "Dry contextual teasing is welcome, but every joke must be grounded in the "
+            "provided facts. Do not invent circumstances. Do not offer unrelated follow-up "
+            "tasks and do not mention tools, JSON, or internal workflow mechanics."
+        )
+    })
+
+    response = client.chat(
+        model=MODEL,
+        messages=final_messages
+    )
+
+    # Preserve the normal local conversation state, including
+    # the original user turn, then mark any pending workflow as
+    # resolved so an old question cannot be revived later.
+    working_conversation = list(
+        conversation
+    )
+
+    working_conversation.append({
+        "role": "system",
+        "content": get_runtime_context()
+    })
+
+    working_conversation.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    if resolved_marker:
+        working_conversation.append({
+            "role": "system",
+            "content": (
+                RESOLVED_NIGHT_ROUTINE_PREFIX
+                + json.dumps({
+                    "date": target_date
+                })
+            )
+        })
+
+    working_conversation.append(
+        response.message
+    )
+
+    return (
+        response.message.content,
+        working_conversation,
+        None,
+        None
+    )
+
+
+def handle_night_routine_request(
+    client,
+    user_input,
+    conversation
+):
+    """
+    Begin Night Routine v1.
+
+    If tomorrow is a variable-location workday and Oliver
+    has not said office vs home yet, return a deterministic
+    clarification and store a local conversation marker.
+    Otherwise complete the routine immediately.
+    """
+
+    print(
+        "[Core] Night routine: preparing tomorrow."
+    )
+
+    result = prepare_night_routine(
+        record_bedtime=True
+    )
+
+    if not result.get(
+        "success"
+    ):
+        answer = (
+            "I couldn't prepare tomorrow's routine: "
+            + result.get(
+                "message",
+                "unknown routine error"
+            )
+        )
+
+        working_conversation = list(
+            conversation
+        )
+
+        working_conversation.append({
+            "role": "user",
+            "content": user_input
+        })
+
+        working_conversation.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        return (
+            answer,
+            working_conversation,
+            None,
+            None
+        )
+
+    if result.get(
+        "status"
+    ) == "needs_input":
+        target_date = result.get(
+            "date"
+        )
+
+        answer = (
+            result.get(
+                "question"
+            )
+            or "Office or home tomorrow?"
+        )
+
+        working_conversation = list(
+            conversation
+        )
+
+        working_conversation.append({
+            "role": "system",
+            "content": get_runtime_context()
+        })
+
+        working_conversation.append({
+            "role": "user",
+            "content": user_input
+        })
+
+        working_conversation.append({
+            "role": "system",
+            "content": (
+                PENDING_NIGHT_ROUTINE_PREFIX
+                + json.dumps({
+                    "date": target_date,
+                    "missing": "work_location"
+                })
+            )
+        })
+
+        working_conversation.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        return (
+            answer,
+            working_conversation,
+            None,
+            None
+        )
+
+    return finalise_night_routine(
+        client=client,
+        user_input=user_input,
+        conversation=conversation,
+        night_result=result,
+        resolved_marker=False
+    )
+
+
+def handle_pending_night_routine_reply(
+    client,
+    user_input,
+    conversation,
+    pending
+):
+    """
+    Complete an unresolved Night Routine v1 office/home
+    question when Oliver supplies the missing location.
+    """
+
+    location = parse_work_location_reply(
+        user_input
+    )
+
+    if not location:
+        return None
+
+    target_date = pending.get(
+        "date"
+    )
+
+    if not target_date:
+        return None
+
+    print(
+        "[Core] Night routine: completing work-location context "
+        f"for {target_date}."
+    )
+
+    result = complete_night_routine_work_location(
+        date=target_date,
+        location=location,
+        record_bedtime=True
+    )
+
+    if not result.get(
+        "success"
+    ):
+        answer = (
+            "I couldn't finish tomorrow's routine: "
+            + result.get(
+                "message",
+                "unknown routine error"
+            )
+        )
+
+        working_conversation = list(
+            conversation
+        )
+
+        working_conversation.append({
+            "role": "user",
+            "content": user_input
+        })
+
+        working_conversation.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        return (
+            answer,
+            working_conversation,
+            None,
+            None
+        )
+
+    return finalise_night_routine(
+        client=client,
+        user_input=user_input,
+        conversation=conversation,
+        night_result=result,
+        resolved_marker=True
+    )
+
+
+# --------------------------------------------------
+# Morning-routine detection / workflow
+# --------------------------------------------------
+
+def is_morning_routine_request(
+    user_input
+):
+    """
+    Detect explicit wake-first morning greetings.
+
+    Terminal behaviour mirrors the eventual voice architecture:
+    Mairon's name comes first, then the command. Trailing
+    punctuation is ignored.
+    """
+
+    text = user_input.lower().strip()
+
+    text = re.sub(
+        r"[.!?]+$",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    morning_phrases = [
+        "mairon morning",
+        "mairon, morning",
+        "mairon good morning",
+        "mairon, good morning",
+    ]
+
+    return text in morning_phrases
+
+def morning_response_has_grounding_violation(
+    text
+):
+    """
+    Reject morning-brief wording that claims Mairon can observe
+    Oliver's physical state or falls back into generic assistant
+    service language.
+
+    Prompting alone is not treated as a sufficient boundary:
+    Core validates the generated wording before it is returned.
+    """
+
+    normalised = (
+        text
+        or ""
+    ).lower()
+
+    forbidden_phrases = [
+        "still horizontal",
+        "stay horizontal",
+        "lying in bed",
+        "laying in bed",
+        "still in bed",
+        "you're in bed",
+        "you are in bed",
+        "leave their bed",
+        "leave your bed",
+        "theoretical rest",
+        "holding coffee",
+        "holding a coffee",
+        "looking tired",
+        "you look tired",
+        "you're awake",
+        "you are awake",
+        "you're asleep",
+        "you are asleep",
+        "already dressed",
+        "still dressed",
+        "want me to",
+        "would you like me to",
+        "shall i assume",
+        "how can i assist",
+        "how may i help",
+    ]
+
+    return [
+        phrase
+        for phrase in forbidden_phrases
+        if phrase in normalised
+    ]
+
+
+def build_safe_morning_fallback(
+    morning_result,
+    calendar_result
+):
+    """
+    Build a deterministic fact-only fallback if Qwen repeatedly
+    violates the morning grounding boundary.
+
+    This intentionally favours correctness over personality.
+    """
+
+    parts = []
+
+    weekday = morning_result.get(
+        "weekday"
+    )
+
+    day_type = morning_result.get(
+        "day_type"
+    )
+
+    work_location = morning_result.get(
+        "work_location"
+    )
+
+    routine_context = (
+        morning_result.get(
+            "routine_context"
+        )
+        or {}
+    )
+
+    routine_rules = (
+        routine_context.get(
+            "routine"
+        )
+        or []
+    )
+
+    if day_type == "work":
+
+        work_text = (
+            f"Today is a {weekday or ''} workday"
+        ).strip()
+
+        if work_location == "office":
+            work_text += " in the office"
+
+        elif work_location == "home":
+            work_text += " from home"
+
+        if routine_rules:
+            rule = routine_rules[0]
+            start_time = rule.get(
+                "start_time"
+            )
+            end_time = rule.get(
+                "end_time"
+            )
+
+            if start_time and end_time:
+                work_text += (
+                    f", with the normal routine running "
+                    f"{start_time}–{end_time}"
+                )
+
+        parts.append(
+            work_text + "."
+        )
+
+    elif day_type == "university":
+        parts.append(
+            f"Today is a {weekday or ''} university day.".replace(
+                "  ",
+                " "
+            )
+        )
+
+    else:
+        if weekday:
+            parts.append(
+                f"Today is {weekday}, with no repeating work or university routine."
+            )
+        else:
+            parts.append(
+                "There is no repeating work or university routine for today."
+            )
+
+    alarm = (
+        morning_result.get(
+            "alarm"
+        )
+        or {}
+    )
+
+    if alarm.get(
+        "exists"
+    ):
+        if alarm.get(
+            "enabled"
+        ):
+            alarm_time = alarm.get(
+                "time"
+            )
+
+            if alarm_time:
+                parts.append(
+                    f"The stored wake alarm is {alarm_time}."
+                )
+        else:
+            parts.append(
+                "Today's stored wake alarm is disabled."
+            )
+
+    sleep = (
+        morning_result.get(
+            "sleep_opportunity"
+        )
+        or {}
+    )
+
+    if sleep.get(
+        "available"
+    ) and sleep.get(
+        "display"
+    ):
+        parts.append(
+            "The recorded bedtime-to-alarm sleep opportunity was "
+            f"{sleep['display']}."
+        )
+
+    events = []
+
+    if isinstance(
+        calendar_result,
+        dict
+    ):
+        candidate_events = calendar_result.get(
+            "events",
+            []
+        )
+
+        if isinstance(
+            candidate_events,
+            list
+        ):
+            events = candidate_events
+
+    event_summaries = []
+
+    for event in events[:3]:
+        if not isinstance(
+            event,
+            dict
+        ):
+            continue
+
+        summary = (
+            event.get("summary")
+            or event.get("title")
+            or "Calendar event"
+        )
+
+        start_value = (
+            event.get("start")
+            or event.get("start_time")
+            or event.get("start_datetime")
+        )
+
+        if isinstance(
+            start_value,
+            dict
+        ):
+            start_value = (
+                start_value.get("dateTime")
+                or start_value.get("date")
+            )
+
+        if start_value:
+            event_summaries.append(
+                f"{summary} ({start_value})"
+            )
+        else:
+            event_summaries.append(
+                str(summary)
+            )
+
+    if event_summaries:
+        parts.append(
+            "Calendar: "
+            + "; ".join(
+                event_summaries
+            )
+            + "."
+        )
+
+    return " ".join(
+        parts
+    )
+
+
+def generate_grounded_morning_brief(
+    client,
+    working_conversation,
+    morning_result,
+    calendar_result,
+    inbox_brief=None
+):
+    """
+    Generate the final morning brief and validate its wording.
+
+    Rejected drafts are NOT kept in the retry context. This is
+    important with deterministic local models: feeding the bad
+    wording back to Qwen can cause it to reproduce the exact same
+    phrase on every correction pass.
+    """
+
+    base_conversation = list(
+        working_conversation
+    )
+
+    all_violations = []
+
+    for attempt in range(3):
+
+        attempt_conversation = list(
+            base_conversation
+        )
+
+        if attempt == 1:
+            attempt_conversation.append({
+                "role": "system",
+                "content": (
+                    "The previous draft was rejected before being shown to Oliver. "
+                    "Write a completely fresh brief from the supplied Core facts. "
+                    "Do not refer to Oliver's body, posture, location in the room, "
+                    "consciousness, current activity, coffee, clothing, or intentions. "
+                    "Do not ask a question and do not offer further help. "
+                    "Only discuss date/day type, routine, stored alarm state, recorded "
+                    "bedtime/sleep opportunity, Calendar, supplied weather, and the "
+                    "pre-classified inbox attention brief."
+                )
+            })
+
+        elif attempt == 2:
+            forbidden = (
+                ", ".join(
+                    sorted(
+                        set(
+                            all_violations
+                        )
+                    )
+                )
+                or "unsupported physical-state wording"
+            )
+
+            attempt_conversation.append({
+                "role": "system",
+                "content": (
+                    "Produce a fact-only morning brief now. The earlier drafts were "
+                    f"rejected for: {forbidden}. Do not reuse those ideas or wording. "
+                    "Every sentence must be directly supported by the supplied Core, "
+                    "Calendar, weather, or inbox-attention data. No questions. No offers. No imagined "
+                    "physical state. A short dry remark is allowed only when it follows "
+                    "directly from a supplied fact."
+                )
+            })
+
+        response = client.chat(
+            model=MODEL,
+            messages=attempt_conversation
+        )
+
+        content = (
+            response.message.content
+            or ""
+        )
+
+        violations = (
+            morning_response_has_grounding_violation(
+                content
+            )
+        )
+
+        if not violations:
+            working_conversation.append(
+                response.message
+            )
+
+            return (
+                content,
+                working_conversation,
+                None,
+                None
+            )
+
+        all_violations.extend(
+            violations
+        )
+
+        print(
+            "[Core] Morning brief grounding check rejected "
+            f"model wording: {', '.join(violations)}"
+        )
+
+    fallback = build_safe_morning_fallback(
+        morning_result=morning_result,
+        calendar_result=calendar_result
+    )
+
+    print(
+        "[Core] Morning brief: using deterministic grounded fallback."
+    )
+
+    working_conversation.append({
+        "role": "assistant",
+        "content": fallback
+    })
+
+    return (
+        fallback,
+        working_conversation,
+        None,
+        None
+    )
+
+def get_morning_inbox_attention_brief(
+    client,
+    conversation
+):
+    """
+    Reuse Mairon's existing constrained Gmail attention workflow
+    for the morning brief.
+
+    The morning brief intentionally reviews only the last day and
+    asks for genuine attention items. Ordinary promotions, sales,
+    newsletters, and marketing should remain out of the final brief.
+
+    This helper returns user-facing grounded prose rather than raw
+    email bodies. The final Morning Routine receives only that
+    pre-classified result.
+    """
+
+    morning_inbox_request = (
+        "Review my emails from the last 1 day and identify only the "
+        "messages that genuinely need my attention this morning. "
+        "Ignore ordinary marketing, newsletters, sales, limited-time "
+        "offers, product announcements, surveys, and routine promotional "
+        "noise. Surface useful FYI messages only when they are genuinely "
+        "worth knowing today. For security notifications, tell me to verify "
+        "whether the activity was mine rather than assuming compromise."
+    )
+
+    try:
+        inbox_answer, _, _, _ = handle_inbox_attention_request(
+            client=client,
+            user_input=morning_inbox_request,
+            conversation=get_isolated_system_context(
+                conversation
+            )
+        )
+
+        return {
+            "success": True,
+            "brief": inbox_answer
+        }
+
+    except Exception as error:
+        return {
+            "success": False,
+            "brief": None,
+            "message": (
+                "Morning inbox review was unavailable: "
+                f"{error}"
+            )
+        }
+
+
+def handle_morning_routine_request(
+    client,
+    user_input,
+    conversation
+):
+    """
+    Build Morning Routine v1 from authoritative local state.
+
+    Core owns the facts. Qwen only turns the resulting bundle
+    into a concise, contextual morning brief.
+
+    v1.2 combines:
+        - today's routine / one-day context
+        - today's actual wake-alarm record
+        - last night's matching bedtime record
+        - Core-calculated sleep opportunity
+        - today's Google Calendar events
+        - current local weather / short forecast
+        - constrained Gmail attention triage from the last day
+
+    Commute stays on-demand rather than running automatically.
+    Garmin health metrics can be layered onto this bundle later.
+    """
+
+    target_date = datetime.now(
+        LOCAL_TIMEZONE
+    ).date().isoformat()
+
+    print(
+        "[Core] Morning routine: building today's context "
+        f"for {target_date}."
+    )
+
+    morning_result = prepare_morning_routine(
+        date=target_date
+    )
+
+    if not morning_result.get(
+        "success"
+    ):
+        answer = (
+            "I couldn't build this morning's routine context: "
+            + morning_result.get(
+                "message",
+                "unknown morning-routine error"
+            )
+        )
+
+        working_conversation = list(
+            conversation
+        )
+
+        working_conversation.append({
+            "role": "user",
+            "content": user_input
+        })
+
+        working_conversation.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        return (
+            answer,
+            working_conversation,
+            None,
+            None
+        )
+
+    print(
+        "[Tool] Mairon Core required: get_calendar_events"
+    )
+
+    calendar_result = execute_tool(
+        "get_calendar_events",
+        {
+            "period": "today"
+        }
+    )
+
+    print(
+        "[Tool] Mairon Core required: get_weather"
+    )
+
+    weather_result = execute_tool(
+        "get_weather",
+        {
+            "location": MAIRON_WEATHER_LOCATION
+        }
+    )
+
+    print(
+        "[Core] Morning routine: reviewing inbox attention."
+    )
+
+    inbox_result = get_morning_inbox_attention_brief(
+        client=client,
+        conversation=conversation
+    )
+
+    # Use an isolated context so stale prior turns cannot
+    # override today's authoritative routine/bedtime/alarm data.
+    working_conversation = get_isolated_system_context(
+        conversation
+    )
+
+    working_conversation.append({
+        "role": "system",
+        "content": get_runtime_context()
+    })
+
+    working_conversation.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    working_conversation.append({
+        "role": "system",
+        "content": (
+            "You are producing Oliver's private local Morning Routine v1 brief. "
+            f"The authoritative local date is {target_date}.\n\n"
+
+            "MORNING CORE STATE:\n"
+            f"{json.dumps(morning_result, ensure_ascii=False)}\n\n"
+
+            "TODAY'S GOOGLE CALENDAR:\n"
+            f"{json.dumps(calendar_result, ensure_ascii=False)}\n\n"
+
+            "CURRENT LOCAL WEATHER / SHORT FORECAST:\n"
+            f"{json.dumps(weather_result, ensure_ascii=False)}\n\n"
+
+            "MORNING INBOX ATTENTION BRIEF:\n"
+            f"{json.dumps(inbox_result, ensure_ascii=False)}\n\n"
+
+            "Use only the supplied facts for claims about Oliver's morning, "
+            "routine, alarm, bedtime, and Calendar. Do not invent missing state. "
+
+            "The field sleep_opportunity is NOT measured sleep. It is only the "
+            "time between Oliver's recorded 'going to bed' timestamp and an enabled "
+            "scheduled wake alarm. Never say Oliver actually slept that amount. "
+            "Phrases such as 'you gave yourself about X between bed and the alarm' "
+            "or 'your sleep opportunity was X' are accurate. "
+
+            "The alarm is currently a persistent Mairon alarm record only. Audible "
+            "speaker/OS/Pi playback has not been attached yet, so do not claim the "
+            "alarm physically rang or woke Oliver. "
+
+            "Mention today's work/university/free-day context when useful. If it is "
+            "a workday and location is known, mention office versus home. Mention "
+            "important Calendar events without implying they came from routine data. "
+
+            "If the sleep opportunity is unusually short, dry teasing is appropriate. "
+            "If it is generous, do not invent sleep deprivation merely for a joke. "
+            "Keep personality grounded in the supplied facts. "
+
+            "Never claim to observe Oliver's current physical state or surroundings unless "
+            "that state is explicitly supplied. Do not say he is still horizontal, in bed, "
+            "holding coffee, looking tired, awake, asleep, dressed, or physically doing "
+            "anything merely because this is a morning brief. "
+
+            "If there is no matching bedtime or alarm record, report that fact only when "
+            "useful; do not infer chaos, laziness, oversleeping, or any other behaviour. "
+
+            "Use the weather result when useful, but do not invent conditions that are not "
+            "present in the weather data. "
+
+            "The inbox section is already a constrained attention review. Mention genuine "
+            "ACTION NEEDED items and useful FYI items concisely. Do not resurrect marketing, "
+            "sales, newsletters, or ignored promotional noise. Do not treat a promotional "
+            "deadline such as 'sale ends tonight' as an urgent personal action. For security "
+            "alerts, phrase the action as verifying whether the activity was Oliver's unless "
+            "the supplied inbox brief proves something stronger. If inbox review was unavailable, "
+            "do not make up email state. "
+
+            "Do not end with a generic service offer or question such as 'Want me to...', "
+            "'Would you like me to...', or 'How can I assist you?'. Finish the brief naturally. "
+
+            "If the runtime clock clearly says it is not morning, do not pretend it is morning. "
+            "Treat the command as a test of today's brief and keep the response natural. "
+
+            "Keep the brief conversational and fairly concise. Do not mention JSON, "
+            "tools, function calls, implementation details, or internal workflow names."
+        )
+    })
+
+    return generate_grounded_morning_brief(
+        client=client,
+        working_conversation=working_conversation,
+        morning_result=morning_result,
+        calendar_result=calendar_result,
+        inbox_brief=inbox_result
+    )
+
+
+# --------------------------------------------------
 # Day-overview detection / workflow
 # --------------------------------------------------
 
@@ -443,8 +1818,8 @@ def handle_day_overview_request(
     ]
 
     print(
-        "[Core] Day overview: combining routine "
-        f"and calendar for {date_string}."
+        "[Core] Day overview: combining routine, calendar, "
+        f"and alarm state for {date_string}."
     )
 
     print(
@@ -469,7 +1844,20 @@ def handle_day_overview_request(
         }
     )
 
-    working_conversation = list(
+    print(
+        "[Tool] Mairon Core required: get_wake_alarm"
+    )
+
+    alarm_result = execute_tool(
+        "get_wake_alarm",
+        {
+            "date": date_string
+        }
+    )
+
+    # Generate this deterministic overview from a clean system context.
+    # Prior assistant guesses must not compete with fresh Core data.
+    working_conversation = get_isolated_system_context(
         conversation
     )
 
@@ -489,7 +1877,7 @@ def handle_day_overview_request(
             f"Oliver asked for an overall view of {relative_name}. "
             f"The resolved calendar date is {date_string}.\n\n"
 
-            "Mairon Core has already retrieved BOTH sources required "
+            "Mairon Core has already retrieved the private sources required "
             "for this answer:\n\n"
 
             "ROUTINE / DAILY CONTEXT:\n"
@@ -498,17 +1886,31 @@ def handle_day_overview_request(
             "GOOGLE CALENDAR:\n"
             f"{json.dumps(calendar_result, ensure_ascii=False)}\n\n"
 
+            "WAKE ALARM STATE:\n"
+            f"{json.dumps(alarm_result, ensure_ascii=False)}\n\n"
+
             "Answer Oliver's original question by combining these sources. "
             "Routine describes what he normally does and any one-day overrides. "
-            "Calendar describes specific scheduled events. "
-            "Do not claim a Calendar event came from routine context or vice versa. "
+            "Calendar describes specific scheduled events. The alarm state describes "
+            "the actual wake-alarm record, which is distinct from a routine's "
+            "recommended wake time. Do not claim one source came from another. "
 
+            f"AUTHORITATIVE DATE LOCK: {relative_name} is {date_string}. "
+            "Do not output, infer, or reuse any different date from prior dialogue. "
             f"Refer to {date_string} as '{relative_name}' when appropriate. "
             "Do not incorrectly call tomorrow 'today'. "
 
             "If routine says it is a workday, mention whether he is working "
             "from home or in the office when that information is known. "
             "If work location is missing, say that briefly rather than guessing. "
+
+            "If an enabled wake alarm exists, you may state its actual stored time. "
+            "If the alarm exists but is disabled, say there is no active wake alarm. "
+            "If no alarm exists, do NOT say one is set merely because routine context "
+            "contains a recommended wake time. You may describe that time only as a "
+            "recommendation. The current development build stores alarm records but "
+            "does not yet have audible speaker/OS playback attached, so never promise "
+            "that an alarm will physically ring yet. "
 
             "Specific Calendar events should supplement the routine, not replace it. "
             "Keep the answer conversational and concise. "
@@ -530,6 +1932,1104 @@ def handle_day_overview_request(
         working_conversation,
         None,
         None
+    )
+
+
+# --------------------------------------------------
+# Deterministic conversational routing
+# --------------------------------------------------
+
+ROUTE_CONTEXT_PREFIX = (
+    "MAIRON_ROUTE_CONTEXT:"
+)
+
+
+def normalise_route_text(
+    user_input
+):
+    """
+    Normalise a route utterance for intent detection while
+    preserving the original text for model/tool arguments.
+    """
+
+    return re.sub(
+        r"\s+",
+        " ",
+        (user_input or "").lower().strip()
+    )
+
+
+def get_latest_route_context(
+    conversation
+):
+    """
+    Return the newest successful route context stored in the
+    local conversation.
+
+    Route context lets follow-ups such as:
+
+        "What if I go through Castle Hill instead?"
+
+    reuse the previous origin, destination, and travel mode
+    without asking Qwen to reconstruct them from scratch.
+    """
+
+    if not conversation:
+        return None
+
+    for message in reversed(
+        conversation
+    ):
+        if get_message_role(
+            message
+        ) != "system":
+            continue
+
+        content = get_message_content(
+            message
+        )
+
+        if not content.startswith(
+            ROUTE_CONTEXT_PREFIX
+        ):
+            continue
+
+        payload_text = content[
+            len(
+                ROUTE_CONTEXT_PREFIX
+            ):
+        ].strip()
+
+        try:
+            payload = json.loads(
+                payload_text
+            )
+        except Exception:
+            return None
+
+        if isinstance(
+            payload,
+            dict
+        ):
+            return payload
+
+        return None
+
+    return None
+
+
+def is_route_request(
+    user_input
+):
+    """
+    Detect explicit travel-time / route questions.
+
+    This intentionally focuses on language that clearly asks
+    about getting from one place to another, rather than the
+    mere presence of words such as "work".
+    """
+
+    text = normalise_route_text(
+        user_input
+    )
+
+    if not text:
+        return False
+
+    strong_phrases = [
+        "travel time",
+        "drive time",
+        "driving time",
+        "route time",
+        "commute time",
+        "how far is",
+        "how far to",
+        "what's the eta",
+        "what is the eta",
+        "directions to",
+        "route to",
+    ]
+
+    if any(
+        phrase in text
+        for phrase in strong_phrases
+    ):
+        return True
+
+    if "how long" in text:
+        travel_clues = [
+            "get to",
+            "get from",
+            "drive to",
+            "driving to",
+            "travel to",
+            "travel from",
+            "commute",
+            "route",
+            " to work",
+            " to the office",
+            " to home",
+            " to uni",
+            " to university",
+        ]
+
+        if any(
+            clue in text
+            for clue in travel_clues
+        ):
+            return True
+
+        if re.match(
+            r"^how long (?:to|from)\b",
+            text
+        ):
+            return True
+
+    if (
+        ("drive" in text or "driving" in text)
+        and (
+            "how long" in text
+            or "how much time" in text
+            or "eta" in text
+        )
+    ):
+        return True
+
+    return False
+
+
+def get_direct_known_route_arguments(
+    user_input
+):
+    """
+    Resolve only the very obvious private home/work commute
+    cases in Core.
+
+    The important rule is:
+
+        "How long will it take me to get to work?"
+
+    is a route request from home to work. It is NOT a request
+    to inspect today's work-location routine.
+
+    More general destinations are extracted by Qwen in a
+    route-only constrained model turn.
+    """
+
+    text = normalise_route_text(
+        user_input
+    )
+
+    transit_clues = [
+        "public transport",
+        "train",
+        "bus",
+        "transit",
+    ]
+
+    if any(
+        clue in text
+        for clue in transit_clues
+    ):
+        return None
+
+    # Work -> home
+    if (
+        "work" in text
+        and (
+            "get home" in text
+            or "to home" in text
+            or "from work to home" in text
+            or "work to home" in text
+        )
+    ):
+        return {
+            "origin": "work",
+            "destination": "home",
+            "mode": "drive"
+        }
+
+    # Home -> work
+    work_destination_phrases = [
+        "get to work",
+        "drive to work",
+        "driving to work",
+        "to work",
+        "get to the office",
+        "drive to the office",
+        "to the office",
+        "home to work",
+        "home to the office",
+    ]
+
+    if any(
+        phrase in text
+        for phrase in work_destination_phrases
+    ):
+        return {
+            "origin": "home",
+            "destination": "work",
+            "mode": "drive"
+        }
+
+    return None
+
+
+def is_normal_route_followup(
+    user_input
+):
+    """
+    Detect a request to remove a custom via route and return
+    to the previously configured/default route.
+    """
+
+    text = normalise_route_text(
+        user_input
+    )
+
+    normal_route_phrases = [
+        "my normal route",
+        "normal route again",
+        "usual route",
+        "usual way",
+        "normal way",
+        "preferred route",
+        "preferred way",
+        "regular route",
+        "regular way",
+    ]
+
+    return any(
+        phrase in text
+        for phrase in normal_route_phrases
+    )
+
+
+def extract_via_followup(
+    user_input
+):
+    """
+    Extract one conversational intermediate place from a
+    route follow-up.
+
+    Examples:
+
+        What if I go through Castle Hill instead?
+            -> Castle Hill
+
+        What about via Parramatta?
+            -> Parramatta
+
+        Go through Ryde instead.
+            -> Ryde
+
+    The underlying route tool already supports multiple via
+    values. This conversational v1 intentionally resolves one
+    newly named place at a time.
+    """
+
+    text = (
+        user_input
+        or ""
+    ).strip()
+
+    patterns = [
+        r"(?i)^what if (?:i|we) (?:go|went) (?:through|via)\s+(.+?)\s*(?:instead)?[?.!]*$",
+        r"(?i)^what about (?:going )?(?:through|via)\s+(.+?)\s*(?:instead)?[?.!]*$",
+        r"(?i)^(?:go|route|drive) (?:through|via)\s+(.+?)\s*(?:instead)?[?.!]*$",
+        r"(?i)^via\s+(.+?)\s*(?:instead)?[?.!]*$",
+    ]
+
+    for pattern in patterns:
+        match = re.match(
+            pattern,
+            text
+        )
+
+        if not match:
+            continue
+
+        via_value = match.group(
+            1
+        ).strip()
+
+        via_value = re.sub(
+            r"\s+instead\s*$",
+            "",
+            via_value,
+            flags=re.IGNORECASE
+        ).strip()
+
+        via_value = via_value.rstrip(
+            "?.!"
+        ).strip()
+
+        if via_value:
+            return via_value
+
+    return None
+
+
+def normalise_route_arguments(
+    arguments
+):
+    """
+    Apply small safe defaults/alias cleanup to a get_route
+    request after Qwen has extracted the locations.
+
+    Core does not invent a missing destination.
+    """
+
+    fixed = dict(
+        arguments
+        or {}
+    )
+
+    origin = (
+        fixed.get("origin")
+        or "home"
+    )
+
+    destination = fixed.get(
+        "destination"
+    )
+
+    mode = (
+        fixed.get("mode")
+        or "drive"
+    )
+
+    alias_map = {
+        "my home": "home",
+        "my house": "home",
+        "the house": "home",
+        "house": "home",
+        "my work": "work",
+        "my workplace": "work",
+        "workplace": "work",
+        "the office": "work",
+        "office": "work",
+    }
+
+    if isinstance(
+        origin,
+        str
+    ):
+        origin = alias_map.get(
+            origin.lower().strip(),
+            origin
+        )
+
+    if isinstance(
+        destination,
+        str
+    ):
+        destination = alias_map.get(
+            destination.lower().strip(),
+            destination
+        )
+
+    if isinstance(
+        mode,
+        str
+    ):
+        mode = mode.lower().strip()
+
+    via = fixed.get(
+        "via"
+    )
+
+    if isinstance(
+        via,
+        str
+    ):
+        via = [
+            via
+        ]
+
+    if isinstance(
+        via,
+        list
+    ):
+        via = [
+            str(value).strip()
+            for value in via
+            if str(value).strip()
+        ]
+    else:
+        via = []
+
+    return {
+        "origin": origin,
+        "destination": destination,
+        "mode": mode,
+        "via": via
+    }
+
+
+def build_route_context_marker(
+    arguments,
+    route_result
+):
+    """
+    Build the small local context object used by subsequent
+    conversational route follow-ups.
+
+    No private preferred-work waypoint coordinates are stored
+    here; those remain inside route_tools/.env.
+    """
+
+    return {
+        "origin": arguments.get(
+            "origin"
+        ),
+        "destination": arguments.get(
+            "destination"
+        ),
+        "mode": arguments.get(
+            "mode"
+        ),
+        "via": arguments.get(
+            "via"
+        ) or [],
+        "result": route_result
+    }
+
+
+def finalise_route_request(
+    client,
+    user_input,
+    conversation,
+    arguments,
+    route_result,
+    previous_context=None
+):
+    """
+    Produce a deterministic grounded route answer.
+
+    Route results are simple enough that Core can format the
+    factual answer itself. This prevents Qwen from inventing
+    landmarks, incidents, road conditions, or unsupported
+    comparisons while still preserving conversational route state.
+    """
+
+    current_duration = None
+
+    if isinstance(
+        route_result,
+        dict
+    ):
+        current_duration = (
+            route_result.get(
+                "duration_minutes"
+            )
+            or route_result.get(
+                "total_duration_minutes"
+            )
+        )
+
+    previous_result = {}
+
+    if isinstance(
+        previous_context,
+        dict
+    ):
+        previous_result = (
+            previous_context.get(
+                "result"
+            )
+            or {}
+        )
+
+    previous_duration = (
+        previous_result.get(
+            "duration_minutes"
+        )
+        or previous_result.get(
+            "total_duration_minutes"
+        )
+    )
+
+    comparison_minutes = None
+
+    if (
+        isinstance(
+            current_duration,
+            (int, float)
+        )
+        and isinstance(
+            previous_duration,
+            (int, float)
+        )
+    ):
+        comparison_minutes = (
+            current_duration
+            - previous_duration
+        )
+
+    working_conversation = list(
+        conversation
+    )
+
+    working_conversation.append({
+        "role": "system",
+        "content": get_runtime_context()
+    })
+
+    working_conversation.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    # --------------------------------------------------
+    # Failed route
+    # --------------------------------------------------
+
+    if not (
+        isinstance(
+            route_result,
+            dict
+        )
+        and route_result.get(
+            "success"
+        )
+    ):
+        via_values = arguments.get(
+            "via"
+        ) or []
+
+        if isinstance(
+            via_values,
+            str
+        ):
+            via_values = [
+                via_values
+            ]
+
+        if via_values:
+            via_text = ", ".join(
+                str(value)
+                for value in via_values
+            )
+
+            answer = (
+                "Google couldn't calculate a reliable driving route "
+                f"through {via_text} for that trip, so I can't give "
+                "you a trustworthy estimate for that variation."
+            )
+        else:
+            answer = (
+                "Google couldn't calculate a reliable route for that trip."
+            )
+
+        if isinstance(
+            previous_duration,
+            (int, float)
+        ):
+            answer += (
+                f" The previous route is still about "
+                f"{round(previous_duration)} minutes."
+            )
+
+        working_conversation.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        return (
+            answer,
+            working_conversation,
+            None,
+            None
+        )
+
+    # --------------------------------------------------
+    # Successful route
+    # --------------------------------------------------
+
+    route_profile = route_result.get(
+        "route_profile"
+    )
+
+    distance_km = route_result.get(
+        "distance_km"
+    )
+
+    via_values = route_result.get(
+        "via"
+    ) or arguments.get(
+        "via"
+    ) or []
+
+    if isinstance(
+        via_values,
+        str
+    ):
+        via_values = [
+            via_values
+        ]
+
+    if route_profile == "preferred_work_route":
+        answer = (
+            "Your normal backroad work route is about "
+            f"{round(current_duration)} minutes"
+        )
+
+    elif (
+        route_profile == "custom_via"
+        and via_values
+    ):
+        via_text = ", ".join(
+            str(value)
+            for value in via_values
+        )
+
+        answer = (
+            f"Via {via_text}, it's about "
+            f"{round(current_duration)} minutes"
+        )
+
+    else:
+        answer = (
+            f"It's about {round(current_duration)} minutes"
+        )
+
+    if isinstance(
+        distance_km,
+        (int, float)
+    ):
+        answer += (
+            f" over {distance_km:g} km"
+        )
+
+    answer += "."
+
+    # --------------------------------------------------
+    # Compare only with the immediately previous route
+    # calculation when both durations are known.
+    # --------------------------------------------------
+
+    if isinstance(
+        comparison_minutes,
+        (int, float)
+    ):
+        rounded_difference = round(
+            comparison_minutes
+        )
+
+        if rounded_difference > 0:
+            answer += (
+                f" That's {rounded_difference} minute"
+                + (
+                    "s"
+                    if rounded_difference != 1
+                    else ""
+                )
+                + " slower than the previous route."
+            )
+
+        elif rounded_difference < 0:
+            faster_by = abs(
+                rounded_difference
+            )
+
+            answer += (
+                f" That's {faster_by} minute"
+                + (
+                    "s"
+                    if faster_by != 1
+                    else ""
+                )
+                + " faster than the previous route."
+            )
+
+        else:
+            answer += (
+                " That's effectively the same time as the previous route."
+            )
+
+    # --------------------------------------------------
+    # Traffic-aware vs static baseline.
+    #
+    # staticDuration is not treated as "usual for this time of day".
+    # It is simply the no-current-traffic baseline supplied by Google.
+    # --------------------------------------------------
+
+    traffic_difference = (
+        route_result.get(
+            "traffic_difference_minutes"
+        )
+    )
+
+    if traffic_difference is None:
+        traffic_difference = (
+            route_result.get(
+                "traffic_delay_minutes"
+            )
+        )
+
+    if isinstance(
+        traffic_difference,
+        (int, float)
+    ):
+        rounded_traffic = round(
+            traffic_difference
+        )
+
+        if rounded_traffic >= 3:
+            answer += (
+                f" The live estimate is about {rounded_traffic} minutes "
+                "slower than Google's static no-traffic baseline."
+            )
+
+        elif rounded_traffic <= -3:
+            faster_by = abs(
+                rounded_traffic
+            )
+
+            answer += (
+                f" The live estimate is about {faster_by} minutes "
+                "faster than Google's static no-traffic baseline."
+            )
+
+    # --------------------------------------------------
+    # Preserve the successful route for conversational
+    # follow-ups such as "what if I go through X instead?"
+    # --------------------------------------------------
+
+    route_context = (
+        build_route_context_marker(
+            arguments=arguments,
+            route_result=route_result
+        )
+    )
+
+    working_conversation.append({
+        "role": "system",
+        "content": (
+            ROUTE_CONTEXT_PREFIX
+            + json.dumps(
+                route_context,
+                ensure_ascii=False
+            )
+        )
+    })
+
+    working_conversation.append({
+        "role": "assistant",
+        "content": answer
+    })
+
+    return (
+        answer,
+        working_conversation,
+        None,
+        None
+    )
+
+def execute_core_route(
+    client,
+    user_input,
+    conversation,
+    arguments,
+    previous_context=None,
+    reason="route request"
+):
+    """
+    Execute one authoritative get_route call and finalise it
+    without exposing unrelated tools to Qwen.
+    """
+
+    arguments = normalise_route_arguments(
+        arguments
+    )
+
+    if not arguments.get(
+        "destination"
+    ):
+        return None
+
+    print(
+        f"[Core] Route workflow: {reason}."
+    )
+
+    print(
+        "[Tool] Mairon Core required: get_route"
+    )
+
+    route_result = execute_tool(
+        "get_route",
+        arguments
+    )
+
+    return finalise_route_request(
+        client=client,
+        user_input=user_input,
+        conversation=conversation,
+        arguments=arguments,
+        route_result=route_result,
+        previous_context=previous_context
+    )
+
+
+def handle_route_followup_request(
+    client,
+    user_input,
+    conversation,
+    previous_context
+):
+    """
+    Handle deterministic follow-ups to the most recent
+    successful route calculation.
+    """
+
+    if not previous_context:
+        return None
+
+    origin = previous_context.get(
+        "origin"
+    )
+
+    destination = previous_context.get(
+        "destination"
+    )
+
+    mode = previous_context.get(
+        "mode"
+    ) or "drive"
+
+    if not origin or not destination:
+        return None
+
+    if is_normal_route_followup(
+        user_input
+    ):
+        return execute_core_route(
+            client=client,
+            user_input=user_input,
+            conversation=conversation,
+            arguments={
+                "origin": origin,
+                "destination": destination,
+                "mode": mode,
+                "via": []
+            },
+            previous_context=previous_context,
+            reason=(
+                "returning to the previous normal route"
+            )
+        )
+
+    via_value = extract_via_followup(
+        user_input
+    )
+
+    if not via_value:
+        return None
+
+    if mode != "drive":
+        # Via routing is currently a driving feature. Let the
+        # normal conversation handle a genuinely different
+        # public-transport request instead of silently changing
+        # its meaning.
+        return None
+
+    return execute_core_route(
+        client=client,
+        user_input=user_input,
+        conversation=conversation,
+        arguments={
+            "origin": origin,
+            "destination": destination,
+            "mode": mode,
+            "via": [
+                via_value
+            ]
+        },
+        previous_context=previous_context,
+        reason=(
+            "recalculating the previous drive through "
+            "a requested intermediate place"
+        )
+    )
+
+
+def handle_route_request(
+    client,
+    user_input,
+    conversation
+):
+    """
+    Handle a new route question in a constrained workflow.
+
+    Obvious home<->work driving questions are resolved fully
+    in Core. More general destinations use Qwen only to extract
+    get_route arguments, with every unrelated tool removed.
+    """
+
+    direct_arguments = (
+        get_direct_known_route_arguments(
+            user_input
+        )
+    )
+
+    if direct_arguments:
+        return execute_core_route(
+            client=client,
+            user_input=user_input,
+            conversation=conversation,
+            arguments=direct_arguments,
+            previous_context=None,
+            reason=(
+                "recognised a direct home/work travel-time question"
+            )
+        )
+
+    if not ROUTE_ONLY_TOOL:
+        return None
+
+    route_messages = list(
+        conversation
+    )
+
+    route_messages.append({
+        "role": "system",
+        "content": get_runtime_context()
+    })
+
+    route_messages.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    route_messages.append({
+        "role": "system",
+        "content": (
+            "This turn has been classified by Mairon Core as a route/travel-time request. "
+            "Stay strictly on routing. The ONLY available capability is get_route. "
+            "Do not inspect routine, Calendar, Gmail, weather, memory, or the web. "
+
+            "If Oliver supplied enough information, call get_route instead of answering "
+            "from memory. If no origin was supplied, default origin to 'home'. Use private "
+            "aliases 'home', 'work', 'uni', and 'train_station' when those meanings are clear. "
+            "Use mode='drive' for driving/car requests. For public transport beginning from "
+            "home, use mode='park_and_ride' because Oliver does not begin public transport "
+            "directly from his house. Preserve a destination established clearly in recent "
+            "conversation when Oliver refers to it naturally. "
+
+            "If the request genuinely lacks a destination or essential travel mode and it "
+            "cannot be safely inferred, ask one short clarification instead of inventing it."
+        )
+    })
+
+    response = client.chat(
+        model=MODEL,
+        messages=route_messages,
+        tools=[
+            ROUTE_ONLY_TOOL
+        ]
+    )
+
+    tool_calls = (
+        response.message.tool_calls
+        or []
+    )
+
+    if not tool_calls:
+        working_conversation = list(
+            conversation
+        )
+
+        working_conversation.append({
+            "role": "system",
+            "content": get_runtime_context()
+        })
+
+        working_conversation.append({
+            "role": "user",
+            "content": user_input
+        })
+
+        working_conversation.append(
+            response.message
+        )
+
+        return (
+            response.message.content,
+            working_conversation,
+            None,
+            None
+        )
+
+    route_call = None
+
+    for tool_call in tool_calls:
+        if (
+            tool_call.function.name
+            == "get_route"
+        ):
+            route_call = tool_call
+            break
+
+    if route_call is None:
+        return None
+
+    arguments = normalise_tool_arguments(
+        route_call.function.arguments
+    )
+
+    arguments = normalise_route_arguments(
+        arguments
+    )
+
+    if not arguments.get(
+        "destination"
+    ):
+        answer = (
+            "I need the destination before I can calculate that route."
+        )
+
+        working_conversation = list(
+            conversation
+        )
+
+        working_conversation.append({
+            "role": "user",
+            "content": user_input
+        })
+
+        working_conversation.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        return (
+            answer,
+            working_conversation,
+            None,
+            None
+        )
+
+    print(
+        "[Core] Route workflow: constrained route extraction."
+    )
+
+    print(
+        "[Tool] Mairon requested: get_route"
+    )
+
+    route_result = execute_tool(
+        "get_route",
+        arguments
+    )
+
+    return finalise_route_request(
+        client=client,
+        user_input=user_input,
+        conversation=conversation,
+        arguments=arguments,
+        route_result=route_result,
+        previous_context=None
     )
 
 
@@ -1056,6 +3556,100 @@ def get_response(
         ]
 
     # --------------------------------------------------
+    # Continue a pending Night Routine v1 clarification.
+    # --------------------------------------------------
+
+    pending_night_routine = (
+        get_pending_night_routine(
+            conversation
+        )
+    )
+
+    if pending_night_routine:
+        pending_result = (
+            handle_pending_night_routine_reply(
+                client=client,
+                user_input=user_input,
+                conversation=conversation,
+                pending=pending_night_routine
+            )
+        )
+
+        if pending_result is not None:
+            return pending_result
+
+    # --------------------------------------------------
+    # Conversational route follow-ups reuse the most recent
+    # successful route state before the general model sees
+    # the turn.
+    # --------------------------------------------------
+
+    previous_route_context = (
+        get_latest_route_context(
+            conversation
+        )
+    )
+
+    if previous_route_context:
+        route_followup_result = (
+            handle_route_followup_request(
+                client=client,
+                user_input=user_input,
+                conversation=conversation,
+                previous_context=(
+                    previous_route_context
+                )
+            )
+        )
+
+        if route_followup_result is not None:
+            return route_followup_result
+
+    # --------------------------------------------------
+    # New route/travel-time questions use a constrained
+    # route-only workflow. This prevents words such as
+    # "work" from accidentally sending Qwen into routine.
+    # --------------------------------------------------
+
+    if is_route_request(
+        user_input
+    ):
+        route_result = handle_route_request(
+            client=client,
+            user_input=user_input,
+            conversation=conversation
+        )
+
+        if route_result is not None:
+            return route_result
+
+    # --------------------------------------------------
+    # Explicit morning greeting starts Morning Routine v1.
+    # --------------------------------------------------
+
+    if is_morning_routine_request(
+        user_input
+    ):
+        return handle_morning_routine_request(
+            client=client,
+            user_input=user_input,
+            conversation=conversation
+        )
+
+    # --------------------------------------------------
+    # Explicit bedtime phrases start Night Routine v1.
+    # --------------------------------------------------
+
+    if is_night_routine_request(
+        user_input
+    ):
+        return handle_night_routine_request(
+            client=client,
+            user_input=user_input,
+            conversation=conversation
+        )
+
+    # --------------------------------------------------
     # Inbox-attention requests use their own constrained
     # private workflow.
     # --------------------------------------------------
@@ -1511,6 +4105,14 @@ def get_response(
                 tool_call.function.arguments
             )
 
+            # Relative dates such as today/tomorrow are resolved by Core,
+            # never trusted to the model's training-time sense of date.
+            arguments = enforce_core_date_for_tool(
+                tool_name=tool_name,
+                arguments=arguments,
+                user_input=user_input
+            )
+
             print(
                 f"[Tool] Mairon requested: {tool_name}"
             )
@@ -1560,26 +4162,131 @@ def get_response(
                     "content": (
                         "The requested work-location update has now been processed. "
                         "Finish Oliver's original request immediately using the "
-                        "set_work_location result already returned. "
-                        "Do not start a new task and do not inspect Gmail, Calendar, "
-                        "weather, routes, memory, the web, or any other source unless "
-                        "Oliver explicitly asked for that additional information in "
-                        "the same message. "
-                        "For a simple work-location update, give a brief confirmation "
-                        "and mention the derived recommended wake time when available. "
-                        "Do not mention tools, function calls, JSON, or implementation "
-                        "details."
+                        "set_work_location result already returned. Do not start a new "
+                        "task and do not inspect Gmail, Calendar, weather, routes, memory, "
+                        "the web, or any other source. The result includes alarm_sync. "
+                        "If alarm_sync.action is routine_alarm_synchronised and its alarm "
+                        "is enabled, you may say Mairon's stored wake alarm was updated to "
+                        "that actual alarm time. If alarm_sync.action is preserved_manual, "
+                        "state the actual manual alarm time instead of the routine "
+                        "recommendation. If alarm_sync.action is preserved_disabled, do "
+                        "not claim an alarm is active. Never confuse recommended_wake_time "
+                        "with an actual alarm record. Also remember that the current build "
+                        "does not yet have audible speaker/OS alarm playback attached, so "
+                        "do not promise that it will physically ring. Keep the confirmation "
+                        "brief and conversational, and do not mention tools, JSON, or "
+                        "implementation details."
                         + relative_date_instruction
                     )
                 })
 
-                # State mutation is complete. Remove all tools for the
-                # response pass so Qwen cannot wander into an unrelated
-                # Gmail/Calendar/weather query after successfully updating
-                # tomorrow's context.
+                # Use a clean generation context so a stale date from an
+                # earlier turn cannot override the fresh tool result.
+                final_messages = get_isolated_system_context(
+                    base_conversation
+                )
+
+                final_messages.append({
+                    "role": "system",
+                    "content": get_runtime_context()
+                })
+
+                final_messages.append({
+                    "role": "user",
+                    "content": user_input
+                })
+
+                final_messages.append({
+                    "role": "system",
+                    "content": (
+                        "AUTHORITATIVE set_work_location result:\n"
+                        f"{json.dumps(tool_result, ensure_ascii=False)}\n\n"
+                        f"AUTHORITATIVE target date: {arguments.get('date')}. "
+                        "Use only this date and this result when confirming the change. "
+                        "Ignore any different date mentioned in prior dialogue. "
+                        "The result includes alarm_sync. If alarm_sync.action is "
+                        "routine_alarm_synchronised and its alarm is enabled, you may say "
+                        "Mairon's stored wake alarm was updated to that actual alarm time. "
+                        "If alarm_sync.action is preserved_manual, state the actual manual "
+                        "alarm time instead of the routine recommendation. If it is "
+                        "preserved_disabled, do not claim an alarm is active. The current "
+                        "development build has no audible alarm playback yet. Keep the "
+                        "confirmation brief, conversational, and grounded only in this result."
+                        + relative_date_instruction
+                    )
+                })
+
                 final_response = client.chat(
                     model=MODEL,
-                    messages=working_conversation
+                    messages=final_messages
+                )
+
+                # Preserve normal conversation history even though generation
+                # itself used the isolated authoritative context.
+                working_conversation.append(
+                    final_response.message
+                )
+
+                return (
+                    final_response.message.content,
+                    working_conversation,
+                    None,
+                    None
+                )
+
+            if tool_name in (
+                "get_wake_alarm",
+                "set_wake_alarm",
+                "disable_wake_alarm",
+                "get_routine_context",
+            ):
+                relative_date_instruction = ""
+
+                if "tomorrow" in user_input.lower():
+                    relative_date_instruction = (
+                        " Oliver explicitly referred to tomorrow. Preserve that relative "
+                        "date correctly and do not call it today."
+                    )
+
+                final_messages = get_isolated_system_context(
+                    base_conversation
+                )
+
+                final_messages.append({
+                    "role": "system",
+                    "content": get_runtime_context()
+                })
+
+                final_messages.append({
+                    "role": "user",
+                    "content": user_input
+                })
+
+                final_messages.append({
+                    "role": "system",
+                    "content": (
+                        f"AUTHORITATIVE {tool_name} result:\n"
+                        f"{json.dumps(tool_result, ensure_ascii=False)}\n\n"
+                        f"AUTHORITATIVE target date: {arguments.get('date')}. "
+                        "Use only this date and this result. Ignore any different date "
+                        "mentioned in prior dialogue. Do not start another task or inspect "
+                        "anything else. For get_wake_alarm, answer whether the stored alarm "
+                        "exists, whether it is enabled, and its actual time when relevant. "
+                        "For set_wake_alarm, confirm the stored date and time. For "
+                        "disable_wake_alarm, confirm the alarm is disabled. For "
+                        "get_routine_context, answer from the returned routine/daily context. "
+                        "Never turn a recommended wake time into an actual alarm unless the "
+                        "result contains an enabled alarm record. The current development "
+                        "build has no audible speaker/OS playback yet. Keep the response "
+                        "brief and conversational, and do not mention JSON, tools, function "
+                        "calls, or implementation details."
+                        + relative_date_instruction
+                    )
+                })
+
+                final_response = client.chat(
+                    model=MODEL,
+                    messages=final_messages
                 )
 
                 working_conversation.append(
