@@ -9,6 +9,7 @@ from tools.desktop_tools import launch_application
 from tools.route_tools import get_route
 from tools.system_tools import get_system_info
 from tools.weather_tools import get_weather
+from tools.web_tools import web_search
 
 
 TOOLS = [
@@ -89,13 +90,10 @@ TOOLS = [
             "how far away somewhere is, current driving time, public transport time, "
             "or whether driving or public transport is preferable. "
             "The aliases 'home' and 'uni' may be used. "
-            "IMPORTANT: Oliver lives in a rural area and does NOT begin his normal "
-            "train commute to uni using public transport from home. He drives from "
-            "home to his configured train station, parks, and then continues by train. "
-            "Therefore, whenever Oliver asks about going from home to uni 'by train', "
-            "'by public transport', or similar, ALWAYS use park_and_ride rather than transit. "
-            "Use transit only when the requested journey genuinely begins at a public "
-            "transport-accessible origin."
+            "IMPORTANT: Oliver does not begin public transport journeys directly from home. "
+            "Any public transport journey beginning at home requires driving to an "
+            "appropriate station or bus stop first. "
+            "For Oliver's normal home-to-uni train commute, use park_and_ride."
         ),
         "parameters": {
             "type": "object",
@@ -117,9 +115,8 @@ TOOLS = [
                     ],
                     "description": (
                         "Travel mode. Use drive for a car journey. "
-                        "Use transit for a journey that genuinely starts using public transport. "
-                        "Use park_and_ride for Oliver's normal home-to-uni train journey, "
-                        "because he first drives from home to his configured train station."
+                        "Use transit only when the journey genuinely begins using public transport. "
+                        "Use park_and_ride for Oliver's normal home-to-uni train journey."
                     )
                 }
             },
@@ -127,6 +124,67 @@ TOOLS = [
                 "origin",
                 "destination",
                 "mode"
+            ],
+            "additionalProperties": False
+        },
+        "strict": True
+    },
+
+    {
+        "type": "function",
+        "name": "web_search",
+        "description": (
+            "Search the live public internet for current or externally verifiable information. "
+            "Use this when Oliver asks about recent events, news, current information, "
+            "software versions, documentation, product announcements, changing facts, "
+            "or something that requires information beyond the model's training knowledge. "
+            "Do not use web search unnecessarily for stable facts that can be answered confidently "
+            "without current information. "
+            "The search query is sent to an external search provider. Never include passwords, "
+            "API keys, private addresses, secret information, or private memory content in a "
+            "web search query unless Oliver has explicitly authorised that disclosure."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "A concise search-engine query containing only the information "
+                        "necessary to perform the public web search."
+                    )
+                },
+                "topic": {
+                    "type": "string",
+                    "enum": [
+                        "general",
+                        "news",
+                        "finance"
+                    ],
+                    "description": (
+                        "Search category. Use news for recent news stories, finance for "
+                        "financial or market information, and general for everything else."
+                    )
+                },
+                "time_range": {
+                    "type": "string",
+                    "enum": [
+                        "none",
+                        "day",
+                        "week",
+                        "month",
+                        "year"
+                    ],
+                    "description": (
+                        "How recent the search results should be. "
+                        "Use none when no time restriction is necessary."
+                    )
+                }
+            },
+            "required": [
+                "query",
+                "topic",
+                "time_range"
             ],
             "additionalProperties": False
         },
@@ -236,12 +294,10 @@ def execute_tool(tool_name, arguments=None):
         destination = arguments["destination"]
         mode = arguments["mode"]
 
-        # Deterministic commute rule:
-        # Oliver's normal home → uni public transport journey
-        # always involves driving to the station first.
+        # Any home → public transport journey requires
+        # driving to a transit interchange first.
         if (
             origin.lower().strip() == "home"
-            and destination.lower().strip() == "uni"
             and mode == "transit"
         ):
             mode = "park_and_ride"
@@ -250,6 +306,19 @@ def execute_tool(tool_name, arguments=None):
             origin,
             destination,
             mode
+        )
+
+    if tool_name == "web_search":
+        time_range = arguments["time_range"]
+
+        if time_range == "none":
+            time_range = None
+
+        return web_search(
+            query=arguments["query"],
+            topic=arguments["topic"],
+            time_range=time_range,
+            max_results=5
         )
 
     if tool_name == "save_memory":
