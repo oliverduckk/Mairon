@@ -1,7 +1,7 @@
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from ollama import Client
@@ -335,6 +335,202 @@ def get_inbox_review_days(
         return 30
 
     return 7
+
+
+# --------------------------------------------------
+# Day-overview detection / workflow
+# --------------------------------------------------
+
+def is_day_overview_request(
+    user_input
+):
+    """
+    Detect questions asking what a day looks like overall.
+
+    These requests should combine routine context with
+    Calendar rather than relying on either source alone.
+    """
+
+    text = user_input.lower().strip()
+
+    overview_phrases = [
+        "what am i doing today",
+        "what am i doing tomorrow",
+        "what do i have today",
+        "what do i have tomorrow",
+        "what's happening today",
+        "what's happening tomorrow",
+        "what is happening today",
+        "what is happening tomorrow",
+        "what does today look like",
+        "what does tomorrow look like",
+        "what's my day today",
+        "what's my day tomorrow",
+        "what is my day today",
+        "what is my day tomorrow",
+        "what am i up to today",
+        "what am i up to tomorrow",
+    ]
+
+    return any(
+        phrase in text
+        for phrase in overview_phrases
+    )
+
+
+def resolve_overview_date(
+    user_input
+):
+    """
+    Resolve today/tomorrow overview requests using
+    Mairon's configured local timezone.
+    """
+
+    text = user_input.lower()
+
+    today = datetime.now(
+        LOCAL_TIMEZONE
+    ).date()
+
+    if "tomorrow" in text:
+        target_date = (
+            today
+            + timedelta(
+                days=1
+            )
+        )
+
+        return {
+            "date": target_date.isoformat(),
+            "relative_name": "tomorrow",
+            "calendar_period": "tomorrow",
+        }
+
+    return {
+        "date": today.isoformat(),
+        "relative_name": "today",
+        "calendar_period": "today",
+    }
+
+
+def handle_day_overview_request(
+    client,
+    user_input,
+    conversation
+):
+    """
+    Build a deterministic view of today/tomorrow using
+    both routine context and Google Calendar.
+
+    Neither source is allowed to silently substitute
+    for the other.
+    """
+
+    target = resolve_overview_date(
+        user_input
+    )
+
+    date_string = target[
+        "date"
+    ]
+
+    relative_name = target[
+        "relative_name"
+    ]
+
+    calendar_period = target[
+        "calendar_period"
+    ]
+
+    print(
+        "[Core] Day overview: combining routine "
+        f"and calendar for {date_string}."
+    )
+
+    print(
+        "[Tool] Mairon Core required: get_routine_context"
+    )
+
+    routine_result = execute_tool(
+        "get_routine_context",
+        {
+            "date": date_string
+        }
+    )
+
+    print(
+        "[Tool] Mairon Core required: get_calendar_events"
+    )
+
+    calendar_result = execute_tool(
+        "get_calendar_events",
+        {
+            "period": calendar_period
+        }
+    )
+
+    working_conversation = list(
+        conversation
+    )
+
+    working_conversation.append({
+        "role": "system",
+        "content": get_runtime_context()
+    })
+
+    working_conversation.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    working_conversation.append({
+        "role": "system",
+        "content": (
+            f"Oliver asked for an overall view of {relative_name}. "
+            f"The resolved calendar date is {date_string}.\n\n"
+
+            "Mairon Core has already retrieved BOTH sources required "
+            "for this answer:\n\n"
+
+            "ROUTINE / DAILY CONTEXT:\n"
+            f"{json.dumps(routine_result, ensure_ascii=False)}\n\n"
+
+            "GOOGLE CALENDAR:\n"
+            f"{json.dumps(calendar_result, ensure_ascii=False)}\n\n"
+
+            "Answer Oliver's original question by combining these sources. "
+            "Routine describes what he normally does and any one-day overrides. "
+            "Calendar describes specific scheduled events. "
+            "Do not claim a Calendar event came from routine context or vice versa. "
+
+            f"Refer to {date_string} as '{relative_name}' when appropriate. "
+            "Do not incorrectly call tomorrow 'today'. "
+
+            "If routine says it is a workday, mention whether he is working "
+            "from home or in the office when that information is known. "
+            "If work location is missing, say that briefly rather than guessing. "
+
+            "Specific Calendar events should supplement the routine, not replace it. "
+            "Keep the answer conversational and concise. "
+            "Do not mention tools, JSON, function calls, or implementation details."
+        )
+    })
+
+    response = client.chat(
+        model=MODEL,
+        messages=working_conversation
+    )
+
+    working_conversation.append(
+        response.message
+    )
+
+    return (
+        response.message.content,
+        working_conversation,
+        None,
+        None
+    )
 
 
 # --------------------------------------------------
@@ -873,6 +1069,19 @@ def get_response(
             conversation
         )
 
+    # --------------------------------------------------
+    # Overall day questions combine routine + Calendar.
+    # --------------------------------------------------
+
+    if is_day_overview_request(
+        user_input
+    ):
+        return handle_day_overview_request(
+            client,
+            user_input,
+            conversation
+        )
+
     base_conversation = list(
         conversation
     )
@@ -1335,3 +1544,51 @@ def get_response(
                     tool_result
                 )
             })
+
+            if tool_name == "set_work_location":
+                relative_date_instruction = ""
+
+                if "tomorrow" in user_input.lower():
+                    relative_date_instruction = (
+                        " Oliver explicitly described this work-location "
+                        "override as applying tomorrow. Preserve that "
+                        "relative date correctly and do not call it today."
+                    )
+
+                working_conversation.append({
+                    "role": "system",
+                    "content": (
+                        "The requested work-location update has now been processed. "
+                        "Finish Oliver's original request immediately using the "
+                        "set_work_location result already returned. "
+                        "Do not start a new task and do not inspect Gmail, Calendar, "
+                        "weather, routes, memory, the web, or any other source unless "
+                        "Oliver explicitly asked for that additional information in "
+                        "the same message. "
+                        "For a simple work-location update, give a brief confirmation "
+                        "and mention the derived recommended wake time when available. "
+                        "Do not mention tools, function calls, JSON, or implementation "
+                        "details."
+                        + relative_date_instruction
+                    )
+                })
+
+                # State mutation is complete. Remove all tools for the
+                # response pass so Qwen cannot wander into an unrelated
+                # Gmail/Calendar/weather query after successfully updating
+                # tomorrow's context.
+                final_response = client.chat(
+                    model=MODEL,
+                    messages=working_conversation
+                )
+
+                working_conversation.append(
+                    final_response.message
+                )
+
+                return (
+                    final_response.message.content,
+                    working_conversation,
+                    None,
+                    None
+                )

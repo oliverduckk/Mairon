@@ -9,16 +9,38 @@ from tools.calendar_tools import (
     get_calendar_events,
     get_next_calendar_event,
 )
-from tools.desktop_tools import launch_application
+
+from tools.desktop_tools import (
+    launch_application,
+)
+
 from tools.gmail_tools import (
     find_emails,
     get_recent_emails,
     read_email,
 )
-from tools.route_tools import get_route
-from tools.system_tools import get_system_info
-from tools.weather_tools import get_weather
-from tools.web_tools import web_read, web_search
+
+from tools.route_tools import (
+    get_route,
+)
+
+from tools.routine_tools import (
+    get_routine_context,
+    set_work_location,
+)
+
+from tools.system_tools import (
+    get_system_info,
+)
+
+from tools.weather_tools import (
+    get_weather,
+)
+
+from tools.web_tools import (
+    web_read,
+    web_search,
+)
 
 
 # --------------------------------------------------
@@ -46,7 +68,7 @@ def function_tool(
 
 
 # --------------------------------------------------
-# Tool definitions
+# System / desktop tools
 # --------------------------------------------------
 
 GET_SYSTEM_INFO_TOOL = function_tool(
@@ -72,12 +94,20 @@ LAUNCH_APPLICATION_TOOL = function_tool(
                 "notepad",
                 "calculator"
             ],
-            "description": "The approved application to launch."
+            "description": (
+                "The approved application to launch."
+            )
         }
     },
-    required=["app_name"]
+    required=[
+        "app_name"
+    ]
 )
 
+
+# --------------------------------------------------
+# Weather
+# --------------------------------------------------
 
 GET_WEATHER_TOOL = function_tool(
     name="get_weather",
@@ -95,9 +125,15 @@ GET_WEATHER_TOOL = function_tool(
             )
         }
     },
-    required=["location"]
+    required=[
+        "location"
+    ]
 )
 
+
+# --------------------------------------------------
+# Routes
+# --------------------------------------------------
 
 GET_ROUTE_TOOL = function_tool(
     name="get_route",
@@ -114,11 +150,15 @@ GET_ROUTE_TOOL = function_tool(
     properties={
         "origin": {
             "type": "string",
-            "description": "Starting location, such as 'home'."
+            "description": (
+                "Starting location, such as 'home'."
+            )
         },
         "destination": {
             "type": "string",
-            "description": "Destination, such as 'uni'."
+            "description": (
+                "Destination, such as 'uni'."
+            )
         },
         "mode": {
             "type": "string",
@@ -141,6 +181,10 @@ GET_ROUTE_TOOL = function_tool(
 )
 
 
+# --------------------------------------------------
+# Calendar
+# --------------------------------------------------
+
 GET_CALENDAR_EVENTS_TOOL = function_tool(
     name="get_calendar_events",
     description=(
@@ -158,10 +202,14 @@ GET_CALENDAR_EVENTS_TOOL = function_tool(
                 "next_7_days",
                 "next_30_days"
             ],
-            "description": "Calendar period to retrieve."
+            "description": (
+                "Calendar period to retrieve."
+            )
         }
     },
-    required=["period"]
+    required=[
+        "period"
+    ]
 )
 
 
@@ -174,6 +222,10 @@ GET_NEXT_CALENDAR_EVENT_TOOL = function_tool(
     )
 )
 
+
+# --------------------------------------------------
+# Gmail
+# --------------------------------------------------
 
 GET_RECENT_EMAILS_TOOL = function_tool(
     name="get_recent_emails",
@@ -200,7 +252,9 @@ GET_RECENT_EMAILS_TOOL = function_tool(
             "type": "integer",
             "minimum": 1,
             "maximum": 20,
-            "description": "Maximum number of messages to return."
+            "description": (
+                "Maximum number of messages to return."
+            )
         },
         "unread_only": {
             "type": "boolean",
@@ -257,7 +311,9 @@ FIND_EMAILS_TOOL = function_tool(
             "type": "integer",
             "minimum": 1,
             "maximum": 20,
-            "description": "Maximum number of matching emails to return."
+            "description": (
+                "Maximum number of matching emails to return."
+            )
         }
     },
     required=[
@@ -289,9 +345,89 @@ READ_EMAIL_TOOL = function_tool(
             )
         }
     },
-    required=["message_id"]
+    required=[
+        "message_id"
+    ]
 )
 
+
+# --------------------------------------------------
+# Routine / daily context
+# --------------------------------------------------
+
+GET_ROUTINE_CONTEXT_TOOL = function_tool(
+    name="get_routine_context",
+    description=(
+        "Get Mairon's private local understanding of Oliver's routine for one specific date. "
+        "This combines his normal repeating weekly routine with any temporary one-day "
+        "context or overrides. "
+        "Use this when Oliver asks what he normally does on a day, whether a date is a "
+        "work day or university day, where he is working that day, what his recommended "
+        "wake time is, or when another workflow needs to understand today's or tomorrow's routine. "
+        "Resolve relative dates such as today and tomorrow using the current local date "
+        "provided in Mairon's runtime context before calling this tool. "
+        "This information is private and local."
+    ),
+    properties={
+        "date": {
+            "type": "string",
+            "description": (
+                "Date in YYYY-MM-DD format. Resolve today, tomorrow, or other "
+                "relative dates using Mairon's supplied local runtime date."
+            )
+        }
+    },
+    required=[
+        "date"
+    ]
+)
+
+
+SET_WORK_LOCATION_TOOL = function_tool(
+    name="set_work_location",
+    description=(
+        "Set whether Oliver is working from home or going into the office on one specific "
+        "workday. This is a temporary one-day context update and MUST NOT change his normal "
+        "weekly work routine or persistent memory. "
+        "Use this when Oliver says things such as 'I'm working from home tomorrow', "
+        "'I'm in the office tomorrow', 'WFH Monday', or corrects a previously stated "
+        "work location. "
+        "Resolve relative dates such as today and tomorrow using the current local date "
+        "from Mairon's runtime context. "
+        "Use location='home' for work from home and location='office' for going into work. "
+        "The returned result also includes the recommended wake time derived from Oliver's "
+        "routine preferences. "
+        "This changes only Mairon's private local daily context and performs no external action."
+    ),
+    properties={
+        "date": {
+            "type": "string",
+            "description": (
+                "The specific work date in YYYY-MM-DD format."
+            )
+        },
+        "location": {
+            "type": "string",
+            "enum": [
+                "home",
+                "office"
+            ],
+            "description": (
+                "'home' means working from home. "
+                "'office' means travelling into the workplace."
+            )
+        }
+    },
+    required=[
+        "date",
+        "location"
+    ]
+)
+
+
+# --------------------------------------------------
+# Public web
+# --------------------------------------------------
 
 WEB_SEARCH_TOOL = function_tool(
     name="web_search",
@@ -299,7 +435,7 @@ WEB_SEARCH_TOOL = function_tool(
         "Search the live public internet for current or externally verifiable information. "
         "Use this for recent events, news, current information, documentation, "
         "software versions, product announcements, and other changing public facts. "
-        "Do not use web search for Oliver's private email, calendar, memory, "
+        "Do not use web search for Oliver's private email, calendar, routine, memory, "
         "routes, or other information available through a dedicated private tool. "
         "Never include passwords, API keys, private addresses, private email contents, "
         "or secret information in a public web search query."
@@ -307,7 +443,9 @@ WEB_SEARCH_TOOL = function_tool(
     properties={
         "query": {
             "type": "string",
-            "description": "Concise public web search query."
+            "description": (
+                "Concise public web search query."
+            )
         },
         "topic": {
             "type": "string",
@@ -316,7 +454,9 @@ WEB_SEARCH_TOOL = function_tool(
                 "news",
                 "finance"
             ],
-            "description": "Search category."
+            "description": (
+                "Search category."
+            )
         },
         "time_range": {
             "type": "string",
@@ -327,7 +467,9 @@ WEB_SEARCH_TOOL = function_tool(
                 "month",
                 "year"
             ],
-            "description": "How recent search results should be."
+            "description": (
+                "How recent search results should be."
+            )
         }
     },
     required=[
@@ -349,7 +491,9 @@ WEB_READ_TOOL = function_tool(
     properties={
         "url": {
             "type": "string",
-            "description": "Complete public HTTP or HTTPS URL."
+            "description": (
+                "Complete public HTTP or HTTPS URL."
+            )
         },
         "focus": {
             "type": "string",
@@ -366,13 +510,20 @@ WEB_READ_TOOL = function_tool(
 )
 
 
+# --------------------------------------------------
+# Persistent memory
+# --------------------------------------------------
+
 SAVE_MEMORY_TOOL = function_tool(
     name="save_memory",
     description=(
         "Save information into Mairon's persistent local memory. "
         "Only use this when Oliver explicitly asks Mairon to remember, save, "
-        "or store something. Do not automatically save email contents, calendar "
-        "information, web results, jokes, temporary facts, or inferred information."
+        "or store something. "
+        "Do NOT use persistent memory for temporary daily context such as "
+        "working from home tomorrow; use the appropriate routine/daily-context tool instead. "
+        "Do not automatically save email contents, calendar information, web results, "
+        "jokes, temporary facts, or inferred information."
     ),
     properties={
         "memory": {
@@ -382,7 +533,9 @@ SAVE_MEMORY_TOOL = function_tool(
             )
         }
     },
-    required=["memory"]
+    required=[
+        "memory"
+    ]
 )
 
 
@@ -390,15 +543,21 @@ SEARCH_MEMORY_TOOL = function_tool(
     name="search_memory",
     description=(
         "Search Mairon's persistent local memory for information Oliver previously "
-        "asked Mairon to remember."
+        "asked Mairon to remember. "
+        "Do not use persistent memory as a substitute for routine context, Gmail, "
+        "Calendar, or another dedicated private data source."
     ),
     properties={
         "query": {
             "type": "string",
-            "description": "Information to search persistent memory for."
+            "description": (
+                "Information to search persistent memory for."
+            )
         }
     },
-    required=["query"]
+    required=[
+        "query"
+    ]
 )
 
 
@@ -421,10 +580,14 @@ DELETE_MEMORY_TOOL = function_tool(
     properties={
         "query": {
             "type": "string",
-            "description": "Description of the memory Oliver wants forgotten."
+            "description": (
+                "Description of the memory Oliver wants forgotten."
+            )
         }
     },
-    required=["query"]
+    required=[
+        "query"
+    ]
 )
 
 
@@ -435,15 +598,23 @@ DELETE_MEMORY_TOOL = function_tool(
 LOCAL_TOOLS = [
     GET_SYSTEM_INFO_TOOL,
     LAUNCH_APPLICATION_TOOL,
+
     GET_WEATHER_TOOL,
     GET_ROUTE_TOOL,
+
     GET_CALENDAR_EVENTS_TOOL,
     GET_NEXT_CALENDAR_EVENT_TOOL,
+
     GET_RECENT_EMAILS_TOOL,
     FIND_EMAILS_TOOL,
     READ_EMAIL_TOOL,
+
+    GET_ROUTINE_CONTEXT_TOOL,
+    SET_WORK_LOCATION_TOOL,
+
     WEB_SEARCH_TOOL,
     WEB_READ_TOOL,
+
     SAVE_MEMORY_TOOL,
     SEARCH_MEMORY_TOOL,
     LIST_MEMORIES_TOOL,
@@ -451,10 +622,11 @@ LOCAL_TOOLS = [
 ]
 
 
-# Cloud models deliberately receive only public-information tools.
+# Cloud models deliberately receive only tools that access
+# public information.
 #
-# Gmail, Calendar, memory, routes, local system information,
-# and desktop control are absent.
+# Gmail, Calendar, routine context, memory, routes,
+# local system information, and desktop control are absent.
 CLOUD_TOOLS = [
     GET_WEATHER_TOOL,
     WEB_SEARCH_TOOL,
@@ -476,10 +648,15 @@ def execute_tool(
 ):
     arguments = arguments or {}
 
+    # --------------------------------------------------
+    # System / desktop
+    # --------------------------------------------------
+
     if tool_name == "get_system_info":
         return get_system_info()
 
     if tool_name == "launch_application":
+
         app_name = arguments.get(
             "app_name"
         )
@@ -487,14 +664,21 @@ def execute_tool(
         if not app_name:
             return {
                 "success": False,
-                "message": "No application name was provided."
+                "message": (
+                    "No application name was provided."
+                )
             }
 
         return launch_application(
             app_name
         )
 
+    # --------------------------------------------------
+    # Weather
+    # --------------------------------------------------
+
     if tool_name == "get_weather":
+
         location = arguments.get(
             "location"
         )
@@ -502,14 +686,21 @@ def execute_tool(
         if not location:
             return {
                 "success": False,
-                "message": "No weather location was provided."
+                "message": (
+                    "No weather location was provided."
+                )
             }
 
         return get_weather(
             location
         )
 
+    # --------------------------------------------------
+    # Routes
+    # --------------------------------------------------
+
     if tool_name == "get_route":
+
         origin = arguments.get(
             "origin"
         )
@@ -547,7 +738,12 @@ def execute_tool(
             mode
         )
 
+    # --------------------------------------------------
+    # Calendar
+    # --------------------------------------------------
+
     if tool_name == "get_calendar_events":
+
         period = arguments.get(
             "period",
             "today"
@@ -560,7 +756,12 @@ def execute_tool(
     if tool_name == "get_next_calendar_event":
         return get_next_calendar_event()
 
+    # --------------------------------------------------
+    # Gmail
+    # --------------------------------------------------
+
     if tool_name == "get_recent_emails":
+
         return get_recent_emails(
             days=arguments.get(
                 "days",
@@ -577,6 +778,7 @@ def execute_tool(
         )
 
     if tool_name == "find_emails":
+
         return find_emails(
             search_text=arguments.get(
                 "search_text",
@@ -597,6 +799,7 @@ def execute_tool(
         )
 
     if tool_name == "read_email":
+
         message_id = arguments.get(
             "message_id"
         )
@@ -613,7 +816,65 @@ def execute_tool(
             message_id
         )
 
+    # --------------------------------------------------
+    # Routine / daily context
+    # --------------------------------------------------
+
+    if tool_name == "get_routine_context":
+
+        date = arguments.get(
+            "date"
+        )
+
+        if not date:
+            return {
+                "success": False,
+                "message": (
+                    "No routine context date was provided."
+                )
+            }
+
+        return get_routine_context(
+            date=date
+        )
+
+    if tool_name == "set_work_location":
+
+        date = arguments.get(
+            "date"
+        )
+
+        location = arguments.get(
+            "location"
+        )
+
+        if not date:
+            return {
+                "success": False,
+                "message": (
+                    "No work date was provided."
+                )
+            }
+
+        if not location:
+            return {
+                "success": False,
+                "message": (
+                    "No work location was provided."
+                )
+            }
+
+        return set_work_location(
+            date=date,
+            location=location
+        )
+
+    # --------------------------------------------------
+    # Public web
+    # --------------------------------------------------
+
     if tool_name == "web_search":
+
         query = arguments.get(
             "query"
         )
@@ -621,7 +882,9 @@ def execute_tool(
         if not query:
             return {
                 "success": False,
-                "message": "No web search query was provided."
+                "message": (
+                    "No web search query was provided."
+                )
             }
 
         topic = arguments.get(
@@ -645,6 +908,7 @@ def execute_tool(
         )
 
     if tool_name == "web_read":
+
         url = arguments.get(
             "url"
         )
@@ -652,7 +916,9 @@ def execute_tool(
         if not url:
             return {
                 "success": False,
-                "message": "No webpage URL was provided."
+                "message": (
+                    "No webpage URL was provided."
+                )
             }
 
         focus = arguments.get(
@@ -674,7 +940,12 @@ def execute_tool(
             focus=focus
         )
 
+    # --------------------------------------------------
+    # Persistent memory
+    # --------------------------------------------------
+
     if tool_name == "save_memory":
+
         memory = arguments.get(
             "memory"
         )
@@ -682,7 +953,9 @@ def execute_tool(
         if not memory:
             return {
                 "success": False,
-                "message": "No memory content was provided."
+                "message": (
+                    "No memory content was provided."
+                )
             }
 
         return save_memory(
@@ -690,6 +963,7 @@ def execute_tool(
         )
 
     if tool_name == "search_memory":
+
         query = arguments.get(
             "query"
         )
@@ -697,7 +971,9 @@ def execute_tool(
         if not query:
             return {
                 "success": False,
-                "message": "No memory search query was provided."
+                "message": (
+                    "No memory search query was provided."
+                )
             }
 
         return search_memories(
@@ -708,6 +984,7 @@ def execute_tool(
         return list_memories()
 
     if tool_name == "delete_memory":
+
         query = arguments.get(
             "query"
         )
@@ -715,12 +992,18 @@ def execute_tool(
         if not query:
             return {
                 "success": False,
-                "message": "No memory deletion query was provided."
+                "message": (
+                    "No memory deletion query was provided."
+                )
             }
 
         return delete_memory(
             query
         )
+
+    # --------------------------------------------------
+    # Unknown tool
+    # --------------------------------------------------
 
     return {
         "success": False,
