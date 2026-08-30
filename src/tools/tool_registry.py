@@ -5,6 +5,10 @@ from memory.memory_store import (
     search_memories,
 )
 
+from tools.calendar_tools import (
+    get_calendar_events,
+    get_next_calendar_event,
+)
 from tools.desktop_tools import launch_application
 from tools.route_tools import get_route
 from tools.system_tools import get_system_info
@@ -59,10 +63,9 @@ TOOLS = [
         "type": "function",
         "name": "get_weather",
         "description": (
-            "Get live current weather and a short forecast for a real-world location "
-            "using an internet weather service. Use this when Oliver asks about current "
-            "weather, today's weather, tomorrow's weather, temperature, rain, or similar "
-            "weather information."
+            "Get live current weather and a short forecast for a real-world location. "
+            "Use this when Oliver asks about current weather, today's weather, "
+            "tomorrow's weather, temperature, rain, or similar weather information."
         ),
         "parameters": {
             "type": "object",
@@ -132,17 +135,71 @@ TOOLS = [
 
     {
         "type": "function",
+        "name": "get_calendar_events",
+        "description": (
+            "Read Oliver's Google Calendar for a specific upcoming time period. "
+            "Use this when Oliver asks what he has scheduled today, tomorrow, "
+            "over the next week, or over the next month. "
+            "This is Oliver's real private calendar and should be preferred over "
+            "web search for questions about his personal schedule. "
+            "Calendar access is read-only: this tool cannot create, modify, "
+            "move, or delete events."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "enum": [
+                        "today",
+                        "tomorrow",
+                        "next_7_days",
+                        "next_30_days"
+                    ],
+                    "description": (
+                        "The period of Oliver's calendar to retrieve. "
+                        "Use today for today, tomorrow for tomorrow, "
+                        "next_7_days for the coming week, and next_30_days "
+                        "for the coming month."
+                    )
+                }
+            },
+            "required": ["period"],
+            "additionalProperties": False
+        },
+        "strict": True
+    },
+
+    {
+        "type": "function",
+        "name": "get_next_calendar_event",
+        "description": (
+            "Get Oliver's next upcoming Google Calendar event. "
+            "Use this when Oliver asks what his next event, appointment, "
+            "class, deadline, meeting, or scheduled item is. "
+            "Calendar access is read-only."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False
+        },
+        "strict": True
+    },
+
+    {
+        "type": "function",
         "name": "web_search",
         "description": (
             "Search the live public internet for current or externally verifiable information. "
             "Use this when Oliver asks about recent events, news, current information, "
             "software versions, documentation, product announcements, changing facts, "
             "or something that requires information beyond the model's training knowledge. "
-            "This tool returns search results and snippets. "
+            "Do not use web search for Oliver's private calendar, memory, routes, "
+            "weather, or other information already available through a dedicated tool. "
             "If an exact or authoritative answer requires reading a source in detail, "
             "use web_read on the most relevant result after searching. "
-            "Do not use web search unnecessarily for stable facts that can be answered confidently "
-            "without current information. "
             "Never include passwords, API keys, private addresses, secret information, "
             "or private memory content in a search query unless Oliver explicitly authorises it."
         ),
@@ -204,7 +261,6 @@ TOOLS = [
             "government sources, or other authoritative sources when available. "
             "Do not invent URLs. Normally use a URL obtained from web_search or explicitly "
             "provided by Oliver. "
-            "The focus should describe the specific information being verified. "
             "This tool is for public HTTP or HTTPS webpages only."
         ),
         "parameters": {
@@ -361,8 +417,6 @@ def execute_tool(tool_name, arguments=None):
                 )
             }
 
-        # Any public transport journey beginning from home
-        # requires driving to a transit interchange first.
         if (
             origin.lower().strip() == "home"
             and mode == "transit"
@@ -374,6 +428,19 @@ def execute_tool(tool_name, arguments=None):
             destination,
             mode
         )
+
+    if tool_name == "get_calendar_events":
+        period = arguments.get(
+            "period",
+            "today"
+        )
+
+        return get_calendar_events(
+            period
+        )
+
+    if tool_name == "get_next_calendar_event":
+        return get_next_calendar_event()
 
     if tool_name == "web_search":
         query = arguments.get("query")
@@ -413,9 +480,6 @@ def execute_tool(tool_name, arguments=None):
                 "message": "No webpage URL was provided."
             }
 
-        # Models may omit focus despite the schema requesting it.
-        # Treat a missing or empty focus as a general page read
-        # instead of crashing Mairon.
         focus = arguments.get(
             "focus",
             ""
