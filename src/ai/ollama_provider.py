@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -11,6 +12,7 @@ from tools.tool_registry import TOOLS, execute_tool
 MODEL = "qwen3:14b"
 
 MAX_TOOL_ROUNDS = 12
+MAX_INBOX_READS = 3
 
 
 MAIRON_TIMEZONE = os.getenv(
@@ -22,6 +24,10 @@ LOCAL_TIMEZONE = ZoneInfo(
     MAIRON_TIMEZONE
 )
 
+
+# --------------------------------------------------
+# Client
+# --------------------------------------------------
 
 def create_client():
     return Client(
@@ -48,6 +54,30 @@ def convert_tools_for_ollama():
 OLLAMA_ACTION_TOOLS = convert_tools_for_ollama()
 
 
+def get_ollama_tool(tool_name):
+    """
+    Return one Ollama-formatted tool definition by name.
+    """
+
+    for tool in OLLAMA_ACTION_TOOLS:
+        if (
+            tool.get("function", {}).get("name")
+            == tool_name
+        ):
+            return tool
+
+    return None
+
+
+READ_EMAIL_ONLY_TOOL = get_ollama_tool(
+    "read_email"
+)
+
+
+# --------------------------------------------------
+# Permission-request tools
+# --------------------------------------------------
+
 CLOUD_ESCALATION_TOOL = {
     "type": "function",
     "function": {
@@ -58,8 +88,8 @@ CLOUD_ESCALATION_TOOL = {
             "confidently handle locally and cloud processing would materially improve "
             "the answer. Do not use this for ordinary factual questions, casual "
             "conversation, normal explanations, routine coding help, memory operations, "
-            "device-control tasks, or ordinary web research. "
-            "Calling this tool does NOT access the cloud. "
+            "device-control tasks, private email, private calendar data, or ordinary "
+            "web research. Calling this tool does NOT access the cloud. "
             "It only asks Mairon Core to request permission from Oliver."
         ),
         "parameters": {
@@ -93,11 +123,7 @@ CALENDAR_EVENT_REQUEST_TOOL = {
             "an event on his calendar. "
             "Use ISO 8601 local date/time values. "
             "The current local date and time are supplied in your runtime context. "
-            "Resolve phrases such as 'tomorrow', 'Friday', and 'next Monday' using "
-            "that runtime context. "
-            "If Oliver specifies a duration, respect it. "
-            "If Oliver gives a start time but no duration, propose a 60-minute event. "
-            "The exact proposed start and end times will be shown to Oliver before approval."
+            "If Oliver gives a start time but no duration, propose a 60-minute event."
         ),
         "parameters": {
             "type": "object",
@@ -109,8 +135,7 @@ CALENDAR_EVENT_REQUEST_TOOL = {
                 "start_time": {
                     "type": "string",
                     "description": (
-                        "Proposed event start as ISO 8601 local date/time, "
-                        "for example 2026-08-31T18:00:00+10:00."
+                        "Proposed event start as ISO 8601 local date/time."
                     )
                 },
                 "end_time": {
@@ -145,12 +170,13 @@ CALENDAR_EVENT_REQUEST_TOOL = {
 }
 
 
+# --------------------------------------------------
+# Runtime context
+# --------------------------------------------------
+
 def get_runtime_context():
     """
-    Give the local model reliable current date/time information.
-
-    This is particularly important for phrases such as
-    'tomorrow', 'Friday', and 'next week'.
+    Give Qwen reliable local date/time information.
     """
 
     now = datetime.now(
@@ -161,18 +187,17 @@ def get_runtime_context():
         "Mairon runtime context: "
         f"The current local date and time is {now.isoformat()} "
         f"({now.strftime('%A')}) in timezone {MAIRON_TIMEZONE}. "
-        "Use this value when resolving relative dates and times."
+        "Use this when resolving relative dates and times."
     )
 
+
+# --------------------------------------------------
+# Requirement detection
+# --------------------------------------------------
 
 def explicitly_requires_web_read(
     user_input
 ):
-    """
-    Detect cases where Oliver explicitly asked Mairon
-    to read/open/check an actual webpage or source.
-    """
-
     text = user_input.lower()
 
     read_phrases = [
@@ -197,14 +222,128 @@ def explicitly_requires_web_read(
     )
 
 
+def explicitly_requires_email_read(
+    user_input
+):
+    text = user_input.lower()
+
+    detail_phrases = [
+        "tell me what",
+        "what did the email",
+        "what does the email",
+        "what did it say",
+        "what does it say",
+        "what delivery method",
+        "what shipping",
+        "what did i order",
+        "what size",
+        "how much did",
+        "how much was",
+        "read the email",
+        "read that email",
+        "read the message",
+        "full email",
+        "full message",
+        "email contents",
+        "in the email",
+        "from the email",
+        "according to the email",
+    ]
+
+    return any(
+        phrase in text
+        for phrase in detail_phrases
+    )
+
+
+def is_inbox_attention_request(
+    user_input
+):
+    """
+    Detect inbox-review requests where Oliver wants Mairon
+    to decide what is important or actionable.
+    """
+
+    text = user_input.lower()
+
+    attention_phrases = [
+        "need my attention",
+        "needs my attention",
+        "need attention",
+        "needs attention",
+        "important emails",
+        "important email",
+        "emails matter",
+        "email matters",
+        "need to act",
+        "needs action",
+        "need action",
+        "action required",
+        "actionable emails",
+        "actionable email",
+        "what should i respond",
+        "what do i need to respond",
+        "inbox brief",
+        "inbox review",
+    ]
+
+    return any(
+        phrase in text
+        for phrase in attention_phrases
+    )
+
+
+def get_inbox_review_days(
+    user_input
+):
+    """
+    Resolve the requested inbox review window.
+
+    Default is seven days.
+    """
+
+    text = user_input.lower()
+
+    match = re.search(
+        r"(?:last|past|previous)\s+(\d+)\s+days?",
+        text
+    )
+
+    if match:
+        return max(
+            1,
+            min(
+                int(match.group(1)),
+                90
+            )
+        )
+
+    if "today" in text:
+        return 1
+
+    if (
+        "last week" in text
+        or "past week" in text
+        or "this week" in text
+    ):
+        return 7
+
+    if (
+        "last month" in text
+        or "past month" in text
+    ):
+        return 30
+
+    return 7
+
+
+# --------------------------------------------------
+# Result helpers
+# --------------------------------------------------
+
 def get_best_search_url(
     search_result
 ):
-    """
-    Return the first usable URL from a successful
-    web_search result.
-    """
-
     if not search_result:
         return None
 
@@ -235,6 +374,476 @@ def get_best_search_url(
     return None
 
 
+def get_email_message_ids(
+    search_result
+):
+    if not search_result:
+        return []
+
+    if not search_result.get(
+        "success"
+    ):
+        return []
+
+    emails = search_result.get(
+        "emails",
+        []
+    )
+
+    message_ids = []
+
+    for email in emails:
+        message_id = email.get(
+            "message_id"
+        )
+
+        if message_id:
+            message_ids.append(
+                message_id
+            )
+
+    return message_ids
+
+
+def normalise_tool_arguments(
+    arguments
+):
+    """
+    Ollama normally returns a dict, but tolerate JSON text
+    defensively at the tool boundary.
+    """
+
+    if isinstance(
+        arguments,
+        dict
+    ):
+        return dict(
+            arguments
+        )
+
+    if isinstance(
+        arguments,
+        str
+    ):
+        try:
+            parsed = json.loads(
+                arguments
+            )
+
+            if isinstance(
+                parsed,
+                dict
+            ):
+                return parsed
+
+        except Exception:
+            pass
+
+    return {}
+
+
+# --------------------------------------------------
+# Inbox-review finalisation
+# --------------------------------------------------
+
+def finalise_inbox_review(
+    client,
+    working_conversation
+):
+    """
+    Finish inbox triage with tools completely removed.
+
+    Internal workflow limits and tool mechanics must never
+    appear in the user-facing answer.
+    """
+
+    working_conversation.append({
+        "role": "system",
+        "content": (
+            "Produce the final inbox-attention brief now. "
+            "Do not call or request any more tools. "
+            "Do not mention tools, function calls, internal limits, "
+            "budgets, implementation details, JSON, Unicode, or the "
+            "inbox-review process itself. "
+            "Do not say that anything needs to reset. "
+
+            "Answer only the user's actual question. "
+
+            "Prioritise messages as follows:\n"
+            "- ACTION NEEDED: Oliver genuinely needs to do something.\n"
+            "- FYI: worth knowing, but no action is currently required.\n"
+            "- Ignore ordinary marketing and promotional noise.\n\n"
+
+            "You do not need to list ignored marketing emails unless "
+            "doing so is useful. Keep the answer concise and practical. "
+            "If an important message is ambiguous, say briefly what is "
+            "known from the available evidence rather than discussing "
+            "why more information was not retrieved."
+        )
+    })
+
+    final_response = client.chat(
+        model=MODEL,
+        messages=working_conversation
+    )
+
+    working_conversation.append(
+        final_response.message
+    )
+
+    return (
+        final_response.message.content,
+        working_conversation,
+        None,
+        None
+    )
+
+
+# --------------------------------------------------
+# Deterministic inbox-attention workflow
+# --------------------------------------------------
+
+def handle_inbox_attention_request(
+    client,
+    user_input,
+    conversation
+):
+    """
+    Run inbox triage as a constrained local workflow.
+
+    Core fetches the requested email window once.
+
+    Qwen may inspect only specific matching emails and may
+    never wander into weather, web search, memory, routes,
+    Calendar, or other unrelated capabilities.
+    """
+
+    days = get_inbox_review_days(
+        user_input
+    )
+
+    print(
+        "[Core] Inbox review: fetching read and unread "
+        f"email from the last {days} day(s)."
+    )
+
+    print(
+        "[Tool] Mairon Core required: get_recent_emails"
+    )
+
+    inbox_result = execute_tool(
+        "get_recent_emails",
+        {
+            "days": days,
+            "max_results": 20,
+            "unread_only": False
+        }
+    )
+
+    working_conversation = list(
+        conversation
+    )
+
+    working_conversation.append({
+        "role": "system",
+        "content": get_runtime_context()
+    })
+
+    working_conversation.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    if not inbox_result.get(
+        "success"
+    ):
+        error_message = inbox_result.get(
+            "message",
+            "Unknown Gmail error."
+        )
+
+        answer = (
+            "I couldn't complete the inbox review because "
+            f"Gmail returned an error: {error_message}"
+        )
+
+        working_conversation.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        return (
+            answer,
+            working_conversation,
+            None,
+            None
+        )
+
+    emails = inbox_result.get(
+        "emails",
+        []
+    )
+
+    if not emails:
+        answer = (
+            f"You don't have any emails in the last {days} "
+            "day(s) in that review window."
+        )
+
+        working_conversation.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        return (
+            answer,
+            working_conversation,
+            None,
+            None
+        )
+
+    valid_message_ids = {
+        email.get("message_id")
+        for email in emails
+        if email.get("message_id")
+    }
+
+    working_conversation.append({
+        "role": "system",
+        "content": (
+            "You are performing a private local inbox-attention review for Oliver. "
+            "Stay strictly on the inbox task. "
+
+            "The email summaries below were fetched from Gmail by Mairon Core "
+            "and include both read and unread messages. "
+            "Read status is not the same as importance.\n\n"
+
+            "Classify messages using these rules:\n"
+
+            "- ACTION NEEDED: Oliver genuinely needs to do something, reply, "
+            "pay, submit, fix, confirm, attend, investigate, or make a decision.\n"
+
+            "- FYI: useful information worth knowing, but no action is currently required.\n"
+
+            "- IGNORE: ordinary marketing, promotions, newsletters, surveys, "
+            "sales, or noise.\n\n"
+
+            "Use sender, subject, date, and snippet first. "
+            "Most messages should be classifiable from those summaries alone. "
+
+            "Only use read_email when a message appears potentially important "
+            "but the summary genuinely does not contain enough information to "
+            "decide whether Oliver should act. "
+
+            "Do not read promotional emails merely to inspect them. "
+            "Do not search memory. "
+            "Do not discuss Unicode or formatting. "
+            "Do not discuss tools or implementation. "
+            "Do not drift into unrelated topics. "
+
+            "Security notifications such as sign-ins, password resets, "
+            "account changes, OAuth authorizations, or recovery events should "
+            "generally be surfaced if Oliver may need to verify that he initiated them. "
+
+            "Keep the eventual final answer concise and useful.\n\n"
+
+            "EMAIL SUMMARIES:\n"
+            f"{json.dumps(emails, ensure_ascii=False)}"
+        )
+    })
+
+    available_tools = (
+        [READ_EMAIL_ONLY_TOOL]
+        if READ_EMAIL_ONLY_TOOL
+        else []
+    )
+
+    read_count = 0
+    read_cache = {}
+
+    # --------------------------------------------------
+    # Allow a few focused inspection rounds
+    # --------------------------------------------------
+
+    for _ in range(6):
+
+        # Once the inspection budget is used, immediately
+        # remove tools and force a normal final answer.
+        if read_count >= MAX_INBOX_READS:
+            return finalise_inbox_review(
+                client,
+                working_conversation
+            )
+
+        if available_tools:
+            response = client.chat(
+                model=MODEL,
+                messages=working_conversation,
+                tools=available_tools
+            )
+
+        else:
+            response = client.chat(
+                model=MODEL,
+                messages=working_conversation
+            )
+
+        tool_calls = (
+            response.message.tool_calls
+            or []
+        )
+
+        # Qwen has finished inspecting messages.
+        #
+        # Do not return its intermediate response directly.
+        # Force one final tool-free pass so it returns to
+        # Oliver's ORIGINAL inbox-review request and
+        # considers all email summaries, not merely the
+        # last message it inspected.
+        if not tool_calls:
+            working_conversation.append(
+                response.message
+            )
+
+            return finalise_inbox_review(
+                client,
+                working_conversation
+            )
+
+        working_conversation.append(
+            response.message
+        )
+
+        for tool_call in tool_calls:
+            tool_name = (
+                tool_call.function.name
+            )
+
+            arguments = normalise_tool_arguments(
+                tool_call.function.arguments
+            )
+
+            if tool_name != "read_email":
+                working_conversation.append({
+                    "role": "tool",
+                    "tool_name": tool_name,
+                    "content": json.dumps({
+                        "success": False,
+                        "message": (
+                            "That capability is not available "
+                            "during inbox review."
+                        )
+                    })
+                })
+
+                continue
+
+            message_id = (
+                arguments.get(
+                    "message_id"
+                )
+                or ""
+            ).strip()
+
+            if message_id not in valid_message_ids:
+                working_conversation.append({
+                    "role": "tool",
+                    "tool_name": "read_email",
+                    "content": json.dumps({
+                        "success": False,
+                        "message": (
+                            "That message is not part of the "
+                            "current inbox review."
+                        )
+                    })
+                })
+
+                continue
+
+            # Re-reading an already inspected message does
+            # not consume another inspection.
+            if message_id in read_cache:
+                read_result = read_cache[
+                    message_id
+                ]
+
+                working_conversation.append({
+                    "role": "tool",
+                    "tool_name": "read_email",
+                    "content": json.dumps(
+                        read_result,
+                        ensure_ascii=False
+                    )
+                })
+
+                continue
+
+            # If Qwen requested several reads in one model
+            # response, satisfy only those that fit within
+            # the review's private inspection budget.
+            if read_count >= MAX_INBOX_READS:
+                working_conversation.append({
+                    "role": "tool",
+                    "tool_name": "read_email",
+                    "content": json.dumps({
+                        "success": False,
+                        "message": (
+                            "This message was not expanded. "
+                            "Use its existing sender, subject, "
+                            "date, and snippet when completing "
+                            "the inbox review."
+                        )
+                    })
+                })
+
+                continue
+
+            print(
+                "[Tool] Mairon requested: read_email"
+            )
+
+            read_result = execute_tool(
+                "read_email",
+                {
+                    "message_id": message_id
+                }
+            )
+
+            read_cache[
+                message_id
+            ] = read_result
+
+            read_count += 1
+
+            working_conversation.append({
+                "role": "tool",
+                "tool_name": "read_email",
+                "content": json.dumps(
+                    read_result,
+                    ensure_ascii=False
+                )
+            })
+
+        # If that batch used the remaining reads, don't
+        # expose another tool-enabled round to Qwen.
+        if read_count >= MAX_INBOX_READS:
+            return finalise_inbox_review(
+                client,
+                working_conversation
+            )
+
+    # If Qwen somehow loops without finishing, Core ends
+    # the workflow cleanly rather than exposing internals.
+    return finalise_inbox_review(
+        client,
+        working_conversation
+    )
+
+
+# --------------------------------------------------
+# Main local provider
+# --------------------------------------------------
+
 def get_response(
     client,
     user_input,
@@ -250,6 +859,20 @@ def get_response(
             }
         ]
 
+    # --------------------------------------------------
+    # Inbox-attention requests use their own constrained
+    # private workflow.
+    # --------------------------------------------------
+
+    if is_inbox_attention_request(
+        user_input
+    ):
+        return handle_inbox_attention_request(
+            client,
+            user_input,
+            conversation
+        )
+
     base_conversation = list(
         conversation
     )
@@ -258,7 +881,6 @@ def get_response(
         conversation
     )
 
-    # Fresh runtime context for every user turn.
     working_conversation.append({
         "role": "system",
         "content": get_runtime_context()
@@ -273,8 +895,6 @@ def get_response(
         OLLAMA_ACTION_TOOLS
     )
 
-    # This is a request-only authority tool.
-    # It cannot perform a Calendar write.
     tools.append(
         CALENDAR_EVENT_REQUEST_TOOL
     )
@@ -290,12 +910,22 @@ def get_response(
         )
     )
 
+    require_email_read = (
+        explicitly_requires_email_read(
+            user_input
+        )
+    )
+
     tools_used = []
 
     last_web_search_result = None
+    last_email_search_result = None
 
     web_read_reminder_sent = False
     core_web_read_performed = False
+
+    email_read_reminder_sent = False
+    core_email_read_performed = False
 
     tool_rounds = 0
 
@@ -325,7 +955,7 @@ def get_response(
         )
 
         # --------------------------------------------------
-        # Calendar event creation permission request
+        # Calendar write permission request
         # --------------------------------------------------
 
         for tool_call in tool_calls:
@@ -333,9 +963,8 @@ def get_response(
                 tool_call.function.name
                 == "request_calendar_event_creation"
             ):
-                arguments = (
+                arguments = normalise_tool_arguments(
                     tool_call.function.arguments
-                    or {}
                 )
 
                 required_fields = [
@@ -365,12 +994,14 @@ def get_response(
                             "message": (
                                 "Calendar creation request is "
                                 "missing required fields: "
-                                + ", ".join(missing_fields)
+                                + ", ".join(
+                                    missing_fields
+                                )
                             )
                         })
                     })
 
-                    continue
+                    break
 
                 pending_action = {
                     "type": "create_calendar_event",
@@ -385,11 +1016,6 @@ def get_response(
                     ) or None,
                 }
 
-                # Important:
-                # return the pre-request state.
-                #
-                # We do not want an unfinished tool call
-                # stored in conversation history.
                 return (
                     None,
                     base_conversation,
@@ -398,7 +1024,7 @@ def get_response(
                 )
 
         # --------------------------------------------------
-        # Cloud escalation permission request
+        # Cloud permission request
         # --------------------------------------------------
 
         for tool_call in tool_calls:
@@ -406,9 +1032,8 @@ def get_response(
                 tool_call.function.name
                 == "request_cloud_escalation"
             ):
-                arguments = (
+                arguments = normalise_tool_arguments(
                     tool_call.function.arguments
-                    or {}
                 )
 
                 reason = arguments.get(
@@ -427,10 +1052,14 @@ def get_response(
                 )
 
         # --------------------------------------------------
-        # Model wants to provide final answer
+        # Qwen wants to provide final answer
         # --------------------------------------------------
 
         if not tool_calls:
+
+            # ==============================================
+            # Webpage read enforcement
+            # ==============================================
 
             web_search_was_used = (
                 "web_search" in tools_used
@@ -457,10 +1086,10 @@ def get_response(
                         "role": "system",
                         "content": (
                             "Oliver explicitly required you to read an actual "
-                            "source before answering. You have searched the web "
-                            "but have not used web_read. Do not answer yet. "
-                            "Choose the most relevant authoritative URL from the "
-                            "search results and call web_read on that page."
+                            "source before answering. You searched the web but "
+                            "have not used web_read. Do not answer yet. "
+                            "Choose the most relevant authoritative URL and "
+                            "call web_read."
                         )
                     })
 
@@ -498,29 +1127,146 @@ def get_response(
                             "role": "system",
                             "content": (
                                 "Mairon Core enforced Oliver's requirement "
-                                "to read a source before answering. "
-                                f"The selected source was:\n{candidate_url}\n\n"
-                                "The extracted webpage result is:\n"
+                                "to read a source before answering.\n\n"
+                                f"Source:\n{candidate_url}\n\n"
+                                "Extracted content:\n"
                                 f"{json.dumps(read_result)}\n\n"
-                                "Now answer Oliver's original question using "
-                                "the source content that was actually read. "
-                                "Do not claim anything was verified unless it "
-                                "is supported by that content."
+                                "Answer the original question using the "
+                                "content that was actually read."
                             )
                         })
 
                         continue
 
-                    return (
-                        (
-                            "I completed the web search, but I could not "
-                            "find a usable webpage to read, so I won't "
-                            "pretend the source was verified."
-                        ),
-                        working_conversation,
-                        None,
-                        None
+            # ==============================================
+            # Gmail read enforcement
+            # ==============================================
+
+            email_search_was_used = (
+                "find_emails" in tools_used
+                or "get_recent_emails" in tools_used
+            )
+
+            email_read_was_used = (
+                "read_email" in tools_used
+            )
+
+            missing_required_email_read = (
+                require_email_read
+                and email_search_was_used
+                and not email_read_was_used
+            )
+
+            if missing_required_email_read:
+
+                message_ids = get_email_message_ids(
+                    last_email_search_result
+                )
+
+                if (
+                    len(message_ids) == 1
+                    and not core_email_read_performed
+                ):
+                    message_id = message_ids[0]
+
+                    print(
+                        "[Tool] Mairon Core required: read_email"
                     )
+
+                    read_result = execute_tool(
+                        "read_email",
+                        {
+                            "message_id": message_id
+                        }
+                    )
+
+                    tools_used.append(
+                        "read_email"
+                    )
+
+                    core_email_read_performed = True
+
+                    working_conversation.append({
+                        "role": "system",
+                        "content": (
+                            "Mairon Core enforced Oliver's requirement "
+                            "to inspect the contents of the relevant email "
+                            "before answering.\n\n"
+                            "The selected email was read and returned:\n"
+                            f"{json.dumps(read_result)}\n\n"
+                            "Now answer Oliver's original question using "
+                            "the actual email contents. Do not ask Oliver "
+                            "whether you should read the email: it has "
+                            "already been read."
+                        )
+                    })
+
+                    continue
+
+                if (
+                    len(message_ids) > 1
+                    and not email_read_reminder_sent
+                ):
+                    working_conversation.append(
+                        response.message
+                    )
+
+                    working_conversation.append({
+                        "role": "system",
+                        "content": (
+                            "Oliver's question requires information from "
+                            "inside one of the matching emails. You have "
+                            "only searched Gmail and have not used read_email. "
+                            "Do not answer yet. Select the most relevant "
+                            "message_id from the Gmail results and call "
+                            "read_email."
+                        )
+                    })
+
+                    email_read_reminder_sent = True
+
+                    continue
+
+                if (
+                    len(message_ids) > 1
+                    and not core_email_read_performed
+                ):
+                    message_id = message_ids[0]
+
+                    print(
+                        "[Tool] Mairon Core required: read_email"
+                    )
+
+                    read_result = execute_tool(
+                        "read_email",
+                        {
+                            "message_id": message_id
+                        }
+                    )
+
+                    tools_used.append(
+                        "read_email"
+                    )
+
+                    core_email_read_performed = True
+
+                    working_conversation.append({
+                        "role": "system",
+                        "content": (
+                            "Mairon Core enforced the required Gmail read. "
+                            "The most relevant available matching message "
+                            "was read.\n\n"
+                            f"{json.dumps(read_result)}\n\n"
+                            "Answer Oliver using the contents that were "
+                            "actually retrieved."
+                        )
+                    })
+
+                    continue
+
+            # ==============================================
+            # Requirements satisfied
+            # ==============================================
 
             working_conversation.append(
                 response.message
@@ -546,17 +1292,14 @@ def get_response(
                 tool_call.function.name
             )
 
-            # Special permission tools are handled above
-            # and must never reach execute_tool().
             if tool_name in (
                 "request_cloud_escalation",
                 "request_calendar_event_creation",
             ):
                 continue
 
-            arguments = (
+            arguments = normalise_tool_arguments(
                 tool_call.function.arguments
-                or {}
             )
 
             print(
@@ -574,6 +1317,14 @@ def get_response(
 
             if tool_name == "web_search":
                 last_web_search_result = (
+                    tool_result
+                )
+
+            if tool_name in (
+                "find_emails",
+                "get_recent_emails",
+            ):
+                last_email_search_result = (
                     tool_result
                 )
 
