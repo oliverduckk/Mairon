@@ -19,8 +19,10 @@ CREDENTIALS_PATH = GOOGLE_DATA_DIR / "credentials.json"
 TOKEN_PATH = GOOGLE_DATA_DIR / "token.json"
 
 
+# Allows Mairon to read and manage events on calendars
+# owned by Oliver, without broader Calendar administration.
 SCOPES = [
-    "https://www.googleapis.com/auth/calendar.readonly"
+    "https://www.googleapis.com/auth/calendar.events.owned"
 ]
 
 
@@ -38,9 +40,8 @@ def get_credentials():
     """
     Load Mairon's Google OAuth credentials.
 
-    token.json is reused between runs. If the access token
-    expires and a refresh token exists, Google automatically
-    refreshes it.
+    If no valid token exists, Google will ask Oliver
+    to authorize the configured Calendar scope.
     """
 
     credentials = None
@@ -93,7 +94,7 @@ def get_credentials():
 
 def create_calendar_service():
     """
-    Create an authenticated read-only Google Calendar client.
+    Create an authenticated Google Calendar API client.
     """
 
     credentials = get_credentials()
@@ -382,21 +383,132 @@ def get_next_calendar_event():
         }
 
 
+def create_calendar_event(
+    summary,
+    start_time,
+    end_time,
+    location=None,
+    description=None
+):
+    """
+    Create an event on Oliver's primary Google Calendar.
+
+    SECURITY NOTE:
+    This function performs the actual write.
+
+    It must NOT be exposed directly to the AI model.
+    Mairon Core must obtain explicit user approval before
+    this function is ever called.
+    """
+
+    if not summary:
+        return {
+            "success": False,
+            "message": "Event summary is required."
+        }
+
+    if not start_time or not end_time:
+        return {
+            "success": False,
+            "message": (
+                "Event start and end times are required."
+            )
+        }
+
+    try:
+        start_datetime = datetime.fromisoformat(
+            start_time
+        )
+
+        end_datetime = datetime.fromisoformat(
+            end_time
+        )
+
+        if start_datetime.tzinfo is None:
+            start_datetime = start_datetime.replace(
+                tzinfo=LOCAL_TIMEZONE
+            )
+
+        if end_datetime.tzinfo is None:
+            end_datetime = end_datetime.replace(
+                tzinfo=LOCAL_TIMEZONE
+            )
+
+        if end_datetime <= start_datetime:
+            return {
+                "success": False,
+                "message": (
+                    "Event end time must be after its start time."
+                )
+            }
+
+        event_body = {
+            "summary": summary,
+            "start": {
+                "dateTime": start_datetime.isoformat(),
+                "timeZone": MAIRON_TIMEZONE,
+            },
+            "end": {
+                "dateTime": end_datetime.isoformat(),
+                "timeZone": MAIRON_TIMEZONE,
+            },
+        }
+
+        if location:
+            event_body["location"] = location
+
+        if description:
+            event_body["description"] = description
+
+        service = create_calendar_service()
+
+        created_event = (
+            service.events()
+            .insert(
+                calendarId="primary",
+                body=event_body
+            )
+            .execute()
+        )
+
+        return {
+            "success": True,
+            "message": "Calendar event created.",
+            "event": normalise_event(
+                created_event
+            )
+        }
+
+    except ValueError:
+        return {
+            "success": False,
+            "message": (
+                "Invalid event date/time format."
+            )
+        }
+
+    except HttpError as error:
+        return {
+            "success": False,
+            "message": (
+                f"Google Calendar API error: {error}"
+            )
+        }
+
+    except Exception as error:
+        return {
+            "success": False,
+            "message": (
+                f"Calendar event creation failed: {error}"
+            )
+        }
+
+
 if __name__ == "__main__":
     print("TODAY:")
     print(
         json.dumps(
             get_calendar_events("today"),
-            indent=2
-        )
-    )
-
-    print()
-
-    print("TOMORROW:")
-    print(
-        json.dumps(
-            get_calendar_events("tomorrow"),
             indent=2
         )
     )

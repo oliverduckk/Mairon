@@ -3,9 +3,12 @@ import os
 from dotenv import load_dotenv
 
 from ai.provider import create_provider
+from core.action_manager import describe_action
 from core.router import (
     approve_cloud_escalation,
+    approve_pending_action,
     decline_cloud_escalation,
+    decline_pending_action,
     route_message,
 )
 
@@ -19,14 +22,19 @@ load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 input_name = os.getenv("MAIRON_USER_NAME")
 
+
 # --------------------------------------------------
 # AI providers
 # --------------------------------------------------
 
 try:
     local_ai = create_provider("ollama")
+
 except Exception as error:
-    print(f"Failed to start local AI provider: {error}")
+    print(
+        f"Failed to start local AI provider: {error}"
+    )
+
     raise SystemExit
 
 
@@ -34,9 +42,16 @@ cloud_ai = None
 
 if api_key:
     try:
-        cloud_ai = create_provider("openai", api_key)
+        cloud_ai = create_provider(
+            "openai",
+            api_key
+        )
+
     except Exception as error:
-        print(f"Cloud AI provider could not be started: {error}")
+        print(
+            "Cloud AI provider could not be started: "
+            f"{error}"
+        )
 
 
 # --------------------------------------------------
@@ -47,10 +62,19 @@ print("Mairon v0.1 starting...")
 print("Default AI: Local Qwen3 14B")
 
 if cloud_ai:
-    print("Cloud escalation: GPT-5.6 Luna")
-    print("Use /cloud before a message to explicitly use cloud processing.")
+    print(
+        "Cloud escalation: GPT-5.6 Luna"
+    )
+
+    print(
+        "Use /cloud before a message to explicitly "
+        "use cloud processing."
+    )
+
 else:
-    print("Cloud escalation: unavailable")
+    print(
+        "Cloud escalation: unavailable"
+    )
 
 print()
 
@@ -59,12 +83,14 @@ print()
 # User
 # --------------------------------------------------
 
-input_name = os.getenv("MAIRON_USER_NAME")
-
 if not input_name:
-    input_name = input("What is your name? ").strip()
+    input_name = input(
+        "What is your name? "
+    ).strip()
 
-print(f"Good evening, {input_name}.\n")
+print(
+    f"Good evening, {input_name}.\n"
+)
 
 
 # --------------------------------------------------
@@ -110,8 +136,8 @@ Safety and accuracy:
   prioritise clear and accurate communication over humour.
 - Do not invent facts simply to provide an answer.
 - If you genuinely do not know something, say so.
-- Do not claim to observe things you cannot actually observe. You may make playful
-  guesses, but clearly treat them as guesses rather than facts.
+- Do not claim to observe things you cannot actually observe.
+- You may make playful guesses, but clearly treat them as guesses rather than facts.
 
 Capabilities:
 - Never claim or suggest that you can perform an action unless one of your currently
@@ -125,6 +151,17 @@ Capabilities:
   current conversation or the user has asked for an action that a tool can perform.
 - Do not force available capabilities into casual conversation simply because you
   have access to them.
+
+Permission-gated actions:
+- Some actions can only be requested, not performed directly by you.
+- Requesting an action does not grant permission to execute it.
+- Mairon Core may show the proposed action to {input_name} and require explicit approval.
+- Never claim a permission-gated action has occurred until Mairon Core confirms success.
+- Calendar event creation requires explicit approval from {input_name}.
+- If {input_name} asks to create, add, schedule, or put an event on his calendar,
+  request calendar event creation using the available permission-request tool.
+- Do not claim the event has been created merely because you requested it.
+- If approval is denied, accept the decision and do not imply that the event exists.
 
 Persistent memory:
 - Only save information to persistent memory when {input_name} explicitly asks you
@@ -173,19 +210,27 @@ cloud_state = None
 # --------------------------------------------------
 
 while True:
-    user_input = input("You: ").strip()
+    user_input = input(
+        "You: "
+    ).strip()
 
     if not user_input:
         continue
 
     if user_input.lower() == "exit":
-        print("Mairon: Shutting down.")
+        print(
+            "Mairon: Shutting down."
+        )
         break
 
+    # --------------------------------------------------
+    # Route the message
+    # --------------------------------------------------
+
     result = route_message(
-        user_input,
         local_ai,
         cloud_ai,
+        user_input,
         mairon_instructions,
         local_state,
         cloud_state
@@ -195,21 +240,36 @@ while True:
     cloud_state = result.cloud_state
 
     # --------------------------------------------------
-    # Human approval required
+    # Cloud approval
     # --------------------------------------------------
 
-    if result.status == "cloud_approval_required":
-        print()
-        print("[Router] Mairon recommends cloud processing.")
-        print(f"Reason: {result.reason}")
+    if (
+        result.status
+        == "cloud_approval_required"
+    ):
         print()
 
-        approval = input("Use GPT-5.6 Luna? [y/N]: ").strip().lower()
+        print(
+            "[Router] Mairon recommends cloud processing."
+        )
 
-        if approval in ("y", "yes"):
+        print(
+            f"Reason: {result.reason}"
+        )
+
+        print()
+
+        approval = input(
+            "Use GPT-5.6 Luna? [y/N]: "
+        ).strip().lower()
+
+        if approval in (
+            "y",
+            "yes"
+        ):
             result = approve_cloud_escalation(
-                result.pending_prompt,
                 cloud_ai,
+                result.pending_prompt,
                 mairon_instructions,
                 local_state,
                 cloud_state
@@ -217,8 +277,8 @@ while True:
 
         else:
             result = decline_cloud_escalation(
-                result.pending_prompt,
                 local_ai,
+                result.pending_prompt,
                 mairon_instructions,
                 local_state,
                 cloud_state
@@ -227,4 +287,55 @@ while True:
         local_state = result.local_state
         cloud_state = result.cloud_state
 
-    print(f"Mairon: {result.answer}\n")
+    # --------------------------------------------------
+    # Permission-gated action approval
+    # --------------------------------------------------
+
+    if (
+        result.status
+        == "action_approval_required"
+    ):
+        print()
+
+        print(
+            "[Permission] Mairon is requesting "
+            "a calendar write."
+        )
+
+        print()
+
+        print(
+            describe_action(
+                result.pending_action
+            )
+        )
+
+        print()
+
+        approval = input(
+            "Create this event? [y/N]: "
+        ).strip().lower()
+
+        if approval in (
+            "y",
+            "yes"
+        ):
+            result = approve_pending_action(
+                result
+            )
+
+        else:
+            result = decline_pending_action(
+                result
+            )
+
+        local_state = result.local_state
+        cloud_state = result.cloud_state
+
+    # --------------------------------------------------
+    # Final response
+    # --------------------------------------------------
+
+    print(
+        f"Mairon: {result.answer}\n"
+    )
