@@ -8,6 +8,13 @@ from ollama import Client
 
 from tools.tool_registry import TOOLS, execute_tool
 
+from personality.personality_engine import (
+    build_retry_instruction,
+    build_runtime_personality_instruction,
+    find_personality_violations,
+    should_use_direct_conversation,
+)
+
 from routine.night_routine import (
     complete_night_routine_work_location,
     prepare_night_routine,
@@ -91,6 +98,11 @@ READ_EMAIL_ONLY_TOOL = get_ollama_tool(
 
 ROUTE_ONLY_TOOL = get_ollama_tool(
     "get_route"
+)
+
+
+WEATHER_ONLY_TOOL = get_ollama_tool(
+    "get_weather"
 )
 
 
@@ -483,6 +495,246 @@ def get_inbox_review_days(
         return 30
 
     return 7
+
+
+# --------------------------------------------------
+# Weather detection / constrained workflow
+# --------------------------------------------------
+
+def is_direct_weather_request(
+    user_input
+):
+    """
+    Detect ordinary current/forecast weather questions that should use
+    Mairon's dedicated weather source rather than the generic public web.
+
+    Research/news/climate-analysis requests are intentionally excluded so
+    they can still reach normal web tools when appropriate.
+    """
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        user_input.lower().strip()
+    )
+
+    weather_terms = [
+        "weather",
+        "temperature",
+        "forecast",
+        "rain",
+        "raining",
+        "rainy",
+        "wind",
+        "windy",
+        "degrees",
+    ]
+
+    if not any(
+        term in text
+        for term in weather_terms
+    ):
+        return False
+
+    research_phrases = [
+        "why has",
+        "why is",
+        "why was",
+        "news",
+        "article",
+        "articles",
+        "search the web",
+        "web search",
+        "look up",
+        "research",
+        "climate",
+        "historical",
+        "history of",
+        "record",
+    ]
+
+    if any(
+        phrase in text
+        for phrase in research_phrases
+    ):
+        return False
+
+    return True
+
+
+def finalise_weather_request(
+    client,
+    user_input,
+    conversation,
+    weather_result,
+    requested_location
+):
+    """
+    Produce a short, tool-free answer grounded only in the dedicated
+    weather result.
+    """
+
+    final_messages = get_isolated_system_context(
+        conversation
+    )
+
+    final_messages.append({
+        "role": "system",
+        "content": get_runtime_context()
+    })
+
+    final_messages.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    final_messages.append({
+        "role": "system",
+        "content": (
+            "Mairon Core classified this as an ordinary weather request and used "
+            "the dedicated weather source. Use ONLY the authoritative weather data "
+            "below for factual weather claims. Do not search the web and do not "
+            "mention tools, JSON, or implementation details. Answer naturally and "
+            "briefly, normally one to three sentences unless Oliver asked for more "
+            "detail. If the result is unavailable or failed, say so plainly rather "
+            "than inventing conditions. The requested/default location was "
+            f"{requested_location!r}.\n\n"
+            "AUTHORITATIVE WEATHER RESULT:\n"
+            f"{json.dumps(weather_result, ensure_ascii=False)}"
+        )
+    })
+
+    response = client.chat(
+        model=MODEL,
+        messages=final_messages
+    )
+
+    working_conversation = list(
+        conversation
+    )
+
+    working_conversation.append({
+        "role": "system",
+        "content": get_runtime_context()
+    })
+
+    working_conversation.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    working_conversation.append(
+        response.message
+    )
+
+    return (
+        response.message.content,
+        working_conversation,
+        None,
+        None
+    )
+
+
+def handle_weather_request(
+    client,
+    user_input,
+    conversation
+):
+    """
+    Resolve an ordinary weather request through get_weather only.
+
+    Qwen may extract an explicitly requested location, but it cannot
+    choose web_search or any unrelated tool inside this workflow.
+    If no location is supplied, Core uses MAIRON_WEATHER_LOCATION.
+    """
+
+    location = MAIRON_WEATHER_LOCATION
+
+    if WEATHER_ONLY_TOOL:
+        extraction_messages = get_isolated_system_context(
+            conversation
+        )
+
+        extraction_messages.append({
+            "role": "system",
+            "content": get_runtime_context()
+        })
+
+        extraction_messages.append({
+            "role": "user",
+            "content": user_input
+        })
+
+        extraction_messages.append({
+            "role": "system",
+            "content": (
+                "Mairon Core has classified this as an ordinary current/forecast "
+                "weather request. The ONLY available capability is get_weather. "
+                f"If Oliver explicitly named a location, call get_weather with that "
+                f"location. If he did not name a location, call get_weather with the "
+                f"default location exactly as follows: {MAIRON_WEATHER_LOCATION!r}. "
+                "Do not answer from memory. Do not search the web."
+            )
+        })
+
+        response = client.chat(
+            model=MODEL,
+            messages=extraction_messages,
+            tools=[
+                WEATHER_ONLY_TOOL
+            ]
+        )
+
+        tool_calls = (
+            response.message.tool_calls
+            or []
+        )
+
+        for tool_call in tool_calls:
+            if (
+                tool_call.function.name
+                != "get_weather"
+            ):
+                continue
+
+            arguments = normalise_tool_arguments(
+                tool_call.function.arguments
+            )
+
+            candidate_location = arguments.get(
+                "location"
+            )
+
+            if (
+                isinstance(candidate_location, str)
+                and candidate_location.strip()
+            ):
+                location = candidate_location.strip()
+
+            break
+
+    print(
+        "[Core] Weather workflow: dedicated weather source."
+    )
+
+    print(
+        "[Tool] Mairon Core required: get_weather"
+    )
+
+    weather_result = execute_tool(
+        "get_weather",
+        {
+            "location": location
+        }
+    )
+
+    return finalise_weather_request(
+        client=client,
+        user_input=user_input,
+        conversation=conversation,
+        weather_result=weather_result,
+        requested_location=location
+    )
 
 
 # --------------------------------------------------
@@ -3537,6 +3789,176 @@ def handle_inbox_attention_request(
 
 
 # --------------------------------------------------
+# Personality / direct-conversation workflow
+# --------------------------------------------------
+
+MAX_PERSONALITY_DRAFTS = 3
+
+
+def handle_direct_conversation(
+    client,
+    user_input,
+    conversation,
+    allow_cloud_escalation=False
+):
+    """
+    Tool-free normal conversation with a compact runtime personality
+    layer and Core validation.
+
+    Ordinary chat should not expose Gmail, Calendar, routine, web,
+    weather, route, alarm, memory, or desktop tools merely because
+    Qwen happens to notice a word such as "today".
+
+    The optional cloud-escalation request tool can remain available
+    because asking Oliver for permission is not itself external data
+    access.
+    """
+
+    base_messages = list(
+        conversation
+    )
+
+    base_messages.append({
+        "role": "system",
+        "content": get_runtime_context()
+    })
+
+    base_messages.append({
+        "role": "system",
+        "content": build_runtime_personality_instruction()
+    })
+
+    base_messages.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    conversation_tools = []
+
+    if allow_cloud_escalation:
+        conversation_tools.append(
+            CLOUD_ESCALATION_TOOL
+        )
+
+    response = None
+    violations = []
+
+    for attempt in range(
+        1,
+        MAX_PERSONALITY_DRAFTS + 1
+    ):
+        attempt_messages = list(
+            base_messages
+        )
+
+        if attempt > 1:
+            attempt_messages.append({
+                "role": "system",
+                "content": build_retry_instruction(
+                    violations=violations,
+                    attempt_number=attempt
+                )
+            })
+
+        chat_kwargs = {
+            "model": MODEL,
+            "messages": attempt_messages,
+        }
+
+        if conversation_tools:
+            chat_kwargs[
+                "tools"
+            ] = conversation_tools
+
+        response = client.chat(
+            **chat_kwargs
+        )
+
+        tool_calls = (
+            response.message.tool_calls
+            or []
+        )
+
+        for tool_call in tool_calls:
+            if (
+                tool_call.function.name
+                == "request_cloud_escalation"
+            ):
+                arguments = normalise_tool_arguments(
+                    tool_call.function.arguments
+                )
+
+                reason = arguments.get(
+                    "reason",
+                    (
+                        "The local model believes this request "
+                        "would materially benefit from cloud processing."
+                    )
+                )
+
+                return (
+                    None,
+                    list(conversation),
+                    reason,
+                    None
+                )
+
+        # No external action tools exist in this mode. If Qwen somehow
+        # produces an unusable tool-only response, retry as plain chat.
+        if tool_calls:
+            violations = [
+                "attempted a tool call during direct conversation"
+            ]
+            continue
+
+        violations = find_personality_violations(
+            response.message.content
+        )
+
+        if not violations:
+            break
+
+        print(
+            "[Personality] Rejected draft: "
+            + ", ".join(
+                violations
+            )
+        )
+
+    if response is None:
+        raise RuntimeError(
+            "Direct-conversation generation returned no response."
+        )
+
+    # Store only the accepted/final turn. Rejected drafts and runtime
+    # personality repair prompts do not pollute the conversation history.
+    working_conversation = list(
+        conversation
+    )
+
+    working_conversation.append({
+        "role": "system",
+        "content": get_runtime_context()
+    })
+
+    working_conversation.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    working_conversation.append(
+        response.message
+    )
+
+    return (
+        response.message.content,
+        working_conversation,
+        None,
+        None
+    )
+
+
+# --------------------------------------------------
 # Main local provider
 # --------------------------------------------------
 
@@ -3577,6 +3999,20 @@ def get_response(
 
         if pending_result is not None:
             return pending_result
+
+    # --------------------------------------------------
+    # Ordinary weather questions use the dedicated weather
+    # workflow before Qwen sees the general web tool pool.
+    # --------------------------------------------------
+
+    if is_direct_weather_request(
+        user_input
+    ):
+        return handle_weather_request(
+            client=client,
+            user_input=user_input,
+            conversation=conversation
+        )
 
     # --------------------------------------------------
     # Conversational route follow-ups reuse the most recent
@@ -3674,6 +4110,25 @@ def get_response(
             client,
             user_input,
             conversation
+        )
+
+    # --------------------------------------------------
+    # Ordinary conversation / explanation / banter uses a
+    # tool-free personality path.
+    #
+    # Dedicated workflows above still take priority. Messages
+    # that genuinely require external/private/current data keep
+    # the normal general tool loop below.
+    # --------------------------------------------------
+
+    if should_use_direct_conversation(
+        user_input
+    ):
+        return handle_direct_conversation(
+            client=client,
+            user_input=user_input,
+            conversation=conversation,
+            allow_cloud_escalation=allow_cloud_escalation
         )
 
     base_conversation = list(

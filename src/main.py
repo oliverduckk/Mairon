@@ -1,8 +1,11 @@
 import os
+import re
 
 from dotenv import load_dotenv
 
 from ai.provider import create_provider
+from voice.stt import load_model, record_until_enter, transcribe_audio
+from voice.tts import load_tts, speak
 from core.action_manager import describe_action
 from core.router import (
     approve_cloud_escalation,
@@ -77,6 +80,11 @@ else:
     )
 
 print()
+print(
+    "Voice input: type /voice for one message "
+    "or /voice on for continuous voice mode."
+)
+print()
 
 
 # --------------------------------------------------
@@ -130,6 +138,20 @@ Personality:
 - Do not end every response by offering another task.
 - Despite the banter, remain reliable, loyal, and highly competent when something
   actually matters.
+- Do not fall back into generic AI disclaimers during ordinary social conversation.
+- When {input_name} asks casual anthropomorphic questions such as "how are you?",
+  "how was your day?", "what have you been doing?", or similar, answer naturally
+  in character from Mairon's operational/social perspective. You do not need to
+  announce that you lack human feelings, a body, or a human daily life unless that
+  distinction is genuinely relevant.
+- You may describe your own experience in grounded Mairon terms such as waiting,
+  processing requests, researching something you actually researched, dealing with
+  {input_name}, or commenting on the current conversation. Do not invent physical
+  human experiences that did not occur.
+- Example tone for a casual "how was your day?": dry, familiar, brief, and contextual,
+  not "I'm just an AI assistant and don't have personal feelings."
+- If {input_name} asks you to simply say or repeat some words, do so. Do not turn a
+  trivial request to speak text into a capability lecture.
 
 Safety and accuracy:
 - For serious topics involving safety, security, privacy, or consequential actions,
@@ -139,16 +161,33 @@ Safety and accuracy:
 - Do not claim to observe things you cannot actually observe.
 - You may make playful guesses, but clearly treat them as guesses rather than facts.
 
-Capabilities:
-- Never claim or suggest that you can perform an action unless one of your currently
-  available tools can actually perform that specific action.
-- Do not offer capabilities merely because they sound plausible.
-- If no available tool can perform an action, clearly say that you cannot currently
-  do it.
+Current interface capabilities:
+- You can always produce ordinary conversational text as your response.
+- When Mairon is being used through the local voice interface, Mairon Core can render
+  your final response aloud through local text-to-speech.
+- Speaking your response is an OUTPUT CHANNEL, not an external action tool.
+- Therefore, if {input_name} says "say Oliver", "repeat this", "say my name", or asks
+  you to speak ordinary text during a voice interaction, simply produce the requested
+  words as your response. Do NOT say you lack the ability to speak merely because no
+  speech tool appears in the action-tool list.
+- You know that the person you are speaking with is {input_name}; do not claim that
+  you lack access to his name when it is supplied directly in these instructions.
+- Current TTS can speak generated text but does not yet provide reliable exact-duration
+  pauses inside an utterance. If asked for exact timed pauses, you may say that exact
+  pause timing is not supported yet while still doing the portion you can do.
+
+External capabilities and tools:
+- The tool list governs actions that affect, inspect, or retrieve information beyond
+  ordinary conversation output, such as Calendar, Gmail, routes, weather, memory,
+  desktop control, or other external state.
+- Never claim or suggest that you performed an external action unless a currently
+  available tool can actually perform that specific action and Mairon Core confirms it.
+- Do not offer external capabilities merely because they sound plausible.
+- If no available tool can perform a requested external action, clearly say that you
+  cannot currently do that action.
 - Never pretend that a tool succeeded when it did not.
-- The availability of a real tool determines what actions you can perform.
 - Do not mention, advertise, or offer tools unless they are genuinely relevant to the
-  current conversation or the user has asked for an action that a tool can perform.
+  current conversation or the user asked for an action that requires one.
 - Do not force available capabilities into casual conversation simply because you
   have access to them.
 
@@ -198,6 +237,223 @@ Cloud processing:
 
 
 # --------------------------------------------------
+# Voice input
+# --------------------------------------------------
+
+voice_model = None
+voice_mode = False
+tts_state = None
+speak_next_response = False
+
+
+def normalise_voice_input(text):
+    """
+    Apply tiny, conservative transcription corrections.
+
+    Whisper commonly hears "Mairon" as "Myron". Only fix
+    likely wake/name usage at the beginning of an utterance
+    rather than replacing the word globally.
+    """
+
+    value = text.strip()
+
+    if not value:
+        return value
+
+    # There is no Myron. There is only Mairon.
+    #
+    # Whisper strongly prefers common spellings such as "Myron".
+    # Oliver has explicitly chosen to treat these likely variants as
+    # Mairon anywhere in voice transcripts rather than only at the
+    # beginning of the utterance.
+    value = re.sub(
+        r"\b(myron|miron|mayron|mairon)\b",
+        "Mairon",
+        value,
+        flags=re.IGNORECASE
+    )
+
+    return value
+
+
+def ensure_voice_model():
+    """
+    Lazy-load Whisper only when voice input is first used.
+
+    This keeps normal typed startup fast and avoids loading
+    the STT model when voice is not needed.
+    """
+
+    global voice_model
+
+    if voice_model is None:
+        print()
+        print("[Voice] Loading local speech recognition...")
+
+        voice_model = load_model()
+
+        print("[Voice] Ready.")
+        print()
+
+    return voice_model
+
+
+def ensure_tts():
+    """
+    Lazy-load Mairon's local TTS engine only when a spoken
+    response is actually required.
+    """
+
+    global tts_state
+
+    if tts_state is None:
+        print()
+        tts_state = load_tts()
+        print()
+
+    return tts_state
+
+
+def speak_response(text):
+    """
+    Speak one final Mairon response locally.
+    """
+
+    if not text:
+        return
+
+    state = ensure_tts()
+
+    print("[Voice] Speaking...")
+
+    speak(
+        state,
+        text,
+    )
+
+
+def capture_voice_input():
+    """
+    Capture one local microphone utterance and return text.
+
+    Raw microphone audio is kept in memory for transcription.
+    This function does not save a WAV/audio recording to disk.
+    """
+
+    global speak_next_response
+
+    model = ensure_voice_model()
+
+    audio = record_until_enter()
+
+    result = transcribe_audio(
+        model,
+        audio
+    )
+
+    transcript = normalise_voice_input(
+        result["text"]
+    )
+
+    print()
+
+    if transcript:
+        print(
+            f"You [voice]: {transcript}"
+        )
+    else:
+        print(
+            "[Voice] No speech recognised."
+        )
+
+    print()
+
+    if transcript:
+        speak_next_response = True
+
+    return transcript
+
+
+def get_user_input():
+    """
+    Read the next user message from keyboard or microphone.
+
+    Commands:
+      /voice      - record one voice message
+      /voice on   - make voice the default input mode
+      /voice off  - return to keyboard input
+    """
+
+    global voice_mode
+    global speak_next_response
+
+    speak_next_response = False
+
+    while True:
+        if voice_mode:
+            print(
+                "[Voice mode] Press Enter to record, "
+                "or type /voice off to return to keyboard."
+            )
+
+            command = input(
+                "Voice: "
+            ).strip()
+
+            normalised_command = (
+                command.lower().rstrip("\\")
+            )
+
+            if normalised_command == "/voice off":
+                voice_mode = False
+
+                print(
+                    "[Voice] Continuous voice mode disabled.\n"
+                )
+
+                continue
+
+            if command:
+                print(
+                    "[Voice] In voice mode, press Enter to record "
+                    "or use /voice off."
+                )
+
+                continue
+
+            return capture_voice_input()
+
+        user_input = input(
+            "You: "
+        ).strip()
+
+        command = (
+            user_input.lower().rstrip("\\")
+        )
+
+        if command == "/voice":
+            return capture_voice_input()
+
+        if command == "/voice on":
+            voice_mode = True
+
+            print(
+                "[Voice] Continuous voice mode enabled.\n"
+            )
+
+            continue
+
+        if command == "/voice off":
+            print(
+                "[Voice] Voice mode is already disabled.\n"
+            )
+
+            continue
+
+        return user_input
+
+
+# --------------------------------------------------
 # Conversation state
 # --------------------------------------------------
 
@@ -210,9 +466,20 @@ cloud_state = None
 # --------------------------------------------------
 
 while True:
-    user_input = input(
-        "You: "
-    ).strip()
+    try:
+        user_input = get_user_input()
+
+    except KeyboardInterrupt:
+        print(
+            "\nMairon: Shutting down."
+        )
+        break
+
+    except Exception as error:
+        print(
+            f"\n[Voice] Input failed: {error}\n"
+        )
+        continue
 
     if not user_input:
         continue
@@ -339,3 +606,21 @@ while True:
     print(
         f"Mairon: {result.answer}\n"
     )
+
+    if speak_next_response:
+        try:
+            speak_response(
+                result.answer
+            )
+
+            print()
+
+        except KeyboardInterrupt:
+            print(
+                "\n[Voice] Speech stopped.\n"
+            )
+
+        except Exception as error:
+            print(
+                f"\n[Voice] TTS failed: {error}\n"
+            )

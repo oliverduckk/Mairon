@@ -116,8 +116,10 @@ GET_WEATHER_TOOL = function_tool(
     name="get_weather",
     description=(
         "Get live current weather and a short forecast for a real-world location. "
-        "Use this for current weather, tomorrow's weather, temperature, rain, "
-        "or similar weather information."
+        "This is the PRIMARY tool for ordinary weather questions. Use it for current "
+        "weather, today's weather, tomorrow's weather, temperature, rain, wind, "
+        "conditions, or similar forecast information. Prefer this dedicated tool over "
+        "web_search whenever it can answer the weather question directly."
     ),
     properties={
         "location": {
@@ -481,10 +483,13 @@ WEB_SEARCH_TOOL = function_tool(
     description=(
         "Search the live public internet for current or externally verifiable information. "
         "Use this for recent events, news, current information, documentation, software "
-        "versions, product announcements, and other changing public facts. Do not use web "
-        "search for Oliver's private email, calendar, routine, alarms, memory, routes, or "
-        "other information available through a dedicated private tool. Never include passwords, "
-        "API keys, private addresses, private email contents, or secret information in a query."
+        "versions, product announcements, and other changing public facts when no dedicated "
+        "Mairon tool is a better fit. Do NOT use web_search for ordinary current weather, "
+        "today's forecast, tomorrow's forecast, temperature, or rain questions; use get_weather. "
+        "Do not use web search for Oliver's private email, calendar, routine, alarms, memory, "
+        "routes, or other information available through a dedicated private tool. Never include "
+        "passwords, API keys, private addresses, private email contents, or secret information "
+        "in a query."
     ),
     properties={
         "query": {
