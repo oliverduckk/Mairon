@@ -1,5 +1,9 @@
 import re
 
+from personality.relationship_state import (
+    build_relationship_context_text,
+)
+
 
 # --------------------------------------------------
 # Generic-assistant / identity violations
@@ -222,7 +226,9 @@ def should_use_direct_conversation(
     )
 
 
-def build_runtime_personality_instruction():
+def build_runtime_personality_instruction(
+    relationship_context=None,
+):
     """
     Compact runtime personality layer for ordinary conversation.
 
@@ -230,6 +236,18 @@ def build_runtime_personality_instruction():
     The large private personality document is design/reference material,
     not something to dump into the model on every single turn.
     """
+
+    relationship_text = (
+        build_relationship_context_text(
+            relationship_context
+        )
+        if relationship_context
+        else (
+            "CORE RELATIONSHIP POLICY:\n"
+            "- No historical callback context was supplied.\n"
+            "- Do not invent one."
+        )
+    )
 
     return (
         "MAIRON DIRECT-CONVERSATION MODE:\n"
@@ -281,6 +299,16 @@ def build_runtime_personality_instruction():
         "appears in the conversation/context supplied to you. If no grounded callback exists, "
         "just continue naturally without one.\n"
         "- A joke must not quietly become a false factual claim.\n\n"
+
+        "Novelty:\n"
+        "- Do not rely on canned catchphrases or memorised one-liners.\n"
+        "- If a familiar relationship theme is available, generate fresh wording from "
+        "the underlying context rather than repeating an old punchline.\n"
+        "- Reusing the same joke structure repeatedly is worse than making no joke.\n"
+        "- It is completely valid to answer with no joke at all.\n\n"
+
+        + relationship_text
+        + "\n\n"
 
         "Keep the response natural. Short conversational turns should usually stay short."
     )
@@ -353,5 +381,8 @@ def build_retry_instruction(
         "that Mairon is incapable of having opinions. If Oliver is talking about "
         "actively programming/building Mairon, acknowledge the actual development "
         "context. If he asks you to say ordinary words, simply say them. Do not "
-        "invent physical experiences, prior topics, callbacks, or unsupported facts."
+        "invent physical experiences, prior topics, callbacks, or unsupported facts. "
+        "If the rejection involved repetition, either express the idea in genuinely "
+        "fresh wording or omit the joke entirely. Do not merely swap a few synonyms "
+        "into the same punchline."
     )

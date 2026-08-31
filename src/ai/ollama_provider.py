@@ -15,6 +15,12 @@ from personality.personality_engine import (
     should_use_direct_conversation,
 )
 
+from personality.relationship_state import (
+    find_repetition_violations,
+    prepare_relationship_turn,
+    record_accepted_relationship_response,
+)
+
 from routine.night_routine import (
     complete_night_routine_work_location,
     prepare_night_routine,
@@ -3814,6 +3820,12 @@ def handle_direct_conversation(
     access.
     """
 
+    relationship_context = (
+        prepare_relationship_turn(
+            user_input
+        )
+    )
+
     base_messages = list(
         conversation
     )
@@ -3825,7 +3837,9 @@ def handle_direct_conversation(
 
     base_messages.append({
         "role": "system",
-        "content": build_runtime_personality_instruction()
+        "content": build_runtime_personality_instruction(
+            relationship_context=relationship_context
+        )
     })
 
     base_messages.append({
@@ -3915,6 +3929,19 @@ def handle_direct_conversation(
             response.message.content
         )
 
+        violations.extend(
+            find_repetition_violations(
+                response_text=response.message.content,
+                conversation=conversation,
+            )
+        )
+
+        violations = list(
+            dict.fromkeys(
+                violations
+            )
+        )
+
         if not violations:
             break
 
@@ -3948,6 +3975,11 @@ def handle_direct_conversation(
 
     working_conversation.append(
         response.message
+    )
+
+    record_accepted_relationship_response(
+        response_text=response.message.content,
+        relationship_context=relationship_context,
     )
 
     return (
