@@ -21,6 +21,16 @@ from personality.relationship_state import (
     record_accepted_relationship_response,
 )
 
+from continuity.context_manager import (
+    build_relevant_past_context,
+)
+
+from personality.conversation_policy import (
+    build_conversation_policy_text,
+    classify_conversation_policy,
+    find_conversation_policy_violations,
+)
+
 from routine.night_routine import (
     complete_night_routine_work_location,
     prepare_night_routine,
@@ -3826,6 +3836,18 @@ def handle_direct_conversation(
         )
     )
 
+    conversation_policy = (
+        classify_conversation_policy(
+            user_input
+        )
+    )
+
+    past_context = (
+        build_relevant_past_context(
+            user_input
+        )
+    )
+
     base_messages = list(
         conversation
     )
@@ -3833,6 +3855,44 @@ def handle_direct_conversation(
     base_messages.append({
         "role": "system",
         "content": get_runtime_context()
+    })
+
+    if past_context:
+        print(
+            "[Context] Retrieved relevant prior conversation."
+        )
+
+        base_messages.append({
+            "role": "system",
+            "content": past_context
+        })
+
+    if conversation_policy.get(
+        "knowledge_honesty"
+    ):
+        print(
+            "[Conversation] Knowledge-honesty guard active."
+        )
+
+    if conversation_policy.get(
+        "reciprocity"
+    ) in (
+        "high",
+        "medium",
+    ):
+        print(
+            "[Conversation] Reciprocity opportunity: "
+            + conversation_policy[
+                "reciprocity"
+            ]
+            + "."
+        )
+
+    base_messages.append({
+        "role": "system",
+        "content": build_conversation_policy_text(
+            conversation_policy
+        )
     })
 
     base_messages.append({
@@ -3873,6 +3933,20 @@ def handle_direct_conversation(
                     attempt_number=attempt
                 )
             })
+
+            if conversation_policy.get(
+                "knowledge_honesty"
+            ):
+                attempt_messages.append({
+                    "role": "system",
+                    "content": (
+                        "KNOWLEDGE-HONESTY RETRY: Do not repair the rejected "
+                        "answer by inventing more specific lore. If you are not "
+                        "confident in a factual detail, remove it. A shorter "
+                        "truthful answer is better than an impressive-sounding "
+                        "fabrication."
+                    )
+                })
 
         chat_kwargs = {
             "model": MODEL,
@@ -3927,6 +4001,12 @@ def handle_direct_conversation(
 
         violations = find_personality_violations(
             response.message.content
+        )
+
+        violations.extend(
+            find_conversation_policy_violations(
+                response.message.content
+            )
         )
 
         violations.extend(

@@ -15,6 +15,10 @@ from core.router import (
     route_message,
 )
 
+from continuity.conversation_journal import (
+    record_conversation_turn,
+)
+
 
 # --------------------------------------------------
 # Environment configuration
@@ -202,9 +206,18 @@ Permission-gated actions:
 - Do not claim the event has been created merely because you requested it.
 - If approval is denied, accept the decision and do not imply that the event exists.
 
+Conversation continuity:
+- Mairon Core may supply small excerpts from a private local conversation journal.
+- Those excerpts represent real prior dialogue and may be used for continuity,
+  accurate recall, earned callbacks, and recognising ongoing discussions.
+- A prior Mairon statement proves what Mairon previously said; it does not by itself
+  prove that the underlying factual claim was correct.
+- Never invent additional conversation history around retrieved excerpts.
+
 Persistent memory:
-- Only save information to persistent memory when {input_name} explicitly asks you
-  to remember, save, or store it.
+- Explicit persistent fact memory is separate from the private conversation journal.
+- Only save information to explicit persistent fact memory when {input_name} explicitly
+  asks you to remember, save, or store it.
 - Do not permanently save ordinary conversation, jokes, hypothetical examples,
   temporary information, or inferred information unless {input_name} explicitly asks.
 - When {input_name} asks about a personal fact, preference, or information that may
@@ -606,6 +619,33 @@ while True:
     print(
         f"Mairon: {result.answer}\n"
     )
+
+    # --------------------------------------------------
+    # Private local conversation journal
+    # --------------------------------------------------
+    #
+    # Record only completed user<->Mairon turns. This is local
+    # continuity/history, not explicit persistent fact memory.
+    #
+    # Raw microphone audio is never written here; only the transcript
+    # and final visible Mairon response are stored.
+    try:
+        record_conversation_turn(
+            user_text=user_input,
+            assistant_text=result.answer,
+            channel=(
+                "voice"
+                if speak_next_response
+                else "text"
+            ),
+        )
+
+    except Exception as error:
+        # Continuity must degrade gracefully. A journal failure should
+        # never prevent Oliver from using Mairon.
+        print(
+            f"[Context] Conversation journal write failed: {error}"
+        )
 
     if speak_next_response:
         try:
