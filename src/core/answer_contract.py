@@ -140,6 +140,17 @@ class AnswerContract:
                     + self.evidence.uncertainty
                 )
 
+        if not self.allow_new_factual_claims:
+            lines.extend([
+                "",
+                "FACTUAL GROUNDING POLICY:",
+                "- Specific factual claims must come from Oliver's current message, recent user-provided context, resolved references in this contract, required claims, or verified Core evidence.",
+                "- Do not use model training memory to add product properties, technical specifications, itinerary details, location assumptions, media facts, history, or other external facts.",
+                "- Plausible is not the same as grounded.",
+                "- Subjective reaction and clearly non-literal banter are allowed only when they do not depend on an unsupported factual premise.",
+                "- Prefer a shorter response over adding an ungrounded detail.",
+            ])
+
         lines.extend([
             "",
             "LANGUAGE POLICY:",

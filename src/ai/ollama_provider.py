@@ -58,6 +58,14 @@ from personality.opinion_ledger import (
     record_opinion_if_needed,
 )
 
+from core.claim_grounding import (
+    build_core_grounding_fallback,
+    build_core_grounding_retry_instruction,
+    build_recent_user_grounding_context,
+    should_verify_core_grounding,
+    verify_core_grounded_draft,
+)
+
 from routine.night_routine import (
     complete_night_routine_work_location,
     prepare_night_routine,
@@ -4070,10 +4078,21 @@ def _core_contract_value(
     ).splitlines():
         line = raw_line.strip()
 
-        if line.lower().startswith(
+        # AnswerContract renders some fields as markdown-style bullets:
+        #
+        #   - Follow-up question allowed: false
+        #   - New unsupported factual claims allowed: false
+        #
+        # Contract parsing must treat the bullet marker as presentation,
+        # not as part of the field name.
+        comparable = line.lstrip(
+            "- "
+        ).strip()
+
+        if comparable.lower().startswith(
             prefix
         ):
-            return line.split(
+            return comparable.split(
                 ":",
                 1,
             )[
@@ -4175,6 +4194,172 @@ def _count_cjk_characters(
     return count
 
 
+def build_core_micro_act_instruction(
+    core_answer_contract,
+    conversation=None,
+    retry=False,
+):
+    """
+    Build a generation-time instruction for tiny conversational acts such as
+    share_context and acknowledge.
+
+    The grounding verifier remains authoritative. This helper exists to stop
+    Qwen from needlessly generating plausible external facts that Core then
+    has to reject.
+
+    Retry wording deliberately does NOT echo the rejected factual claims.
+    Repeating a bad premise inside the retry prompt can anchor the model on it
+    and cause a paraphrased version of the same hallucination.
+    """
+
+    intent = _core_contract_value(
+        core_answer_contract,
+        "Intent",
+    )
+
+    if intent not in {
+        "share_context",
+        "acknowledge",
+    }:
+        return None
+
+    prior_user_context = (
+        build_recent_user_grounding_context(
+            conversation
+        )
+    )
+
+    lines = [
+        "CORE SOCIAL MICRO-ACT MODE:",
+        "- Respond as Mairon in one or two short natural sentences.",
+        "- React to Oliver's current message and then stop.",
+        "- Do not ask a question.",
+        "- Do not offer another task or use service-assistant language.",
+        "- For any LITERAL statement about reality, use only a direct paraphrase "
+        "or trivial implication of Oliver's current message or the USER-provided "
+        "context below.",
+        "- Previous assistant/Mairon statements are conversational context only; "
+        "they are NOT factual evidence.",
+        "- Do not add plausible external details about products, geography, travel "
+        "routes, climate/weather, manufacturing, specifications, performance, "
+        "history, media canon, or what supposedly happened off-screen.",
+        "- Sarcasm, teasing, absurd hyperbole, anthropomorphism, and obviously "
+        "non-literal jokes are welcome. A joke does not need to be literally true "
+        "when a normal reader would clearly recognise it as a joke.",
+        "- If the only way to sound interesting is to invent a plausible fact, "
+        "do not invent it. Use personality instead.",
+    ]
+
+    if retry:
+        lines.extend([
+            "- The previous draft was rejected. Start fresh.",
+            "- Do NOT reuse, paraphrase, negate, or allude to the rejected factual "
+            "premise. Do not try to 'fix' it by swapping in a different external fact.",
+            "- Prefer a dry/sarcastic reaction or clearly absurd joke over factual "
+            "embellishment.",
+        ])
+
+    if prior_user_context:
+        lines.extend([
+            "",
+            prior_user_context,
+        ])
+
+    return "\n".join(
+        lines
+    )
+
+
+def repair_core_restricted_draft(
+    response_text,
+    core_answer_contract,
+):
+    """
+    Deterministically remove forbidden conversational tails from
+    Core-restricted micro-acts before rejecting the entire draft.
+
+    This is intentionally conservative:
+    - only acts when Core explicitly forbids follow-up questions;
+    - removes whole question/service-offer sentences;
+    - never invents replacement wording;
+    - if nothing useful remains, the normal retry path handles it.
+    """
+
+    if not core_answer_contract:
+        return str(
+            response_text or ""
+        ).strip()
+
+    text = str(
+        response_text or ""
+    ).strip()
+
+    if not text:
+        return text
+
+    follow_up_allowed = _core_contract_value(
+        core_answer_contract,
+        "Follow-up question allowed",
+    )
+
+    if (
+        str(
+            follow_up_allowed or ""
+        ).strip().lower()
+        != "false"
+    ):
+        return text
+
+    generic_offer_markers = (
+        "let me know if",
+        "if you need anything",
+        "if you need help",
+        "i'll be here",
+        "i will be here",
+        "want me to",
+        "would you like me to",
+        "should i ",
+        "shall i ",
+    )
+
+    # Split conservatively on normal sentence boundaries. If a sentence
+    # contains a question mark or a generic service offer, drop that whole
+    # sentence rather than trying to rewrite its meaning.
+    sentences = re.split(
+        r"(?<=[.!?])\s+",
+        text,
+    )
+
+    kept = []
+
+    for sentence in sentences:
+        candidate = sentence.strip()
+
+        if not candidate:
+            continue
+
+        lowered = candidate.lower()
+
+        if "?" in candidate:
+            continue
+
+        if any(
+            marker in lowered
+            for marker in generic_offer_markers
+        ):
+            continue
+
+        kept.append(
+            candidate
+        )
+
+    repaired = " ".join(
+        kept
+    ).strip()
+
+    return repaired
+
+
 def find_core_answer_contract_violations(
     response_text,
     core_answer_contract,
@@ -4212,6 +4397,22 @@ def find_core_answer_contract_violations(
             "switched too much of the response out of English"
         )
 
+    follow_up_allowed = _core_contract_value(
+        core_answer_contract,
+        "Follow-up question allowed",
+    )
+
+    if (
+        str(
+            follow_up_allowed or ""
+        ).strip().lower()
+        == "false"
+        and "?" in text
+    ):
+        violations.append(
+            "current Core contract forbids a follow-up question"
+        )
+
     generic_offer_markers = (
         "let me know if",
         "if you need anything",
@@ -4220,7 +4421,23 @@ def find_core_answer_contract_violations(
         "i will be here",
         "want me to",
         "would you like me to",
+        "should i ",
+        "shall i ",
     )
+
+    if (
+        str(
+            follow_up_allowed or ""
+        ).strip().lower()
+        == "false"
+        and any(
+            marker in lowered
+            for marker in generic_offer_markers
+        )
+    ):
+        violations.append(
+            "current Core contract forbids generic follow-up/service language"
+        )
 
     if intent == "acknowledge":
         word_count = len(
@@ -4693,6 +4910,24 @@ def handle_direct_conversation(
             "content": core_answer_contract
         })
 
+        core_micro_act_instruction = (
+            build_core_micro_act_instruction(
+                core_answer_contract=core_answer_contract,
+                conversation=conversation,
+                retry=False,
+            )
+        )
+
+        if core_micro_act_instruction:
+            print(
+                "[Core] Social micro-act generation mode active."
+            )
+
+            base_messages.append({
+                "role": "system",
+                "content": core_micro_act_instruction
+            })
+
     base_messages.append({
         "role": "user",
         "content": user_input
@@ -4707,6 +4942,31 @@ def handle_direct_conversation(
 
     response = None
     violations = []
+    accepted_draft_text = None
+
+    core_intent = _core_contract_value(
+        core_answer_contract,
+        "Intent",
+    )
+
+    core_is_micro_act = (
+        core_intent
+        in {
+            "share_context",
+            "acknowledge",
+        }
+    )
+
+    core_grounding_required = (
+        should_verify_core_grounding(
+            core_answer_contract
+        )
+    )
+
+    if core_grounding_required:
+        print(
+            "[Grounding] Core claim verification active."
+        )
 
     for attempt in range(
         1,
@@ -4717,13 +4977,29 @@ def handle_direct_conversation(
         )
 
         if attempt > 1:
-            attempt_messages.append({
-                "role": "system",
-                "content": build_retry_instruction(
-                    violations=violations,
-                    attempt_number=attempt
+            if core_is_micro_act:
+                micro_retry_instruction = (
+                    build_core_micro_act_instruction(
+                        core_answer_contract=core_answer_contract,
+                        conversation=conversation,
+                        retry=True,
+                    )
                 )
-            })
+
+                if micro_retry_instruction:
+                    attempt_messages.append({
+                        "role": "system",
+                        "content": micro_retry_instruction
+                    })
+
+            else:
+                attempt_messages.append({
+                    "role": "system",
+                    "content": build_retry_instruction(
+                        violations=violations,
+                        attempt_number=attempt
+                    )
+                })
 
             if conversation_policy.get(
                 "knowledge_honesty"
@@ -4774,6 +5050,19 @@ def handle_direct_conversation(
                         "English is the default language."
                     )
                 })
+
+                if not core_is_micro_act:
+                    core_grounding_retry = (
+                        build_core_grounding_retry_instruction(
+                            violations
+                        )
+                    )
+
+                    if core_grounding_retry:
+                        attempt_messages.append({
+                            "role": "system",
+                            "content": core_grounding_retry
+                        })
 
             if (
                 spoiler_context.get(
@@ -4848,36 +5137,75 @@ def handle_direct_conversation(
             ]
             continue
 
-        violations = find_personality_violations(
+        original_draft_text = str(
             response.message.content
+            or ""
+        )
+
+        draft_text = repair_core_restricted_draft(
+            response_text=original_draft_text,
+            core_answer_contract=core_answer_contract,
+        )
+
+        if (
+            draft_text
+            != original_draft_text.strip()
+        ):
+            print(
+                "[Core] Removed forbidden follow-up/service tail from draft."
+            )
+
+        violations = []
+
+        if not draft_text:
+            violations.append(
+                "Core repair removed the entire restricted response"
+            )
+
+        violations.extend(
+            find_personality_violations(
+                draft_text
+            )
         )
 
         violations.extend(
             find_conversation_policy_violations(
-                response.message.content
+                draft_text
             )
         )
 
         violations.extend(
             find_spoiler_guard_violations(
-                response_text=response.message.content,
+                response_text=draft_text,
                 spoiler_context=spoiler_context,
             )
         )
 
         violations.extend(
             find_repetition_violations(
-                response_text=response.message.content,
+                response_text=draft_text,
                 conversation=conversation,
             )
         )
 
         violations.extend(
             find_core_answer_contract_violations(
-                response_text=response.message.content,
+                response_text=draft_text,
                 core_answer_contract=core_answer_contract,
             )
         )
+
+        if core_grounding_required:
+            violations.extend(
+                verify_core_grounded_draft(
+                    client=client,
+                    model=MODEL,
+                    user_input=user_input,
+                    draft=draft_text,
+                    core_answer_contract=core_answer_contract,
+                    conversation=conversation,
+                )
+            )
 
         if research_evidence:
             violations.extend(
@@ -4890,7 +5218,7 @@ def handle_direct_conversation(
                         )
                         or user_input
                     ),
-                    draft=response.message.content,
+                    draft=draft_text,
                     research_evidence=research_evidence,
                     self_correction_context=self_correction_context,
                     opinion_context=opinion_context,
@@ -4904,6 +5232,9 @@ def handle_direct_conversation(
         )
 
         if not violations:
+            accepted_draft_text = (
+                draft_text
+            )
             break
 
         print(
@@ -4919,6 +5250,18 @@ def handle_direct_conversation(
         )
 
     if violations:
+        core_grounding_failed = any(
+            (
+                "unsupported Core-grounded claim"
+                in violation
+                or "claim-grounding verifier"
+                in violation
+                or "Core-restricted response contained unsupported"
+                in violation
+            )
+            for violation in violations
+        )
+
         if research_evidence:
             final_response_text = (
                 build_failed_grounding_fallback(
@@ -4932,20 +5275,50 @@ def handle_direct_conversation(
             )
 
         else:
-            final_response_text = (
-                "I'm tripping my own response guardrails on that one. "
-                "I'm not going to force through a draft I already know "
-                "is bad."
+            core_intent = _core_contract_value(
+                core_answer_contract,
+                "Intent",
             )
 
-            print(
-                "[Personality] Drafts remained invalid; Core refused "
-                "to accept the last rejected draft."
-            )
+            if (
+                core_grounding_failed
+                or core_intent
+                in {
+                    "share_context",
+                    "acknowledge",
+                }
+            ):
+                final_response_text = (
+                    build_core_grounding_fallback(
+                        core_answer_contract
+                    )
+                )
+
+                print(
+                    "[Grounding] Restricted drafts remained invalid; "
+                    "Core used a fail-closed response."
+                )
+
+            else:
+                final_response_text = (
+                    "I'm tripping my own response guardrails on that one. "
+                    "I'm not going to force through a draft I already know "
+                    "is bad."
+                )
+
+                print(
+                    "[Personality] Drafts remained invalid; Core refused "
+                    "to accept the last rejected draft."
+                )
 
     else:
         final_response_text = (
-            response.message.content
+            accepted_draft_text
+            if accepted_draft_text is not None
+            else str(
+                response.message.content
+                or ""
+            ).strip()
         )
 
     # Store only the accepted/final turn. Rejected drafts and runtime

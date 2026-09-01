@@ -142,8 +142,55 @@ def _extract_application_name(
     return app_name
 
 
+DISCOURSE_PREFIX_PATTERN = re.compile(
+    r"^(?:(?:mate|bro|bruh|dude|man|yeah|yep|nah|nope|okay|ok|lol|lmao|haha+)"
+    r"(?:\s*[,!.-]\s*|\s+))+",
+    flags=re.IGNORECASE,
+)
+
+
 def _normalise(text: str) -> str:
-    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+    return re.sub(
+        r"\s+",
+        " ",
+        str(
+            text or ""
+        ).strip().lower(),
+    )
+
+
+def _strip_discourse_prefixes(
+    text: str,
+) -> str:
+    """
+    Remove casual conversation lead-ins ONLY for intent classification.
+
+    Raw user text is preserved everywhere else.
+
+    Examples:
+    - "Mate they are currently on my feet" -> "they are currently on my feet"
+    - "Bro can you open the calculator?" -> "can you open the calculator?"
+    """
+
+    value = str(
+        text or ""
+    ).strip()
+
+    previous = None
+
+    while (
+        value
+        and value != previous
+    ):
+        previous = value
+
+        value = DISCOURSE_PREFIX_PATTERN.sub(
+            "",
+            value,
+            count=1,
+        ).strip()
+
+    return value
 
 
 def _matches_any(text: str, patterns) -> bool:
@@ -424,7 +471,13 @@ def _contains_follow_up_pronoun(text: str) -> bool:
 
 def classify_turn(user_input: str, conversation_state=None) -> TurnState:
     raw = str(user_input or "").strip()
-    text = _normalise(raw)
+
+    text = _strip_discourse_prefixes(
+        _normalise(
+            raw
+        )
+    )
+
     state = TurnState(raw_text=raw)
 
     if not text:
