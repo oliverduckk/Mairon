@@ -272,6 +272,20 @@ def normalise_message_summary(
             headers,
             "Date"
         ),
+        "internal_date_ms": (
+            int(
+                message.get(
+                    "internalDate"
+                )
+            )
+            if str(
+                message.get(
+                    "internalDate",
+                    ""
+                )
+            ).isdigit()
+            else None
+        ),
         "snippet": clean_email_text(
             message.get(
                 "snippet",
@@ -500,15 +514,39 @@ def sanitise_search_text(
 def build_exact_query(
     search_text,
     days,
-    unread_only
+    unread_only,
+    after_epoch=None,
+    before_epoch=None
 ):
     """
     Build a narrow exact-phrase Gmail search.
+
+    Rolling searches use newer_than:Nd.
+
+    Exact local-day searches use epoch-second after:/before: bounds.
+    Epoch bounds avoid Gmail's YYYY/MM/DD timezone ambiguity and let
+    Mairon Core represent "today" and "yesterday" precisely.
     """
 
-    query_parts = [
-        f"newer_than:{days}d"
-    ]
+    query_parts = []
+
+    if after_epoch is not None:
+        query_parts.append(
+            f"after:{int(after_epoch)}"
+        )
+
+    if before_epoch is not None:
+        query_parts.append(
+            f"before:{int(before_epoch)}"
+        )
+
+    if (
+        after_epoch is None
+        and before_epoch is None
+    ):
+        query_parts.append(
+            f"newer_than:{days}d"
+        )
 
     if unread_only:
         query_parts.append(
@@ -524,19 +562,38 @@ def build_exact_query(
         query_parts
     )
 
-
 def build_loose_query(
     search_text,
     days,
-    unread_only
+    unread_only,
+    after_epoch=None,
+    before_epoch=None
 ):
     """
     Build a broader keyword search.
+
+    Exact local-day bounds use epoch-second after:/before: operators.
     """
 
-    query_parts = [
-        f"newer_than:{days}d"
-    ]
+    query_parts = []
+
+    if after_epoch is not None:
+        query_parts.append(
+            f"after:{int(after_epoch)}"
+        )
+
+    if before_epoch is not None:
+        query_parts.append(
+            f"before:{int(before_epoch)}"
+        )
+
+    if (
+        after_epoch is None
+        and before_epoch is None
+    ):
+        query_parts.append(
+            f"newer_than:{days}d"
+        )
 
     if unread_only:
         query_parts.append(
@@ -561,18 +618,27 @@ def find_emails(
     search_text="",
     days=30,
     unread_only=False,
-    max_results=10
+    max_results=10,
+    after_epoch=None,
+    before_epoch=None,
+    expand_search=True
 ):
     """
     Find emails using structured parameters.
 
-    Search strategy:
+    Search strategy for normal rolling searches:
 
     1. Try the requested time range using an exact phrase.
     2. If that fails, retry using loose keywords.
-    3. If the period was narrower than 30 days and still
-       nothing was found, expand to 30 days.
+    3. If the period was narrower than 30 days and still nothing was
+       found, optionally expand to 30 days.
     4. Try exact and loose matching again.
+
+    Exact-window mode:
+
+    If after_epoch and/or before_epoch are supplied, Gmail is constrained
+    to those exact epoch-second boundaries and Core NEVER broadens the
+    time window. This is used for requests such as "today" or "yesterday".
     """
 
     search_text = sanitise_search_text(
@@ -595,15 +661,51 @@ def find_emails(
         )
     )
 
+    if after_epoch is not None:
+        after_epoch = max(
+            0,
+            int(after_epoch)
+        )
+
+    if before_epoch is not None:
+        before_epoch = max(
+            0,
+            int(before_epoch)
+        )
+
+    if (
+        after_epoch is not None
+        and before_epoch is not None
+        and before_epoch <= after_epoch
+    ):
+        return {
+            "success": False,
+            "message": (
+                "Gmail exact search has an invalid time window."
+            )
+        }
+
+    exact_window = (
+        after_epoch is not None
+        or before_epoch is not None
+    )
+
+    # Exact calendar windows must never silently expand beyond what
+    # Oliver asked for.
+    if exact_window:
+        expand_search = False
+
     # --------------------------------------------------
     # Search 1:
-    # requested period + exact phrase
+    # requested period/window + exact phrase
     # --------------------------------------------------
 
     exact_query = build_exact_query(
         search_text,
         days,
-        unread_only
+        unread_only,
+        after_epoch=after_epoch,
+        before_epoch=before_epoch
     )
 
     exact_result = search_emails(
@@ -622,17 +724,29 @@ def find_emails(
     ) > 0:
         exact_result[
             "search_strategy"
-        ] = "exact"
+        ] = (
+            "exact_window_exact"
+            if exact_window
+            else "exact"
+        )
 
         exact_result[
             "search_expanded"
         ] = False
 
+        exact_result[
+            "after_epoch"
+        ] = after_epoch
+
+        exact_result[
+            "before_epoch"
+        ] = before_epoch
+
         return exact_result
 
     # --------------------------------------------------
     # Search 2:
-    # requested period + loose keywords
+    # requested period/window + loose keywords
     # --------------------------------------------------
 
     if search_text:
@@ -644,7 +758,9 @@ def find_emails(
         loose_query = build_loose_query(
             search_text,
             days,
-            unread_only
+            unread_only,
+            after_epoch=after_epoch,
+            before_epoch=before_epoch
         )
 
         loose_result = search_emails(
@@ -663,21 +779,56 @@ def find_emails(
         ) > 0:
             loose_result[
                 "search_strategy"
-            ] = "loose_keywords"
+            ] = (
+                "exact_window_loose_keywords"
+                if exact_window
+                else "loose_keywords"
+            )
 
             loose_result[
                 "search_expanded"
             ] = False
 
+            loose_result[
+                "after_epoch"
+            ] = after_epoch
+
+            loose_result[
+                "before_epoch"
+            ] = before_epoch
+
             return loose_result
 
     # --------------------------------------------------
+    # Exact-window searches stop here.
+    # --------------------------------------------------
+
+    if exact_window:
+        return {
+            "success": True,
+            "gmail_query": build_loose_query(
+                search_text,
+                days,
+                unread_only,
+                after_epoch=after_epoch,
+                before_epoch=before_epoch
+            ),
+            "email_count": 0,
+            "emails": [],
+            "search_strategy": "exact_window_exhausted",
+            "search_expanded": False,
+            "after_epoch": after_epoch,
+            "before_epoch": before_epoch
+        }
+
+    # --------------------------------------------------
     # Search 3:
-    # expand narrow searches to 30 days
+    # optionally expand narrow rolling searches to 30 days
     # --------------------------------------------------
 
     if (
-        search_text
+        expand_search
+        and search_text
         and days < 30
     ):
         expanded_days = 30

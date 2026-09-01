@@ -7,6 +7,7 @@ from ai.provider import create_provider
 from voice.stt import load_model, record_until_enter, transcribe_audio
 from voice.tts import load_tts, speak
 from core.action_manager import describe_action
+from core.orchestrator import MaironCore
 from core.router import (
     approve_cloud_escalation,
     approve_pending_action,
@@ -473,6 +474,63 @@ def get_user_input():
 local_state = None
 cloud_state = None
 
+# Mairon Core owns deterministic intent routing, short-lived
+# conversational referents, factual-authority decisions, and workflows.
+#
+# The language model is downstream of Core rather than being allowed to
+# decide every task from scratch.
+mairon_core = MaironCore()
+
+
+def emit_final_response(
+    user_input,
+    answer,
+):
+    """
+    Display, journal, and optionally speak one completed Mairon turn.
+
+    Core-owned deterministic answers and model-generated answers both pass
+    through the same final-output path.
+    """
+
+    print(
+        f"Mairon: {answer}\n"
+    )
+
+    try:
+        record_conversation_turn(
+            user_text=user_input,
+            assistant_text=answer,
+            channel=(
+                "voice"
+                if speak_next_response
+                else "text"
+            ),
+        )
+
+    except Exception as error:
+        print(
+            f"[Context] Conversation journal write failed: {error}"
+        )
+
+    if speak_next_response:
+        try:
+            speak_response(
+                answer
+            )
+
+            print()
+
+        except KeyboardInterrupt:
+            print(
+                "\n[Voice] Speech stopped.\n"
+            )
+
+        except Exception as error:
+            print(
+                f"\n[Voice] TTS failed: {error}\n"
+            )
+
 
 # --------------------------------------------------
 # Main conversation loop
@@ -504,14 +562,106 @@ while True:
         break
 
     # --------------------------------------------------
-    # Route the message
+    # Mairon Core
+    # --------------------------------------------------
+
+    try:
+        core_decision = mairon_core.prepare_turn(
+            user_input
+        )
+
+    except Exception as error:
+        # Core is still being built. A pre-routing bug should degrade to
+        # the existing provider rather than taking the whole assistant down.
+        print(
+            f"[Core] Pre-routing failed: {error}"
+        )
+
+        core_decision = None
+
+    if core_decision is not None:
+        turn = core_decision.turn
+        epistemic_route = (
+            core_decision.epistemic_route
+        )
+
+        if (
+            turn.intent
+            not in {
+                "casual_conversation",
+                "factual_question",
+            }
+            or epistemic_route.mode
+            not in {
+                "conversation",
+                "classify_then_verify",
+            }
+        ):
+            print(
+                "[Core] "
+                + str(
+                    turn.intent
+                )
+                + " -> "
+                + str(
+                    epistemic_route.authority
+                )
+            )
+
+        # Some high-value workflows are fully owned by Core. Qwen does not
+        # get to reinterpret or embellish the verified result.
+        if core_decision.needs_clarification:
+            answer = (
+                core_decision.clarification_question
+                or "I need a little more information before I can do that."
+            )
+
+            emit_final_response(
+                user_input=user_input,
+                answer=answer,
+            )
+
+            continue
+
+        if (
+            core_decision.direct_response
+            is not None
+        ):
+            emit_final_response(
+                user_input=user_input,
+                answer=(
+                    core_decision.direct_response
+                ),
+            )
+
+            continue
+
+        # Normal model turns receive Core's structured per-turn contract as
+        # part of the system instructions.
+        turn_instructions = (
+            mairon_instructions
+            + "\n\n"
+            + (
+                core_decision
+                .answer_contract
+                .to_model_instruction()
+            )
+        )
+
+    else:
+        turn_instructions = (
+            mairon_instructions
+        )
+
+    # --------------------------------------------------
+    # Existing provider/router path
     # --------------------------------------------------
 
     result = route_message(
         local_ai,
         cloud_ai,
         user_input,
-        mairon_instructions,
+        turn_instructions,
         local_state,
         cloud_state
     )
@@ -550,7 +700,7 @@ while True:
             result = approve_cloud_escalation(
                 cloud_ai,
                 result.pending_prompt,
-                mairon_instructions,
+                turn_instructions,
                 local_state,
                 cloud_state
             )
@@ -559,7 +709,7 @@ while True:
             result = decline_cloud_escalation(
                 local_ai,
                 result.pending_prompt,
-                mairon_instructions,
+                turn_instructions,
                 local_state,
                 cloud_state
             )
@@ -616,51 +766,7 @@ while True:
     # Final response
     # --------------------------------------------------
 
-    print(
-        f"Mairon: {result.answer}\n"
+    emit_final_response(
+        user_input=user_input,
+        answer=result.answer,
     )
-
-    # --------------------------------------------------
-    # Private local conversation journal
-    # --------------------------------------------------
-    #
-    # Record only completed user<->Mairon turns. This is local
-    # continuity/history, not explicit persistent fact memory.
-    #
-    # Raw microphone audio is never written here; only the transcript
-    # and final visible Mairon response are stored.
-    try:
-        record_conversation_turn(
-            user_text=user_input,
-            assistant_text=result.answer,
-            channel=(
-                "voice"
-                if speak_next_response
-                else "text"
-            ),
-        )
-
-    except Exception as error:
-        # Continuity must degrade gracefully. A journal failure should
-        # never prevent Oliver from using Mairon.
-        print(
-            f"[Context] Conversation journal write failed: {error}"
-        )
-
-    if speak_next_response:
-        try:
-            speak_response(
-                result.answer
-            )
-
-            print()
-
-        except KeyboardInterrupt:
-            print(
-                "\n[Voice] Speech stopped.\n"
-            )
-
-        except Exception as error:
-            print(
-                f"\n[Voice] TTS failed: {error}\n"
-            )

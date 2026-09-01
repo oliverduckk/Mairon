@@ -312,6 +312,29 @@ FIND_EMAILS_TOOL = function_tool(
             "minimum": 1,
             "maximum": 20,
             "description": "Maximum number of matching emails to return."
+        },
+        "after_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "description": (
+                "Optional exact lower time boundary as Unix epoch seconds. "
+                "Mairon Core uses this for exact local-day searches such as today or yesterday."
+            )
+        },
+        "before_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "description": (
+                "Optional exact upper time boundary as Unix epoch seconds. "
+                "Mairon Core uses this for exact local-day searches such as today or yesterday."
+            )
+        },
+        "expand_search": {
+            "type": "boolean",
+            "description": (
+                "Whether a narrow rolling search may expand to a broader period when no matches "
+                "are found. Must be false for exact calendar windows."
+            )
         }
     },
     required=[
@@ -711,7 +734,10 @@ def execute_tool(
             search_text=arguments.get("search_text", ""),
             days=arguments.get("days", 30),
             unread_only=arguments.get("unread_only", False),
-            max_results=arguments.get("max_results", 10)
+            max_results=arguments.get("max_results", 10),
+            after_epoch=arguments.get("after_epoch"),
+            before_epoch=arguments.get("before_epoch"),
+            expand_search=arguments.get("expand_search", True)
         )
 
     if tool_name == "read_email":
