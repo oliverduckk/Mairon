@@ -16,6 +16,13 @@ QUESTION_PATTERNS = [
     r"^\s*(?:what|why|who|where|when|how|does|do|did|is|are|can|could|would|should|has|have|will)\b",
 ]
 
+APPLICATION_LAUNCH_PATTERN = re.compile(
+    r"\b(?:open|launch|start)(?:\s+up)?\s+(?:the\s+)?"
+    r"(?P<app>calculator|notepad)\b",
+    flags=re.IGNORECASE,
+)
+
+
 ACTION_PATTERNS = [
     r"^\s*(?:check|send|turn|open|close|start|stop|set|remind|search|find|look|show|tell|wake|shutdown|shut down|restart|download|upload|move|copy)\b",
 ]
@@ -105,6 +112,34 @@ RECOMMENDATION_REQUEST_PATTERNS = [
 FOLLOW_UP_PRONOUNS = {
     "it", "that", "this", "they", "them", "those", "these", "he", "she",
 }
+
+
+def _extract_application_name(
+    text: str,
+) -> Optional[str]:
+    match = APPLICATION_LAUNCH_PATTERN.search(
+        str(
+            text or ""
+        )
+    )
+
+    if not match:
+        return None
+
+    app_name = (
+        match.group(
+            "app"
+        )
+        or ""
+    ).strip().lower()
+
+    if app_name not in {
+        "calculator",
+        "notepad",
+    }:
+        return None
+
+    return app_name
 
 
 def _normalise(text: str) -> str:
@@ -398,6 +433,34 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.confidence = 1.0
         state.should_answer_directly = False
         state.add_reason("empty input")
+        return state
+
+    app_name = _extract_application_name(
+        raw
+    )
+
+    if app_name:
+        state.speech_act = "request_action"
+        state.intent = "launch_application"
+        state.subject = app_name
+        state.entities[
+            "app_name"
+        ] = app_name
+        state.requested_action = "launch_application"
+        state.requires_private_data = False
+        state.requires_live_data = True
+        state.factuality = "action_result"
+        state.preferred_authority = "desktop"
+        state.should_use_tools = True
+        state.should_answer_directly = False
+        state.should_recommend = False
+        state.should_continue_conversation = False
+        state.confidence = 0.99
+
+        state.add_reason(
+            "explicit launch request for an approved desktop application"
+        )
+
         return state
 
     if _matches_any(text, ORDER_STATUS_PATTERNS):

@@ -21,6 +21,9 @@ from core.turn_state import (
 from core.workflow_result import (
     WorkflowResult,
 )
+from core.workflows.application_launch import (
+    launch_approved_application,
+)
 from core.workflows.email_search import (
     search_email,
 )
@@ -215,6 +218,75 @@ class MaironCore:
 
         workflow_result = None
         direct_response = None
+
+        # --------------------------------------------------
+        # Deterministic approved desktop application launch
+        # --------------------------------------------------
+
+        if turn.intent == "launch_application":
+            app_name = str(
+                turn.entities.get(
+                    "app_name",
+                    "",
+                )
+            ).strip().lower()
+
+            workflow_result = (
+                launch_approved_application(
+                    app_name=app_name
+                )
+            )
+
+            contract = build_answer_contract(
+                turn=turn,
+                route=route,
+                evidence=(
+                    workflow_result.evidence
+                    if workflow_result
+                    else None
+                ),
+            )
+
+            if (
+                workflow_result
+                and workflow_result.answer_fact
+            ):
+                contract.required_claims.append(
+                    workflow_result.answer_fact
+                )
+
+            if (
+                workflow_result
+                and workflow_result.success
+                and workflow_result.answer_fact
+            ):
+                direct_response = (
+                    workflow_result.answer_fact
+                )
+
+            else:
+                direct_response = (
+                    workflow_result.error
+                    if (
+                        workflow_result
+                        and workflow_result.error
+                    )
+                    else (
+                        "I couldn't open that application."
+                    )
+                )
+
+            self.conversation_state.update_from_turn(
+                turn
+            )
+
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
+                workflow_result=workflow_result,
+                direct_response=direct_response,
+            )
 
         # --------------------------------------------------
         # Deterministic targeted Gmail workflow
