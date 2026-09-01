@@ -2,6 +2,11 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+from core.answer_contract_runtime import (
+    coerce_answer_contract_runtime,
+    render_answer_contract,
+)
+
 
 def _extract_json_object(
     text: Any,
@@ -61,70 +66,56 @@ def _extract_json_object(
     return parsed
 
 
-def _contract_value(
-    core_answer_contract: Optional[str],
-    field_name: str,
-) -> Optional[str]:
-    if not core_answer_contract:
-        return None
-
-    prefix = (
-        str(
-            field_name
-        ).strip()
-        + ":"
-    ).lower()
-
-    for raw_line in str(
-        core_answer_contract
-    ).splitlines():
-        line = raw_line.strip()
-
-        comparable = line.lstrip(
-            "- "
-        ).strip()
-
-        if comparable.lower().startswith(
-            prefix
-        ):
-            return comparable.split(
-                ":",
-                1,
-            )[
-                1
-            ].strip()
-
-    return None
-
-
 def contract_forbids_new_factual_claims(
-    core_answer_contract: Optional[str],
+    core_answer_contract,
 ) -> bool:
-    value = _contract_value(
-        core_answer_contract,
-        "New unsupported factual claims allowed",
+    """
+    Structured policy check.
+
+    No prose parsing occurs here.
+    """
+
+    runtime = (
+        coerce_answer_contract_runtime(
+            core_answer_contract
+        )
     )
 
-    return (
-        str(
-            value or ""
-        ).strip().lower()
-        == "false"
+    if runtime is None:
+        return False
+
+    return not (
+        runtime.allow_new_factual_claims
     )
 
 
 def contract_intent(
-    core_answer_contract: Optional[str],
+    core_answer_contract,
 ) -> Optional[str]:
-    value = _contract_value(
-        core_answer_contract,
-        "Intent",
+    """
+    Structured intent lookup.
+
+    No prose parsing occurs here.
+    """
+
+    runtime = (
+        coerce_answer_contract_runtime(
+            core_answer_contract
+        )
     )
 
-    if not value:
+    if runtime is None:
         return None
 
-    return value.strip().lower()
+    value = str(
+        runtime.intent
+        or ""
+    ).strip().lower()
+
+    return (
+        value
+        or None
+    )
 
 
 def _message_role_and_content(
@@ -244,8 +235,8 @@ def _combined_allowed_grounding_text(
         str(
             user_input or ""
         ),
-        str(
-            core_answer_contract or ""
+        render_answer_contract(
+            core_answer_contract
         ),
     ]
 
@@ -461,6 +452,358 @@ def _unsupported_current_location_claims(
     return unsupported
 
 
+def _unsupported_travel_transport_claims(
+    draft: str,
+    grounding_text: str,
+) -> List[str]:
+    """
+    Catch high-confidence itinerary/transport inventions.
+
+    Example:
+        Oliver: "My XT6s arrived for my China trip."
+        Draft:  "Hope you're ready for serious driving adventures."
+
+    "Driving adventures" is not obvious absurd banter. It is a plausible
+    claim about how Oliver will travel, so it requires support.
+
+    This check activates only when the grounding packet itself establishes
+    a trip/travel context.
+    """
+
+    grounding_norm = _normalise_for_grounding(
+        grounding_text
+    )
+
+    travel_context_terms = (
+        " trip",
+        "trip ",
+        " travel",
+        "travel ",
+        " holiday",
+        "holiday ",
+        " vacation",
+        "vacation ",
+        " itinerary",
+        "itinerary ",
+    )
+
+    if not any(
+        term in f" {grounding_norm} "
+        for term in travel_context_terms
+    ):
+        return []
+
+    draft_text = str(
+        draft
+        or ""
+    )
+
+    transport_categories = {
+        "driving": {
+            "grounding_terms": (
+                "drive",
+                "driving",
+                "car",
+                "road trip",
+                "roadtrip",
+            ),
+            "draft_patterns": (
+                r"\bready\s+for\b.{0,35}\bdriving\b",
+                r"\bdriving\s+(?:adventure|adventures|trip|trips|around|through|across)\b",
+                r"\b(?:you|we)(?:'ll| will| are going to| are gonna| gonna)?\s+(?:be\s+)?driv(?:e|ing)\b",
+                r"\b(?:car|road)\s+trip\b",
+            ),
+        },
+        "flying": {
+            "grounding_terms": (
+                "flight",
+                "flights",
+                "fly",
+                "flying",
+                "plane",
+            ),
+            "draft_patterns": (
+                r"\b(?:you|we)(?:'ll| will| are going to| are gonna| gonna)?\s+(?:fly|be flying)\b",
+                r"\b(?:take|taking|catch|catching)\b.{0,20}\b(?:a\s+)?flight\b",
+            ),
+        },
+        "rail": {
+            "grounding_terms": (
+                "train",
+                "trains",
+                "rail",
+                "railway",
+            ),
+            "draft_patterns": (
+                r"\b(?:you|we)(?:'ll| will| are going to| are gonna| gonna)?\s+(?:take|catch|ride)\b.{0,20}\btrain\b",
+                r"\btrain\s+(?:trip|journey|ride|rides)\b",
+            ),
+        },
+        "taxi/rideshare": {
+            "grounding_terms": (
+                "taxi",
+                "taxis",
+                "didi",
+                "uber",
+                "rideshare",
+            ),
+            "draft_patterns": (
+                r"\b(?:take|taking|catch|catching|use|using)\b.{0,20}\b(?:taxi|didi|uber|rideshare)\b",
+            ),
+        },
+    }
+
+    unsupported = []
+
+    for category, rules in (
+        transport_categories.items()
+    ):
+        draft_has_claim = any(
+            re.search(
+                pattern,
+                draft_text,
+                flags=re.IGNORECASE,
+            )
+            for pattern in rules[
+                "draft_patterns"
+            ]
+        )
+
+        if not draft_has_claim:
+            continue
+
+        grounding_has_transport = any(
+            re.search(
+                r"\b"
+                + re.escape(
+                    term
+                )
+                + r"\b",
+                grounding_norm,
+                flags=re.IGNORECASE,
+            )
+            for term in rules[
+                "grounding_terms"
+            ]
+        )
+
+        if grounding_has_transport:
+            continue
+
+        unsupported.append(
+            (
+                f"travel transport claim involving {category} "
+                "is not directly supported"
+            )
+        )
+
+    return unsupported
+
+
+def _unsupported_travel_world_claims(
+    draft: str,
+    grounding_text: str,
+) -> List[str]:
+    """
+    Catch plausible travel-world embellishments that are not supported by
+    Oliver's grounding packet.
+
+    This is deliberately narrower than "ban all novel words". Mairon may
+    still make obviously absurd jokes. What this blocks are realistic claims
+    about weather/climate, traffic, clothing requirements, venues, activities,
+    and other itinerary-like details that a normal reader could mistake for
+    actual knowledge.
+
+    Exact live regression:
+        Oliver:
+            "My XT6s have arrived for my China trip in November!"
+
+        Unsupported:
+            "China's infamous traffic"
+            "sweating through your jacket in November"
+            "your bargaining skills at the market"
+    """
+
+    grounding_norm = _normalise_for_grounding(
+        grounding_text
+    )
+
+    padded_grounding = (
+        " "
+        + grounding_norm
+        + " "
+    )
+
+    travel_context_terms = (
+        " trip ",
+        " travel ",
+        " holiday ",
+        " vacation ",
+        " itinerary ",
+    )
+
+    if not any(
+        term in padded_grounding
+        for term in travel_context_terms
+    ):
+        return []
+
+    draft_text = str(
+        draft
+        or ""
+    )
+
+    categories = {
+        "weather/climate": {
+            "grounding_terms": (
+                "weather",
+                "forecast",
+                "rain",
+                "raining",
+                "rainy",
+                "snow",
+                "snowing",
+                "snowy",
+                "hot",
+                "heat",
+                "warm",
+                "warmer",
+                "cold",
+                "cool",
+                "cooler",
+                "chilly",
+                "freezing",
+                "humid",
+                "humidity",
+                "temperature",
+                "temperatures",
+                "sweat",
+                "sweating",
+            ),
+            "draft_patterns": (
+                r"\b(?:weather|forecast|climate|temperature|temperatures)\b",
+                r"\b(?:rain|raining|rainy|drizzle|snow|snowing|snowy)\b",
+                r"\b(?:hot|heat|warm|warmer|cold|cool|cooler|chilly|freezing|humid|humidity)\b",
+                r"\b(?:sweat|sweating|sweaty)\b",
+            ),
+        },
+        "weather-related clothing": {
+            "grounding_terms": (
+                "jacket",
+                "coat",
+                "shell",
+                "umbrella",
+                "raincoat",
+                "poncho",
+            ),
+            "draft_patterns": (
+                r"\b(?:jacket|coat|shell|umbrella|raincoat|poncho)\b",
+            ),
+        },
+        "traffic/road conditions": {
+            "grounding_terms": (
+                "traffic",
+                "congestion",
+                "traffic jam",
+                "traffic jams",
+                "roads",
+                "road conditions",
+            ),
+            "draft_patterns": (
+                r"\b(?:traffic|congestion)\b",
+                r"\btraffic\s+jams?\b",
+                r"\broad\s+conditions?\b",
+            ),
+        },
+        "market/shopping activity": {
+            "grounding_terms": (
+                "market",
+                "markets",
+                "shopping",
+                "shop",
+                "shops",
+                "bargain",
+                "bargaining",
+            ),
+            "draft_patterns": (
+                r"\b(?:market|markets|shopping|shops?)\b",
+                r"\b(?:bargain|bargaining)\b",
+            ),
+        },
+        "tourist activity/venue": {
+            "grounding_terms": (
+                "museum",
+                "museums",
+                "temple",
+                "temples",
+                "attraction",
+                "attractions",
+                "nightlife",
+                "beach",
+                "beaches",
+                "hike",
+                "hiking",
+                "mountain",
+                "mountains",
+                "tour",
+                "tours",
+                "sightseeing",
+            ),
+            "draft_patterns": (
+                r"\b(?:museum|museums|temple|temples|attraction|attractions)\b",
+                r"\b(?:nightlife|beach|beaches|hike|hiking|mountain|mountains)\b",
+                r"\b(?:tour|tours|sightseeing)\b",
+            ),
+        },
+    }
+
+    unsupported = []
+
+    for category, rules in (
+        categories.items()
+    ):
+        draft_has_detail = any(
+            re.search(
+                pattern,
+                draft_text,
+                flags=re.IGNORECASE,
+            )
+            for pattern in rules[
+                "draft_patterns"
+            ]
+        )
+
+        if not draft_has_detail:
+            continue
+
+        grounding_has_detail = any(
+            re.search(
+                r"\b"
+                + re.escape(
+                    term
+                )
+                + r"\b",
+                grounding_norm,
+                flags=re.IGNORECASE,
+            )
+            for term in rules[
+                "grounding_terms"
+            ]
+        )
+
+        if grounding_has_detail:
+            continue
+
+        unsupported.append(
+            (
+                f"travel-world detail involving {category} "
+                "is not directly supported"
+            )
+        )
+
+    return unsupported
+
+
 def find_deterministic_grounding_violations(
     user_input: str,
     draft: str,
@@ -503,6 +846,32 @@ def find_deterministic_grounding_violations(
 
     for description in (
         _unsupported_current_location_claims(
+            draft=draft,
+            grounding_text=grounding_text,
+        )
+    ):
+        violations.append(
+            (
+                "unsupported Core-grounded claim: "
+                + description
+            )
+        )
+
+    for description in (
+        _unsupported_travel_transport_claims(
+            draft=draft,
+            grounding_text=grounding_text,
+        )
+    ):
+        violations.append(
+            (
+                "unsupported Core-grounded claim: "
+                + description
+            )
+        )
+
+    for description in (
+        _unsupported_travel_world_claims(
             draft=draft,
             grounding_text=grounding_text,
         )
@@ -640,7 +1009,12 @@ def verify_core_grounded_draft(
         "'XT6s last 500 km', "
         "'they are currently in China', "
         "'you will visit the Great Wall', "
-        "'they were made in China'.\n"
+        "'they were made in China', "
+        "'China has infamous traffic', "
+        "'you will be sweating in a jacket in November', "
+        "'your bargaining skills at the market'. "
+        "A sentence can be sarcastic while still smuggling in a plausible "
+        "factual premise; those premises still require grounding.\n"
         "- When uncertain, ask: would a normal reader reasonably believe Mairon is "
         "telling Oliver something true about the product, location, itinerary, "
         "history, media canon, technical behaviour, or an external event? If yes, "
@@ -688,9 +1062,8 @@ def verify_core_grounded_draft(
             "role": "system",
             "content": (
                 "CORE ANSWER CONTRACT:\n"
-                + str(
+                + render_answer_contract(
                     core_answer_contract
-                    or ""
                 )
             ),
         },
@@ -828,11 +1201,17 @@ def build_core_grounding_retry_instruction(
 
 def build_core_grounding_fallback(
     core_answer_contract: Optional[str],
+    user_input: Optional[str] = None,
 ) -> str:
     """
     Fail closed after repeated semantic-grounding failures.
 
-    These deliberately contain almost no factual content.
+    Phase 6.4:
+    Keep factual content near-zero, but avoid sounding like a broken
+    customer-service bot when the user's turn is obviously social.
+
+    Existing callers that do not provide user_input retain the old fallback
+    for backward compatibility with the regression suite.
     """
 
     intent = contract_intent(
@@ -840,8 +1219,70 @@ def build_core_grounding_fallback(
     )
 
     if intent == "share_context":
+        if user_input is None:
+            return (
+                "Fair enough. That makes sense."
+            )
+
+        text = str(
+            user_input
+            or ""
+        ).lower()
+
+        arrival_markers = (
+            "arrived",
+            "has arrived",
+            "have arrived",
+            "is here",
+            "are here",
+            "turned up",
+            "showed up",
+            "came today",
+            "came in",
+        )
+
+        excitement_markers = (
+            "let's go",
+            "lets go",
+            "fuck yeah",
+            "hell yeah",
+            "finally",
+            "!!!",
+        )
+
+        has_arrival = any(
+            marker in text
+            for marker in arrival_markers
+        )
+
+        has_excitement = (
+            any(
+                marker in text
+                for marker in excitement_markers
+            )
+            or "!" in text
+        )
+
+        if (
+            has_arrival
+            and has_excitement
+        ):
+            return (
+                "Hell yes. About fucking time."
+            )
+
+        if has_arrival:
+            return (
+                "Nice. About time."
+            )
+
+        if has_excitement:
+            return (
+                "There we fucking go."
+            )
+
         return (
-            "Fair enough. That makes sense."
+            "Right, got you."
         )
 
     if intent == "acknowledge":

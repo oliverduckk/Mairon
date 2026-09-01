@@ -61,6 +61,30 @@ CONTEXTUAL_EMAIL_FOLLOWUP_PATTERNS = [
 DECLARATIVE_SHARE_PATTERNS = [
     r"^\s*(?:they|it|these|those|this)\s+(?:are|is|were|was)\b",
     r"^\s*i(?:'m| am| just| bought| got| have| own| use| read| watch| like| love| hate| reckon| think)\b",
+
+    # First-person plural updates are also user-provided context:
+    #
+    # - "We aren't driving anywhere."
+    # - "We are taking trains."
+    # - "We have one domestic flight."
+    #
+    # These should not fall through to generic casual conversation.
+    r"^\s*we(?:'re| are| aren't| arent| were| weren't| werent| have| haven't| havent| got| take| are taking| will| won't| wont| plan| planned)\b",
+
+    # Personal/household status updates often begin with a possessive noun
+    # phrase rather than "I" or "they":
+    #
+    # - "My XT6s have arrived for my China trip in November!"
+    # - "My new monitor is here."
+    # - "My exam got moved."
+    # - "Our flight has changed."
+    #
+    # These are declarative user-provided context. They must not fall through
+    # to generic casual conversation, because generic conversation may enable
+    # unrelated long-term retrieval.
+    r"^\s*(?:my|our)\s+[^?]{1,140}?\s+"
+    r"(?:is|are|was|were|has|have|had|got|gets|came|arrived|changed|moved|turned|looks|feels|seems)\b",
+
     r"\bfor my trip\b",
     r"\bgotta\b",
     r"\byou know\b",
@@ -88,6 +112,13 @@ CORRECTION_PATTERNS = [
     r"\bis(?:n't| not)\b",
     r"\byou just said\b",
     r"\byou said\b",
+
+    # Challenges to Mairon's immediately preceding claim/source.
+    r"\bwhere\s+(?:are|were)\s+you\s+getting\b",
+    r"\bwhere\s+did\s+you\s+get\b",
+    r"\bi\s+never(?:\s+even)?\s+asked\b",
+    r"\bi\s+didn'?t\s+ask\b",
+    r"\bi\s+did\s+not\s+ask\b",
 ]
 
 BANTER_PATTERNS = [

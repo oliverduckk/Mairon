@@ -65,6 +65,11 @@ from core.claim_grounding import (
     should_verify_core_grounding,
     verify_core_grounded_draft,
 )
+from core.answer_contract_runtime import (
+    coerce_answer_contract_runtime,
+    contract_field_value,
+    render_answer_contract,
+)
 
 from routine.night_routine import (
     complete_night_routine_work_location,
@@ -556,36 +561,54 @@ def is_direct_weather_request(
     user_input
 ):
     """
-    Detect ordinary current/forecast weather questions that should use
-    Mairon's dedicated weather source rather than the generic public web.
+    Detect an ACTUAL current/forecast weather request.
 
-    Research/news/climate-analysis requests are intentionally excluded so
-    they can still reach normal web tools when appropriate.
+    Important:
+    - use word boundaries so "trains" does not contain a magical forecast;
+    - mentions/complaints about weather are not automatically requests;
+    - source challenges such as "where are you getting the weather from?"
+      are conversational corrections, not weather lookups;
+    - research/climate questions stay on the normal web path.
     """
 
     text = re.sub(
         r"\s+",
         " ",
-        user_input.lower().strip()
+        str(
+            user_input
+            or ""
+        ).lower().strip()
     )
 
-    weather_terms = [
-        "weather",
-        "temperature",
-        "forecast",
-        "rain",
-        "raining",
-        "rainy",
-        "wind",
-        "windy",
-        "degrees",
+    if not text:
+        return False
+
+    # --------------------------------------------------
+    # Meta / correction language.
+    # --------------------------------------------------
+
+    meta_weather_patterns = [
+        r"\b(?:i|we)\s+(?:never|didn'?t|did not)\b.{0,40}\bask(?:ed)?\b.{0,30}\bweather\b",
+        r"\b(?:i|we)\s+(?:wasn'?t|were not|weren'?t|am not|are not|aren'?t)\b.{0,40}\bask(?:ing)?\b.{0,30}\bweather\b",
+        r"\bwhere\s+(?:are|were|did)\s+you\s+(?:get|get(?:ting)?|getting)\b.{0,40}\bweather\b",
+        r"\bwhy\s+(?:are|were|did)\s+you\b.{0,40}\b(?:check|checking|give|giving|tell|telling|mention|mentioning)\b.{0,40}\bweather\b",
+        r"\bwhat\s+weather\s+(?:are|were)\s+you\s+talking\s+about\b",
+        r"\bstop\b.{0,30}\b(?:weather|forecast)\b",
+        r"\bnot\s+(?:asking|talking)\s+about\b.{0,20}\b(?:weather|forecast)\b",
     ]
 
-    if not any(
-        term in text
-        for term in weather_terms
+    if any(
+        re.search(
+            pattern,
+            text,
+        )
+        for pattern in meta_weather_patterns
     ):
         return False
+
+    # --------------------------------------------------
+    # Research / analysis language.
+    # --------------------------------------------------
 
     research_phrases = [
         "why has",
@@ -610,7 +633,58 @@ def is_direct_weather_request(
     ):
         return False
 
-    return True
+    # --------------------------------------------------
+    # Full-word weather vocabulary.
+    # --------------------------------------------------
+
+    weather_word_pattern = re.compile(
+        r"\b(?:weather|temperature|forecast|rain|raining|rainy|wind|windy|degrees)\b"
+    )
+
+    if not weather_word_pattern.search(
+        text
+    ):
+        return False
+
+    # --------------------------------------------------
+    # Explicit weather request shapes.
+    #
+    # Examples:
+    # - "what's the weather tomorrow?"
+    # - "will it rain?"
+    # - "forecast for Sydney"
+    # - "weather Sydney"
+    # - "is it windy today?"
+    # --------------------------------------------------
+
+    request_patterns = [
+        r"^\s*(?:what(?:'s| is)|how(?:'s| is))\s+(?:the\s+)?(?:weather|temperature|forecast)\b",
+        r"^\s*(?:weather|forecast|temperature)\b",
+        r"\b(?:weather|forecast|temperature)\s+(?:in|for|at|around|tomorrow|today|tonight)\b",
+        r"\b(?:will|would|is|are|was|were|does|do|did|should|could|can)\b.{0,50}\b(?:rain|raining|rainy|wind|windy|degrees|temperature|weather)\b",
+        r"\b(?:how hot|how cold|how windy)\b",
+    ]
+
+    if any(
+        re.search(
+            pattern,
+            text,
+        )
+        for pattern in request_patterns
+    ):
+        return True
+
+    # A question mark plus an actual full-word weather term is also enough,
+    # unless one of the meta/research guards above already rejected it.
+    if (
+        "?" in text
+        and weather_word_pattern.search(
+            text
+        )
+    ):
+        return True
+
+    return False
 
 
 def finalise_weather_request(
@@ -4062,44 +4136,16 @@ def _core_contract_value(
     field_name,
 ):
     """
-    Read one simple 'Field: value' line from the current Core contract.
+    Compatibility accessor for older provider helpers.
+
+    Phase 6: field lookup is delegated to the shared structured
+    AnswerContractRuntime. This function never parses rendered prose.
     """
 
-    if not core_answer_contract:
-        return None
-
-    prefix = (
-        str(field_name).strip()
-        + ":"
-    ).lower()
-
-    for raw_line in str(
-        core_answer_contract
-    ).splitlines():
-        line = raw_line.strip()
-
-        # AnswerContract renders some fields as markdown-style bullets:
-        #
-        #   - Follow-up question allowed: false
-        #   - New unsupported factual claims allowed: false
-        #
-        # Contract parsing must treat the bullet marker as presentation,
-        # not as part of the field name.
-        comparable = line.lstrip(
-            "- "
-        ).strip()
-
-        if comparable.lower().startswith(
-            prefix
-        ):
-            return comparable.split(
-                ":",
-                1,
-            )[
-                1
-            ].strip()
-
-    return None
+    return contract_field_value(
+        core_answer_contract,
+        field_name,
+    )
 
 
 def _explicit_recall_request(
@@ -4153,7 +4199,10 @@ def should_retrieve_past_context_for_turn(
         "Intent",
     )
 
-    if intent == "acknowledge":
+    if intent in {
+        "acknowledge",
+        "correct_mairon",
+    }:
         return False
 
     if (
@@ -4241,8 +4290,16 @@ def build_core_micro_act_instruction(
         "- Previous assistant/Mairon statements are conversational context only; "
         "they are NOT factual evidence.",
         "- Do not add plausible external details about products, geography, travel "
-        "routes, climate/weather, manufacturing, specifications, performance, "
-        "history, media canon, or what supposedly happened off-screen.",
+        "routes, climate/weather, traffic, clothing, markets/shopping, tourist "
+        "activities, manufacturing, specifications, performance, history, media "
+        "canon, or what supposedly happened off-screen.",
+        "- For travel updates specifically: mentioning a destination/month does NOT "
+        "license you to invent traffic, weather, clothing, transport, attractions, "
+        "markets, bargaining, food, or itinerary details.",
+        "- If you want personality, prefer obviously non-literal humour attached to "
+        "something Oliver actually mentioned. Example shapes: the shoes escaping "
+        "parcel purgatory, the destination being warned, or the shoes developing an "
+        "ego. Do NOT copy these examples mechanically.",
         "- Sarcasm, teasing, absurd hyperbole, anthropomorphism, and obviously "
         "non-literal jokes are welcome. A joke does not need to be literally true "
         "when a normal reader would clearly recognise it as a joke.",
@@ -4252,11 +4309,15 @@ def build_core_micro_act_instruction(
 
     if retry:
         lines.extend([
-            "- The previous draft was rejected. Start fresh.",
-            "- Do NOT reuse, paraphrase, negate, or allude to the rejected factual "
-            "premise. Do not try to 'fix' it by swapping in a different external fact.",
+            "- Produce an alternate fresh reply to Oliver's CURRENT message.",
+            "- Stay completely in-character. Do not discuss instructions, rules, "
+            "drafts, rejection, validation, truthfulness, lying, factuality, or "
+            "why a prior response was unsuitable.",
+            "- Do not negate or argue with an imaginary accusation from Oliver.",
             "- Prefer a dry/sarcastic reaction or clearly absurd joke over factual "
             "embellishment.",
+            "- Do not introduce new weather, traffic, clothing, venue, shopping, "
+            "transport, or itinerary details unless Oliver explicitly supplied them.",
         ])
 
     if prior_user_context:
@@ -4358,6 +4419,215 @@ def repair_core_restricted_draft(
     ).strip()
 
     return repaired
+
+
+def find_core_micro_act_relevance_violations(
+    response_text,
+    user_input,
+    core_answer_contract,
+):
+    """
+    Cheap relevance guard for tiny social turns.
+
+    Grounding answers:
+        "Is this factual claim supported?"
+
+    This guard answers:
+        "Is Mairon even replying to Oliver's current message?"
+
+    It specifically prevents retry/meta leakage such as:
+        "I'm not denying anything..."
+        "If you're implying I'm lying..."
+
+    from being accepted merely because those sentences contain no external
+    factual hallucination.
+    """
+
+    intent = _core_contract_value(
+        core_answer_contract,
+        "Intent",
+    )
+
+    if intent not in {
+        "share_context",
+        "acknowledge",
+    }:
+        return []
+
+    response = str(
+        response_text
+        or ""
+    ).strip()
+
+    user_text = str(
+        user_input
+        or ""
+    ).strip()
+
+    if not response:
+        return [
+            "Core social micro-act produced an empty response"
+        ]
+
+    lowered = response.lower()
+    user_lowered = user_text.lower()
+
+    violations = []
+
+    # --------------------------------------------------
+    # Meta-defensive / validator-leak language.
+    # --------------------------------------------------
+
+    meta_defensive_markers = (
+        "i'm not denying",
+        "i am not denying",
+        "if you're implying",
+        "if you are implying",
+        "if you're accusing",
+        "if you are accusing",
+        "i'm lying",
+        "i am lying",
+        "supposedly said",
+        "what exactly i said",
+        "what exactly i supposedly",
+        "being factual",
+        "i was being factual",
+        "i'm being factual",
+        "i am being factual",
+        "i never said",
+        "i didn't say",
+        "i did not say",
+        "that's not what i said",
+        "that is not what i said",
+        "my previous response",
+        "previous draft",
+        "rejected draft",
+        "response guardrail",
+        "answer contract",
+        "validation",
+    )
+
+    user_is_actually_correcting = any(
+        marker in user_lowered
+        for marker in (
+            "you're wrong",
+            "you are wrong",
+            "that's wrong",
+            "that is wrong",
+            "you said",
+            "you just said",
+            "i never asked",
+            "i didn't ask",
+            "i did not ask",
+            "where are you getting",
+            "where did you get",
+        )
+    )
+
+    if (
+        not user_is_actually_correcting
+        and any(
+            marker in lowered
+            for marker in meta_defensive_markers
+        )
+    ):
+        violations.append(
+            (
+                "Core social micro-act responded to an imaginary "
+                "accusation/validator instead of Oliver's current message"
+            )
+        )
+
+    # --------------------------------------------------
+    # Cheap topical anchoring.
+    #
+    # A natural reply usually either:
+    # - reuses at least one meaningful current-message token; or
+    # - is an unmistakable short social reaction.
+    # --------------------------------------------------
+
+    token_pattern = re.compile(
+        r"[a-z0-9][a-z0-9'_-]*",
+        flags=re.IGNORECASE,
+    )
+
+    stopwords = {
+        "the", "a", "an", "and", "or", "but", "for", "to", "of",
+        "in", "on", "at", "with", "from", "my", "our", "your", "their",
+        "i", "im", "i'm", "we", "were", "we're", "you", "youre", "you're",
+        "it", "its", "it's", "they", "theyre", "they're", "this", "that",
+        "these", "those", "is", "are", "was", "were", "be", "been",
+        "have", "has", "had", "do", "does", "did", "will", "would",
+        "can", "could", "should", "may", "might", "just", "very",
+        "really", "so", "now", "then", "here", "there",
+    }
+
+    user_tokens = {
+        token.lower()
+        for token in token_pattern.findall(
+            user_text
+        )
+        if (
+            len(token) >= 3
+            and token.lower()
+            not in stopwords
+        )
+    }
+
+    response_tokens = {
+        token.lower()
+        for token in token_pattern.findall(
+            response
+        )
+        if (
+            len(token) >= 3
+            and token.lower()
+            not in stopwords
+        )
+    }
+
+    topical_overlap = bool(
+        user_tokens
+        & response_tokens
+    )
+
+    social_reaction_markers = (
+        "hell yes",
+        "fuck yes",
+        "fuck yeah",
+        "there we go",
+        "there we fucking go",
+        "about time",
+        "finally",
+        "nice",
+        "love that",
+        "beautiful",
+        "fair",
+        "got you",
+        "that tracks",
+        "makes sense",
+        "let's go",
+        "lets go",
+    )
+
+    obvious_social_reaction = any(
+        marker in lowered
+        for marker in social_reaction_markers
+    )
+
+    if (
+        intent == "share_context"
+        and not topical_overlap
+        and not obvious_social_reaction
+    ):
+        violations.append(
+            (
+                "Core social micro-act is not anchored to Oliver's "
+                "current message"
+            )
+        )
+
+    return violations
 
 
 def find_core_answer_contract_violations(
@@ -4907,7 +5177,7 @@ def handle_direct_conversation(
 
         base_messages.append({
             "role": "system",
-            "content": core_answer_contract
+            "content": render_answer_contract(core_answer_contract)
         })
 
         core_micro_act_instruction = (
@@ -5001,8 +5271,11 @@ def handle_direct_conversation(
                     )
                 })
 
-            if conversation_policy.get(
-                "knowledge_honesty"
+            if (
+                conversation_policy.get(
+                    "knowledge_honesty"
+                )
+                and not core_is_micro_act
             ):
                 attempt_messages.append({
                     "role": "system",
@@ -5039,7 +5312,10 @@ def handle_direct_conversation(
                         "content": grounding_retry
                     })
 
-            if core_answer_contract:
+            if (
+                core_answer_contract
+                and not core_is_micro_act
+            ):
                 attempt_messages.append({
                     "role": "system",
                     "content": (
@@ -5051,18 +5327,17 @@ def handle_direct_conversation(
                     )
                 })
 
-                if not core_is_micro_act:
-                    core_grounding_retry = (
-                        build_core_grounding_retry_instruction(
-                            violations
-                        )
+                core_grounding_retry = (
+                    build_core_grounding_retry_instruction(
+                        violations
                     )
+                )
 
-                    if core_grounding_retry:
-                        attempt_messages.append({
-                            "role": "system",
-                            "content": core_grounding_retry
-                        })
+                if core_grounding_retry:
+                    attempt_messages.append({
+                        "role": "system",
+                        "content": core_grounding_retry
+                    })
 
             if (
                 spoiler_context.get(
@@ -5195,6 +5470,14 @@ def handle_direct_conversation(
             )
         )
 
+        violations.extend(
+            find_core_micro_act_relevance_violations(
+                response_text=draft_text,
+                user_input=user_input,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
         if core_grounding_required:
             violations.extend(
                 verify_core_grounded_draft(
@@ -5290,7 +5573,8 @@ def handle_direct_conversation(
             ):
                 final_response_text = (
                     build_core_grounding_fallback(
-                        core_answer_contract
+                        core_answer_contract,
+                        user_input=user_input,
                     )
                 )
 
@@ -5379,9 +5663,20 @@ def get_response(
 ):
     (
         static_instructions,
-        core_answer_contract,
+        core_answer_contract_text,
     ) = split_static_and_turn_instructions(
         instructions
+    )
+
+    # Phase 6:
+    # The current router still transports the turn contract inside the
+    # instruction string. Convert that legacy transport into ONE structured
+    # runtime object at provider ingress. Every internal policy/validator
+    # below consumes the object rather than reparsing prose.
+    core_answer_contract = (
+        coerce_answer_contract_runtime(
+            core_answer_contract_text
+        )
     )
 
     if conversation is None:
@@ -5569,7 +5864,7 @@ def get_response(
 
         working_conversation.append({
             "role": "system",
-            "content": core_answer_contract
+            "content": render_answer_contract(core_answer_contract)
         })
 
     working_conversation.append({
