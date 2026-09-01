@@ -313,3 +313,112 @@ def find_conversation_policy_violations(
         )
 
     return violations
+
+
+# --------------------------------------------------
+# Immediate self-correction grounding
+# --------------------------------------------------
+
+SELF_CORRECTION_PATTERNS = [
+    r"\bwhat do you mean\b",
+    r"\bwhat did you mean\b",
+    r"\byou just said\b",
+    r"\byou said\b",
+    r"\bdidn't you just say\b",
+    r"\bdid you just say\b",
+    r"\bwhy did you say\b",
+    r"\bthat's wrong\b",
+    r"\bthat is wrong\b",
+    r"\byou(?:'re| are) wrong\b",
+    r"\bactually\b",
+    r"\bnot (?:a|an|the)\b",
+    r"\bwasn't\b",
+    r"\bwas not\b",
+    r"\bisn't\b",
+    r"\bis not\b",
+]
+
+
+def _recent_assistant_text(
+    conversation,
+):
+    if not conversation:
+        return None
+
+    for message in reversed(
+        conversation[
+            -8:
+        ]
+    ):
+        if isinstance(
+            message,
+            dict,
+        ):
+            role = message.get(
+                "role"
+            )
+
+            content = message.get(
+                "content"
+            ) or ""
+        else:
+            role = getattr(
+                message,
+                "role",
+                None,
+            )
+
+            content = getattr(
+                message,
+                "content",
+                "",
+            ) or ""
+
+        if (
+            role == "assistant"
+            and content
+        ):
+            return content
+
+    return None
+
+
+def build_recent_self_correction_text(
+    user_input,
+    conversation,
+):
+    """
+    If Oliver challenges something Mairon JUST said, explicitly ground
+    the next generation in Mairon's own prior wording.
+
+    The prior response is authoritative about what Mairon said, even if
+    the factual content inside it turns out to be wrong.
+    """
+
+    text = _normalise(
+        user_input
+    )
+
+    if not _matches_any(
+        text,
+        SELF_CORRECTION_PATTERNS,
+    ):
+        return None
+
+    prior = _recent_assistant_text(
+        conversation
+    )
+
+    if not prior:
+        return None
+
+    return (
+        "CORE IMMEDIATE SELF-CORRECTION CONTEXT:\\n"
+        "Oliver is challenging or asking about something Mairon just said.\\n"
+        "The immediately previous Mairon response is authoritative evidence "
+        "of Mairon's own wording:\\n\\n"
+        f"{prior}\\n\\n"
+        "Do not deny saying something that is plainly present in that response. "
+        "If the earlier statement was inaccurate, acknowledge it directly and "
+        "correct it. Do not invent a justification merely to defend the mistake."
+    )

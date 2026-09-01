@@ -59,7 +59,29 @@ STOPWORDS = {
     "there", "these", "they", "this", "those", "to", "too",
     "up", "us", "was", "we", "were", "what", "when", "where",
     "which", "who", "why", "will", "with", "would", "you",
-    "your", "yours",
+    "your", "yours", "only", "re",
+}
+
+LOW_INFORMATION_TERMS = {
+    "anime",
+    "manga",
+    "animanga",
+    "series",
+    "show",
+    "movie",
+    "film",
+    "book",
+    "novel",
+    "character",
+    "characters",
+    "chapter",
+    "episode",
+    "arc",
+    "volume",
+    "season",
+    "latest",
+    "current",
+    "top",
 }
 
 RECALL_HINTS = [
@@ -363,6 +385,13 @@ def _score_row(
 
     score = 0.0
     matched = 0
+    matched_terms = set()
+
+    distinctive_query_terms = {
+        term
+        for term in query_terms
+        if term not in LOW_INFORMATION_TERMS
+    }
 
     for term in query_terms:
         in_user = (
@@ -380,6 +409,9 @@ def _score_row(
             continue
 
         matched += 1
+        matched_terms.add(
+            term
+        )
 
         df = document_frequency.get(
             term,
@@ -412,6 +444,27 @@ def _score_row(
             )
 
     if matched == 0:
+        return 0.0
+
+    # If the query contains a distinctive subject term, at least one
+    # distinctive subject term must match. Generic words such as
+    # "anime", "character", "chapter", or "latest" must never be
+    # enough to pull an unrelated franchise into the prompt.
+    if (
+        distinctive_query_terms
+        and not (
+            matched_terms
+            & distinctive_query_terms
+        )
+    ):
+        return 0.0
+
+    # Longer queries should not be considered relevant because of one
+    # accidental generic overlap.
+    if (
+        len(query_terms) >= 4
+        and matched < 2
+    ):
         return 0.0
 
     coverage = (
