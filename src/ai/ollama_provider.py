@@ -3942,6 +3942,350 @@ def build_spoiler_safe_media_evidence(
 
 
 # --------------------------------------------------
+# Ephemeral Core Answer Contracts
+# --------------------------------------------------
+
+CORE_ANSWER_CONTRACT_MARKER = "CORE ANSWER CONTRACT:"
+
+
+def split_static_and_turn_instructions(
+    instructions,
+):
+    """
+    main.py passes Mairon's normal static instructions plus an optional
+    per-turn Core Answer Contract.
+
+    Provider conversation state persists across turns, so the static
+    instructions belong in history while the Answer Contract is ephemeral
+    and must be re-applied ONLY to the current turn.
+    """
+
+    value = str(
+        instructions or ""
+    )
+
+    marker_index = value.find(
+        CORE_ANSWER_CONTRACT_MARKER
+    )
+
+    if marker_index == -1:
+        return (
+            value.strip(),
+            None,
+        )
+
+    static_text = value[
+        :marker_index
+    ].rstrip()
+
+    contract_text = value[
+        marker_index:
+    ].strip()
+
+    return (
+        static_text,
+        contract_text,
+    )
+
+
+def strip_ephemeral_core_contracts(
+    conversation,
+):
+    """
+    Remove old per-turn contracts before the next generation.
+
+    General tool workflows may temporarily carry a contract in the returned
+    provider history. It must never silently become a future-turn rule.
+    """
+
+    cleaned = []
+
+    for message in list(
+        conversation or []
+    ):
+        if isinstance(
+            message,
+            dict,
+        ):
+            role = message.get(
+                "role"
+            )
+
+            content = str(
+                message.get(
+                    "content"
+                )
+                or ""
+            )
+        else:
+            role = getattr(
+                message,
+                "role",
+                None,
+            )
+
+            content = str(
+                getattr(
+                    message,
+                    "content",
+                    "",
+                )
+                or ""
+            )
+
+        if (
+            role == "system"
+            and content.lstrip().startswith(
+                CORE_ANSWER_CONTRACT_MARKER
+            )
+        ):
+            continue
+
+        cleaned.append(
+            message
+        )
+
+    return cleaned
+
+
+
+def _core_contract_value(
+    core_answer_contract,
+    field_name,
+):
+    """
+    Read one simple 'Field: value' line from the current Core contract.
+    """
+
+    if not core_answer_contract:
+        return None
+
+    prefix = (
+        str(field_name).strip()
+        + ":"
+    ).lower()
+
+    for raw_line in str(
+        core_answer_contract
+    ).splitlines():
+        line = raw_line.strip()
+
+        if line.lower().startswith(
+            prefix
+        ):
+            return line.split(
+                ":",
+                1,
+            )[
+                1
+            ].strip()
+
+    return None
+
+
+def _explicit_recall_request(
+    user_input,
+):
+    """
+    Some conversational statements genuinely ask Mairon to revive older
+    history. Those are allowed to use the Conversation Journal even when
+    the speech act is otherwise casual.
+    """
+
+    text = str(
+        user_input or ""
+    ).lower()
+
+    recall_markers = (
+        "remember when",
+        "do you remember",
+        "we talked about",
+        "we spoke about",
+        "you said before",
+        "you told me before",
+        "last time",
+        "earlier we",
+        "that thing we talked about",
+        "what did i say",
+        "what did you say",
+    )
+
+    return any(
+        marker in text
+        for marker in recall_markers
+    )
+
+
+def should_retrieve_past_context_for_turn(
+    user_input,
+    core_answer_contract,
+):
+    """
+    Long-term conversation retrieval is useful only when the current turn
+    benefits from it.
+
+    Trivial acknowledgements and simple declarative shares should use the
+    immediate live conversation, not drag unrelated old topics into the
+    model context.
+    """
+
+    intent = _core_contract_value(
+        core_answer_contract,
+        "Intent",
+    )
+
+    if intent == "acknowledge":
+        return False
+
+    if (
+        intent == "share_context"
+        and not _explicit_recall_request(
+            user_input
+        )
+    ):
+        return False
+
+    return True
+
+
+def _count_cjk_characters(
+    text,
+):
+    """
+    Count Chinese/Japanese/Korean-script characters conservatively.
+    """
+
+    count = 0
+
+    for char in str(
+        text or ""
+    ):
+        code = ord(
+            char
+        )
+
+        if (
+            0x3400 <= code <= 0x4DBF
+            or 0x4E00 <= code <= 0x9FFF
+            or 0x3040 <= code <= 0x30FF
+            or 0xAC00 <= code <= 0xD7AF
+        ):
+            count += 1
+
+    return count
+
+
+def find_core_answer_contract_violations(
+    response_text,
+    core_answer_contract,
+):
+    """
+    Deterministic validation for the parts of the Core contract that can be
+    checked cheaply and reliably.
+
+    This is deliberately narrow. Core should not pretend a heuristic can
+    prove every semantic property of a response.
+    """
+
+    if not core_answer_contract:
+        return []
+
+    text = str(
+        response_text or ""
+    ).strip()
+
+    lowered = text.lower()
+
+    violations = []
+
+    intent = _core_contract_value(
+        core_answer_contract,
+        "Intent",
+    )
+
+    # English remains the default. A tiny foreign-language joke is fine;
+    # a sentence/paragraph language switch is not.
+    if _count_cjk_characters(
+        text
+    ) > 12:
+        violations.append(
+            "switched too much of the response out of English"
+        )
+
+    generic_offer_markers = (
+        "let me know if",
+        "if you need anything",
+        "if you need help",
+        "i'll be here",
+        "i will be here",
+        "want me to",
+        "would you like me to",
+    )
+
+    if intent == "acknowledge":
+        word_count = len(
+            text.split()
+        )
+
+        if word_count > 24:
+            violations.append(
+                "simple acknowledgement became too long"
+            )
+
+        if "?" in text:
+            violations.append(
+                "simple acknowledgement added a follow-up question"
+            )
+
+        if any(
+            marker in lowered
+            for marker in generic_offer_markers
+        ):
+            violations.append(
+                "simple acknowledgement added an offer of further help"
+            )
+
+        # A thanks response should not suddenly become a mini-report.
+        if (
+            ":" in text
+            and word_count > 12
+        ):
+            violations.append(
+                "simple acknowledgement drifted into unrelated content"
+            )
+
+    if intent == "share_context":
+        if len(
+            text.split()
+        ) > 90:
+            violations.append(
+                "declarative-share response became an unsolicited long-form answer"
+            )
+
+        recommendation_markers = (
+            "you should ",
+            "i recommend ",
+            "i'd recommend ",
+            "i would recommend ",
+            "here are ",
+            "consider buying",
+            "you could buy",
+            "best options",
+            "budget-friendly",
+        )
+
+        if any(
+            marker in lowered
+            for marker in recommendation_markers
+        ):
+            violations.append(
+                "declarative share was turned into unsolicited recommendations"
+            )
+
+    return violations
+
+
+# --------------------------------------------------
 # Personality / direct-conversation workflow
 # --------------------------------------------------
 
@@ -3952,7 +4296,8 @@ def handle_direct_conversation(
     client,
     user_input,
     conversation,
-    allow_cloud_escalation=False
+    allow_cloud_escalation=False,
+    core_answer_contract=None,
 ):
     """
     Tool-free normal conversation with a compact runtime personality
@@ -4155,6 +4500,10 @@ def handle_direct_conversation(
     # dedicated spoiler state. Do not retrieve unrelated historical
     # conversation while Oliver is merely setting/confirming his
     # spoiler ceiling.
+    #
+    # Core also suppresses long-term retrieval for trivial acknowledgements
+    # and ordinary declarative shares. Those turns should use the immediate
+    # live conversation instead of reviving unrelated old topics.
     if (
         spoiler_context.get(
             "progress_updated"
@@ -4167,6 +4516,10 @@ def handle_direct_conversation(
         )
         or spoiler_context.get(
             "must_confirm_latest"
+        )
+        or not should_retrieve_past_context_for_turn(
+            user_input=user_input,
+            core_answer_contract=core_answer_contract,
         )
     ):
         past_context = None
@@ -4330,6 +4683,16 @@ def handle_direct_conversation(
         )
     })
 
+    if core_answer_contract:
+        print(
+            "[Core] Applying per-turn Answer Contract."
+        )
+
+        base_messages.append({
+            "role": "system",
+            "content": core_answer_contract
+        })
+
     base_messages.append({
         "role": "user",
         "content": user_input
@@ -4399,6 +4762,18 @@ def handle_direct_conversation(
                         "role": "system",
                         "content": grounding_retry
                     })
+
+            if core_answer_contract:
+                attempt_messages.append({
+                    "role": "system",
+                    "content": (
+                        "CORE-CONTRACT RETRY: The previous draft violated the "
+                        "current turn's Core Answer Contract. Obey that contract "
+                        "literally. Stay on the current user message and immediate "
+                        "conversation only. Do not revive unrelated older topics. "
+                        "English is the default language."
+                    )
+                })
 
             if (
                 spoiler_context.get(
@@ -4494,6 +4869,13 @@ def handle_direct_conversation(
             find_repetition_violations(
                 response_text=response.message.content,
                 conversation=conversation,
+            )
+        )
+
+        violations.extend(
+            find_core_answer_contract_violations(
+                response_text=response.message.content,
+                core_answer_contract=core_answer_contract,
             )
         )
 
@@ -4622,13 +5004,27 @@ def get_response(
     conversation=None,
     allow_cloud_escalation=False
 ):
+    (
+        static_instructions,
+        core_answer_contract,
+    ) = split_static_and_turn_instructions(
+        instructions
+    )
+
     if conversation is None:
         conversation = [
             {
                 "role": "system",
-                "content": instructions
+                "content": static_instructions
             }
         ]
+
+    else:
+        # Old Answer Contracts are turn-scoped and must never leak into a
+        # future turn.
+        conversation = strip_ephemeral_core_contracts(
+            conversation
+        )
 
     # --------------------------------------------------
     # Continue a pending Night Routine v1 clarification.
@@ -4781,7 +5177,8 @@ def get_response(
             client=client,
             user_input=user_input,
             conversation=conversation,
-            allow_cloud_escalation=allow_cloud_escalation
+            allow_cloud_escalation=allow_cloud_escalation,
+            core_answer_contract=core_answer_contract,
         )
 
     base_conversation = list(
@@ -4791,6 +5188,16 @@ def get_response(
     working_conversation = list(
         conversation
     )
+
+    if core_answer_contract:
+        print(
+            "[Core] Applying per-turn Answer Contract."
+        )
+
+        working_conversation.append({
+            "role": "system",
+            "content": core_answer_contract
+        })
 
     working_conversation.append({
         "role": "system",

@@ -106,3 +106,58 @@ class ConversationState:
             )
 
         return turn
+
+
+
+def append_visible_turn_to_model_history(
+    current_state,
+    user_input,
+    assistant_text,
+    system_instructions=None,
+):
+    """
+    Add a Core-owned visible exchange to the local provider's conversation
+    history without calling the language model.
+
+    This keeps one continuous live conversation even when Core answered a
+    turn deterministically.
+
+    Example:
+        Oliver -> Core/Gmail -> "ready to collect"
+        Oliver -> Qwen follow-up
+
+    Qwen should see the first exchange rather than starting from a blank
+    conversational history.
+    """
+
+    if current_state is None:
+        state = []
+
+        if system_instructions:
+            state.append({
+                "role": "system",
+                "content": str(
+                    system_instructions
+                ),
+            })
+
+    else:
+        state = list(
+            current_state
+        )
+
+    state.append({
+        "role": "user",
+        "content": str(
+            user_input
+        ),
+    })
+
+    state.append({
+        "role": "assistant",
+        "content": str(
+            assistant_text
+        ),
+    })
+
+    return state

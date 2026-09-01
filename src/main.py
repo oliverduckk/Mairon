@@ -8,6 +8,9 @@ from voice.stt import load_model, record_until_enter, transcribe_audio
 from voice.tts import load_tts, speak
 from core.action_manager import describe_action
 from core.orchestrator import MaironCore
+from core.conversation_state import (
+    append_visible_turn_to_model_history,
+)
 from core.router import (
     approve_cloud_escalation,
     approve_pending_action,
@@ -621,6 +624,15 @@ while True:
                 answer=answer,
             )
 
+            local_state = (
+                append_visible_turn_to_model_history(
+                    current_state=local_state,
+                    user_input=user_input,
+                    assistant_text=answer,
+                    system_instructions=mairon_instructions,
+                )
+            )
+
             continue
 
         if (
@@ -632,6 +644,17 @@ while True:
                 answer=(
                     core_decision.direct_response
                 ),
+            )
+
+            local_state = (
+                append_visible_turn_to_model_history(
+                    current_state=local_state,
+                    user_input=user_input,
+                    assistant_text=(
+                        core_decision.direct_response
+                    ),
+                    system_instructions=mairon_instructions,
+                )
             )
 
             continue

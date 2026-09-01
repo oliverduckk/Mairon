@@ -1000,30 +1000,19 @@ def find_repetition_violations(
                     "response reuses too much recent wording"
                 ]
 
-        previous_sentences = _sentence_candidates(
-            previous
-        )
-
-        for candidate_sentence in candidate_sentences:
-            candidate_sentence_norm = _normalise_text(
-                candidate_sentence
-            )
-
-            for previous_sentence in previous_sentences:
-                previous_sentence_norm = _normalise_text(
-                    previous_sentence
-                )
-
-                ratio = SequenceMatcher(
-                    None,
-                    candidate_sentence_norm,
-                    previous_sentence_norm,
-                ).ratio()
-
-                if ratio >= 0.92:
-                    return [
-                        "reused a recent sentence/punchline"
-                    ]
+        # Sentence-level similarity used to be rejected globally here.
+        # That created false positives whenever Oliver revisited the same
+        # topic or repeated a real-world test: perfectly normal factual or
+        # conversational sentences were treated as reused punchlines.
+        #
+        # Core still rejects:
+        # - exact repeated responses;
+        # - strongly near-duplicate complete responses;
+        # - high whole-response token overlap.
+        #
+        # Semantic banter-premise repetition will be handled separately by
+        # a dedicated premise tracker rather than guessing that every
+        # similar sentence is a joke.
 
     return []
 

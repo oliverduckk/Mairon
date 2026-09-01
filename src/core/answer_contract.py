@@ -142,6 +142,12 @@ class AnswerContract:
 
         lines.extend([
             "",
+            "LANGUAGE POLICY:",
+            "- English is the default response language.",
+            "- A foreign-language phrase may be used only as a rare, very short joke.",
+            "- Never switch a full sentence or paragraph into another language unless Oliver explicitly asks.",
+            "- Oliver should not need to understand Chinese, Japanese, or another language to understand the response.",
+            "",
             "Do not contradict this contract. Do not add factual detail "
             "that Core has not supplied when new factual claims are forbidden.",
         ])
@@ -210,11 +216,15 @@ def build_answer_contract(
     if turn.intent == "share_context":
         contract.allow_recommendations = False
         contract.allow_new_factual_claims = False
+        contract.allow_follow_up_question = False
 
         contract.forbidden_behaviours.extend([
             "Do not turn a declarative share into unsolicited recommendations.",
             "Do not infer that Oliver is asking for advice merely because the topic is something advice could be given about.",
-            "React to what Oliver actually said. Do not manufacture a problem to solve.",
+            "React only to what Oliver actually said and the immediately active conversation.",
+            "Do not revive unrelated older topics from retrieved history.",
+            "Do not manufacture a problem to solve.",
+            "Keep the response conversational and compact; normally one to three sentences.",
         ])
 
     if turn.intent == "acknowledge":
@@ -225,6 +235,9 @@ def build_answer_contract(
         contract.forbidden_behaviours.extend([
             "Do not turn thanks into another offer of help.",
             "Do not append generic customer-service follow-up language.",
+            "Do not answer or revive an older question or topic.",
+            "Do not introduce factual claims.",
+            "Keep a simple acknowledgement brief; normally one short sentence.",
         ])
 
     return contract
