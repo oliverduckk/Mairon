@@ -144,10 +144,15 @@ class AnswerContract:
             lines.extend([
                 "",
                 "FACTUAL GROUNDING POLICY:",
-                "- Specific factual claims must come from Oliver's current message, recent user-provided context, resolved references in this contract, required claims, or verified Core evidence.",
-                "- Do not use model training memory to add product properties, technical specifications, itinerary details, location assumptions, media facts, history, or other external facts.",
+                "- Specific factual claims must come from Oliver's current message, "
+                "recent user-provided context, resolved references in this contract, "
+                "required claims, or verified Core evidence.",
+                "- Do not use model training memory to add product properties, technical "
+                "specifications, itinerary details, location assumptions, media facts, "
+                "history, or other external facts.",
                 "- Plausible is not the same as grounded.",
-                "- Subjective reaction and clearly non-literal banter are allowed only when they do not depend on an unsupported factual premise.",
+                "- Subjective reaction and clearly non-literal banter are allowed only "
+                "when they do not depend on an unsupported factual premise.",
                 "- Prefer a shorter response over adding an ungrounded detail.",
             ])
 
@@ -156,8 +161,10 @@ class AnswerContract:
             "LANGUAGE POLICY:",
             "- English is the default response language.",
             "- A foreign-language phrase may be used only as a rare, very short joke.",
-            "- Never switch a full sentence or paragraph into another language unless Oliver explicitly asks.",
-            "- Oliver should not need to understand Chinese, Japanese, or another language to understand the response.",
+            "- Never switch a full sentence or paragraph into another language unless "
+            "Oliver explicitly asks.",
+            "- Oliver should not need to understand Chinese, Japanese, or another "
+            "language to understand the response.",
             "",
             "Do not contradict this contract. Do not add factual detail "
             "that Core has not supplied when new factual claims are forbidden.",
@@ -224,17 +231,30 @@ def build_answer_contract(
             "Do not offer unrelated next steps after answering the status.",
         ])
 
+    if turn.intent == "factual_question":
+        contract.allow_recommendations = False
+        contract.forbidden_behaviours.extend([
+            "Answer the current factual question directly and truthfully before doing anything conversational.",
+            "Do not intentionally give a fake/joke factual answer first and then retract or correct it.",
+            "A very short personality line may follow the answer only when it is directly about the current question, does not contradict the answer, and adds no unsupported Oliver/Mairon history.",
+            "Do not append callbacks to unrelated prior topics after the factual answer.",
+            "Do not revive an old product, device, trip, joke, or assistant phrase merely "
+            "because it appears in conversation history.",
+        ])
+
     if turn.intent == "share_context":
         contract.allow_recommendations = False
         contract.allow_new_factual_claims = False
         contract.allow_follow_up_question = False
-
         contract.forbidden_behaviours.extend([
             "Do not turn a declarative share into unsolicited recommendations.",
-            "Do not infer that Oliver is asking for advice merely because the topic is something advice could be given about.",
+            "Do not infer that Oliver is asking for advice merely because the topic "
+            "is something advice could be given about.",
             "React only to what Oliver actually said and the immediately active conversation.",
             "Do not revive unrelated older topics from retrieved history.",
             "Do not manufacture a problem to solve.",
+            "Do not invent plausible details merely to make the reaction more colourful.",
+            "Do not offer another task after reacting to the update.",
             "Keep the response conversational and compact; normally one to three sentences.",
         ])
 
@@ -249,6 +269,38 @@ def build_answer_contract(
             "Do not answer or revive an older question or topic.",
             "Do not introduce factual claims.",
             "Keep a simple acknowledgement brief; normally one short sentence.",
+        ])
+
+    if turn.intent == "casual_conversation":
+        contract.allow_recommendations = False
+        contract.allow_new_factual_claims = False
+        contract.forbidden_behaviours.extend([
+            "Keep banter anchored to the live conversation.",
+            "Do not turn prior Mairon inventions into factual conversation history.",
+            "Do not import unrelated long-term conversation material.",
+        ])
+
+    if turn.intent == "self_correction":
+        contract.allow_recommendations = False
+        contract.allow_new_factual_claims = False
+        contract.allow_follow_up_question = False
+        contract.forbidden_behaviours.extend([
+            "Treat Oliver's latest explicit correction as authoritative for what he meant.",
+            "Do not argue with the correction.",
+            "Do not describe the correction as Mairon being fact-checked.",
+            "Do not revive the superseded user detail as though it were still current.",
+        ])
+
+    if turn.intent == "conversation_recall":
+        contract.allow_recommendations = False
+        contract.allow_new_factual_claims = False
+        contract.allow_follow_up_question = False
+        contract.forbidden_behaviours.extend([
+            "Answer only from the supplied live conversation record.",
+            "Do not use web research, media research, model memory, or unrelated journal history.",
+            "Prior Mairon statements are not proof of user facts.",
+            "When Oliver explicitly corrected an earlier statement, prefer the later correction.",
+            "If the live conversation does not contain the answer, say so rather than guessing.",
         ])
 
     return contract

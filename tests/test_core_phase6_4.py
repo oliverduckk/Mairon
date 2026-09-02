@@ -92,12 +92,6 @@ def run():
         for violation in violations
     ), violations
 
-    assert any(
-        "not anchored"
-        in violation
-        for violation in violations
-    ), violations
-
     # --------------------------------------------------
     # 2. Normal grounded social responses pass relevance.
     # --------------------------------------------------
@@ -124,7 +118,12 @@ def run():
         )
 
     # --------------------------------------------------
-    # 3. Random unrelated sentence is rejected.
+    # 3. Generic semantic irrelevance is NOT decided by the
+    #    cheap deterministic guard anymore.
+    #
+    # Phase 6.8.3 moved that judgment into the existing semantic
+    # grounding/relevance verifier so paraphrases are not rejected
+    # merely for lacking exact token overlap.
     # --------------------------------------------------
 
     unrelated = (
@@ -139,11 +138,7 @@ def run():
         )
     )
 
-    assert any(
-        "not anchored"
-        in violation
-        for violation in violations
-    ), violations
+    assert violations == [], violations
 
     # --------------------------------------------------
     # 4. Retry prompt does not tell Qwen it was rejected,

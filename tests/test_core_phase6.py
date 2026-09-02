@@ -1,3 +1,4 @@
+import inspect
 import sys
 from pathlib import Path
 
@@ -325,23 +326,15 @@ def run():
     )
 
     # Provider compatibility accessor must delegate, not parse.
-    provider_accessor_start = (
-        provider_source.index(
-            "def _core_contract_value("
+    #
+    # Inspect the function directly instead of assuming which unrelated
+    # helper happens to appear after it in ollama_provider.py. Phase 6.5
+    # legitimately renamed/reorganised the recall helpers.
+    provider_accessor = (
+        inspect.getsource(
+            _core_contract_value
         )
     )
-
-    provider_accessor_end = (
-        provider_source.index(
-            "def _explicit_recall_request(",
-            provider_accessor_start,
-        )
-    )
-
-    provider_accessor = provider_source[
-        provider_accessor_start:
-        provider_accessor_end
-    ]
 
     assert (
         ".splitlines()"

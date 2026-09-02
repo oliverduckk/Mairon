@@ -544,8 +544,11 @@ def _extract_title_from_discussion(
     text,
 ):
     patterns = [
-        # "what do you think about Re Zero"
-        r"\b(?:about|of)\s+(.+?)(?:[?.!,]|$)",
+        # Opinion wording must be explicit. A generic phrase such as
+        # "changed about when I cleaned it" is NOT a media-title signal.
+        r"\bwhat\s+do\s+you\s+think\s+(?:about|of)\s+(.+?)(?:[?.!,]|$)",
+        r"\bwhat(?:'s| is)\s+your\s+(?:opinion|take)\s+(?:on|about|of)\s+(.+?)(?:[?.!,]|$)",
+        r"\bhow\s+do\s+you\s+feel\s+about\s+(.+?)(?:[?.!,]|$)",
         # "top 3 One Piece characters"
         r"\btop\s+\d+\s+(.+?)\s+characters?\b",
         # "favourite One Piece characters"
@@ -1153,12 +1156,145 @@ def _find_pending_spoiler_question(
 def is_media_like_turn(
     user_input,
 ):
-    text = user_input.lower()
+    """
+    Detect explicit media vocabulary using lexical boundaries.
 
-    return any(
-        word in text
-        for word in MEDIA_WORDS
+    Substring matching is intentionally forbidden here. The weather system
+    already taught us what happens when "trains" secretly contains "rain".
+    """
+
+    text = str(
+        user_input
+        or ""
+    ).lower()
+
+    for word in MEDIA_WORDS:
+        if re.search(
+            r"(?<![a-z0-9])"
+            + re.escape(
+                word.lower()
+            )
+            + r"(?![a-z0-9])",
+            text,
+        ):
+            return True
+
+    return False
+
+
+def empty_spoiler_context():
+    """
+    No-media sentinel used when the current turn has not earned access to the
+    spoiler/media subsystem.
+    """
+
+    return {
+        "domain_active": False,
+        "title": None,
+        "profile": None,
+        "high_risk": False,
+        "release_sensitive": False,
+        "must_ask_progress": False,
+        "must_complete_progress": False,
+        "must_confirm_latest": False,
+        "progress_updated": False,
+        "pending_question": None,
+        "progress_only_update": False,
+    }
+
+
+def _looks_like_media_follow_up(
+    user_input,
+):
+    text = _normalise_text(
+        user_input
     )
+
+    if not text:
+        return False
+
+    return bool(
+        re.search(
+            r"^(?:and\s+|but\s+|what\s+about\s+)?"
+            r"(?:it|that|this|he|she|they|them|those|these|who|what|why|how|"
+            r"does|do|did|is|are|was|were|when|where)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def should_activate_media_domain(
+    user_input,
+    conversation=None,
+):
+    """
+    Decide whether media/spoiler machinery is allowed to inspect this turn.
+
+    Strong current-turn evidence wins:
+    - explicit media vocabulary;
+    - an explicitly named title already known to the spoiler-profile store;
+    - an explicit media-progress statement.
+
+    A referential follow-up may inherit media domain only from very recent
+    conversation that itself contains a strong media signal.
+
+    Generic phrases such as "about when I cleaned it" never activate media.
+    """
+
+    current = str(
+        user_input
+        or ""
+    ).strip()
+
+    if not current:
+        return False
+
+    if is_media_like_turn(
+        current
+    ):
+        return True
+
+    state = _load_state()
+
+    if _known_profile_title_in_text(
+        current,
+        state,
+    ):
+        return True
+
+    if _is_explicit_progress_statement(
+        _normalise_text(
+            current
+        )
+    ):
+        return True
+
+    if not (
+        conversation
+        and _looks_like_media_follow_up(
+            current
+        )
+    ):
+        return False
+
+    for previous in reversed(
+        _conversation_texts(
+            conversation
+        )[-4:]
+    ):
+        if is_media_like_turn(
+            previous
+        ):
+            return True
+
+        if _known_profile_title_in_text(
+            previous,
+            state,
+        ):
+            return True
+
+    return False
 
 
 def is_high_spoiler_risk(
@@ -1235,9 +1371,18 @@ def prepare_spoiler_context(
     conversation=None,
 ):
     """
-    Build spoiler state for the current turn and persist any explicit
-    progress statement Oliver just gave.
+    Build spoiler state only after the current turn has been positively
+    identified as media-related.
+
+    Non-media conversation returns immediately without title extraction,
+    progress persistence, or spoiler-state inference.
     """
+
+    if not should_activate_media_domain(
+        user_input=user_input,
+        conversation=conversation,
+    ):
+        return empty_spoiler_context()
 
     updated_profile = (
         register_spoiler_progress_from_message(
@@ -1327,6 +1472,7 @@ def prepare_spoiler_context(
     )
 
     return {
+        "domain_active": True,
         "title": title,
         "profile": profile,
         "high_risk": high_risk,

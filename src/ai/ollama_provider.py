@@ -63,7 +63,18 @@ from core.claim_grounding import (
     build_core_grounding_retry_instruction,
     build_recent_user_grounding_context,
     should_verify_core_grounding,
+    should_verify_factual_focus_fidelity,
     verify_core_grounded_draft,
+    verify_factual_focus_fidelity,
+)
+from core.source_lock import (
+    build_source_lock_instruction,
+    build_source_lock_retry_instruction,
+    find_factual_answer_integrity_violations,
+    find_factual_personal_history_violations,
+    find_factual_process_commentary_violations,
+    repair_factual_personal_history_tail,
+    recommended_source_lock_prior_window,
 )
 from core.answer_contract_runtime import (
     coerce_answer_contract_runtime,
@@ -81,7 +92,52 @@ from routine.morning_routine import (
 )
 
 
-MODEL = "qwen3:14b"
+DEFAULT_LOCAL_MODEL = "qwen3:14b"
+
+# Backward-compatible constant for older imports/tests. Runtime generation
+# uses get_local_model_name() so MAIRON_LOCAL_MODEL can be changed without
+# editing source code.
+MODEL = DEFAULT_LOCAL_MODEL
+
+
+def get_local_model_name():
+    """
+    Resolve the active Ollama generator at call time.
+
+    Reading the environment dynamically matters because main.py loads .env
+    after importing the provider module. It also makes temporary PowerShell
+    A/B tests possible without touching source or persistent configuration.
+    """
+
+    configured = str(
+        os.getenv(
+            "MAIRON_LOCAL_MODEL",
+            DEFAULT_LOCAL_MODEL,
+        )
+        or ""
+    ).strip()
+
+    return (
+        configured
+        or DEFAULT_LOCAL_MODEL
+    )
+
+
+def generation_debug_enabled():
+    value = str(
+        os.getenv(
+            "MAIRON_DEBUG_GENERATION",
+            "",
+        )
+        or ""
+    ).strip().lower()
+
+    return value in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 MAX_TOOL_ROUNDS = 12
 MAX_INBOX_READS = 3
@@ -407,6 +463,532 @@ def get_isolated_system_context(
     return []
 
 
+def should_use_restricted_generation_context(
+    core_intent,
+    user_input=None,
+):
+    """
+    Decide whether a direct-conversation turn should use an isolated working
+    context rather than raw canonical conversation history.
+
+    Social/recall lanes retain the Phase 6.7 rule. Phase 6.8.11 additionally
+    isolates STANDALONE factual questions. A fresh question such as
+    "what's the capital of Canada?" does not need yesterday's desk/XM6 banter
+    in the generation prompt, and exposing it merely creates callback bait.
+
+    Backward-pointing factual follow-ups still retain live context so Core can
+    resolve wording such as "what about its population?" later.
+    """
+
+    if core_intent in {
+        "share_context",
+        "acknowledge",
+        "casual_conversation",
+        "self_correction",
+        "conversation_recall",
+    }:
+        return True
+
+    if core_intent == "factual_question":
+        return not _current_turn_needs_recent_user_context(
+            user_input=user_input,
+            intent=core_intent,
+        )
+
+    return False
+
+
+def build_restricted_generation_context(
+    conversation,
+):
+    """
+    Generation context for Core-restricted social/recall turns.
+
+    Canonical conversation history remains untouched. This function creates a
+    temporary WORKING context containing only the stable system/personality
+    seed. Prior assistant prose is deliberately excluded so an old joke,
+    hallucination, or colourful phrase cannot become the next generation's
+    strongest attractor.
+
+    Any prior USER context that is actually needed is supplied separately in a
+    compact Core grounding packet.
+    """
+
+    return get_isolated_system_context(
+        conversation
+    )
+
+
+def _current_turn_needs_recent_user_context(
+    user_input,
+    intent,
+):
+    """
+    Decide whether a tiny social turn genuinely depends on an earlier USER turn.
+
+    This is discourse-level routing, not topic matching. We keep at most one
+    previous user message for references such as:
+        "Give it two days..."
+        "At least my iPad..."
+        "And that one?"
+
+    Standalone banter such as:
+        "Don't get smug. You're still the assistant I debug every night."
+    gets no unrelated prior-user payload.
+    """
+
+    text = str(
+        user_input
+        or ""
+    ).strip().lower()
+
+    if not text:
+        return False
+
+    if intent == "conversation_recall":
+        return False
+
+    deictic_pattern = re.compile(
+        r"\b(?:it|its|that|this|they|them|their|those|these|he|his|she|him|her)\b",
+        flags=re.IGNORECASE,
+    )
+
+    if deictic_pattern.search(
+        text
+    ):
+        return True
+
+    connective_patterns = (
+        r"^\s*at\s+least\b",
+        r"^\s*also\b",
+        r"^\s*and\b",
+        r"^\s*but\b",
+        r"^\s*same\b",
+    )
+
+    return any(
+        re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+        for pattern in connective_patterns
+    )
+
+
+def build_micro_act_prior_user_context(
+    user_input,
+    intent,
+    conversation,
+):
+    """
+    Return the MINIMUM user-authored context needed for a social micro-act.
+
+    Zero messages is the normal case. One prior USER message is allowed only
+    when the current wording genuinely points backward.
+    """
+
+    if not _current_turn_needs_recent_user_context(
+        user_input=user_input,
+        intent=intent,
+    ):
+        return None
+
+    return build_recent_user_grounding_context(
+        conversation,
+        max_user_messages=1,
+    )
+
+
+def build_factual_focus_instruction(
+    core_answer_contract,
+):
+    """
+    Keep ordinary factual questions focused on the current question.
+
+    Personality may decorate the answer only when the decoration is about the
+    current subject/answer. Old banter is not a free callback pool.
+    """
+
+    intent = _core_contract_value(
+        core_answer_contract,
+        "Intent",
+    )
+
+    if intent != "factual_question":
+        return None
+
+    return (
+        "CORE FACTUAL-FOCUS MODE:\n"
+        "- Answer Oliver's CURRENT factual question directly and truthfully FIRST.\n"
+        "- Never give a disposable joke/fake answer and then retract it with 'just kidding', 'sike', or similar wording.\n"
+        "- A very short personality line may follow only when it is directly about the current question/answer, does not contradict the answer, and adds no unsupported Oliver/Mairon history.\n"
+        "- Do not append a callback, joke, or comment about an unrelated prior topic.\n"
+        "- Do not revive prior products, devices, travel topics, jokes, or assistant "
+        "phrasing merely because they are present in conversation history.\n"
+        "- Do not discuss internal answer-generation process, model memory, training data, "
+        "whether a fact is hard-coded, whether it was worth checking, or whether you are "
+        "'sticking with the correct answer'. Oliver asked for the fact, not implementation commentary."
+    )
+
+
+def repair_factual_follow_up_tail(
+    draft,
+):
+    """
+    Remove unsolicited question sentences that appear AFTER a factual answer.
+
+    Clarification is still possible: if the response is only a question, leave
+    it untouched. This guard acts only once Mairon has already supplied at least
+    one declarative answer sentence. It prevents a correct standalone answer
+    from wandering back into stale conversation with tails such as:
+
+        "Ottawa. So, did you charge those XM6s?"
+    """
+
+    text = str(
+        draft
+        or ""
+    ).strip()
+
+    if not text:
+        return (
+            text,
+            [],
+        )
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(
+            r"(?<=[.!?])\s+",
+            text,
+        )
+        if sentence.strip()
+    ]
+
+    if len(sentences) <= 1:
+        return (
+            text,
+            [],
+        )
+
+    kept = []
+    removed = []
+    answer_seen = False
+
+    for sentence in sentences:
+        is_question = "?" in sentence
+
+        if answer_seen and is_question:
+            removed.append(
+                sentence
+            )
+            continue
+
+        kept.append(
+            sentence
+        )
+
+        if not is_question and re.search(
+            r"[A-Za-z0-9]",
+            sentence,
+        ):
+            answer_seen = True
+
+    repaired = " ".join(
+        kept
+    ).strip()
+
+    return (
+        repaired
+        or text,
+        removed,
+    )
+
+
+def repair_factual_process_tail(
+    draft,
+):
+    """
+    Remove sentence-separated model/process commentary AFTER a factual answer.
+
+    Example:
+        "The capital is Ottawa. I know this one without checking a map."
+            -> "The capital is Ottawa."
+
+    A process claim embedded in the first answer sentence is not silently
+    edited; the deterministic integrity validator handles that case instead.
+    """
+
+    text = str(
+        draft
+        or ""
+    ).strip()
+
+    if not text:
+        return (
+            text,
+            [],
+        )
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(
+            r"(?<=[.!?])\s+",
+            text,
+        )
+        if sentence.strip()
+    ]
+
+    if len(
+        sentences
+    ) <= 1:
+        return (
+            text,
+            [],
+        )
+
+    kept = []
+    removed = []
+
+    for index, sentence in enumerate(
+        sentences
+    ):
+        process_violation = bool(
+            find_factual_process_commentary_violations(
+                sentence
+            )
+        )
+
+        if (
+            index > 0
+            and kept
+            and process_violation
+        ):
+            removed.append(
+                sentence
+            )
+            continue
+
+        kept.append(
+            sentence
+        )
+
+    repaired = " ".join(
+        kept
+    ).strip()
+
+    return (
+        repaired
+        or text,
+        removed,
+    )
+
+
+def repair_live_recall_tail(
+    draft,
+):
+    """
+    Preserve the answer prefix of an explicit live-conversation recall turn.
+
+    Recall accuracy outranks stylistic novelty. Once a substantive declarative
+    answer has been produced, later sentence-separated banter/callbacks are
+    unnecessary and create avoidable grounding risk. A short lead-in such as
+    "Yep." may remain before the substantive answer.
+
+    This is deliberately answer-preserving rather than a retry trigger: if the
+    first answer sentence is wrong, ordinary grounding still rejects it.
+    """
+
+    text = str(
+        draft
+        or ""
+    ).strip()
+
+    if not text:
+        return (
+            text,
+            [],
+        )
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(
+            r"(?<=[.!?])\s+",
+            text,
+        )
+        if sentence.strip()
+    ]
+
+    if len(
+        sentences
+    ) <= 1:
+        return (
+            text,
+            [],
+        )
+
+    keep_through = None
+
+    for index, sentence in enumerate(
+        sentences
+    ):
+        if "?" in sentence:
+            if index == 0:
+                return (
+                    text,
+                    [],
+                )
+
+            continue
+
+        tokens = re.findall(
+            r"[A-Za-z0-9']+",
+            sentence,
+        )
+
+        if len(
+            tokens
+        ) >= 5:
+            keep_through = index
+            break
+
+    if keep_through is None:
+        return (
+            text,
+            [],
+        )
+
+    if keep_through >= len(
+        sentences
+    ) - 1:
+        return (
+            text,
+            [],
+        )
+
+    kept = sentences[
+        :keep_through + 1
+    ]
+    removed = sentences[
+        keep_through + 1:
+    ]
+
+    return (
+        " ".join(
+            kept
+        ).strip(),
+        removed,
+    )
+
+
+def build_direct_generation_options(
+    core_intent,
+):
+    """
+    Restrict tiny social acts to short, lower-variance generations.
+
+    This is both a quality and latency control. General conversation retains
+    the model's normal settings.
+    """
+
+    if core_intent in {
+        "share_context",
+        "acknowledge",
+        "casual_conversation",
+        "self_correction",
+    }:
+        return {
+            "temperature": 0.35,
+            "num_predict": 160,
+        }
+
+    if core_intent == "conversation_recall":
+        return {
+            "temperature": 0.1,
+            "num_predict": 128,
+        }
+
+    if core_intent == "factual_question":
+        return {
+            "temperature": 0.2,
+            "num_predict": 96,
+        }
+
+    return None
+
+
+def build_direct_context_window(
+    core_intent,
+):
+    """
+    Allocate enough Ollama runtime context for every direct-conversation turn.
+
+    Mairon's stable system/personality prompt is already close to 4096 tokens.
+    Leaving any direct lane on Ollama's smaller active context can therefore
+    consume the entire window before the model has room to answer.
+
+    The Desk benchmark proved this twice:
+    - social: prompt_eval_count=4083 + eval_count=13 = 4096
+    - factual: prompt_eval_count=4092 + eval_count=4 = 4096
+
+    8192 is deliberately conservative: enough headroom for the current prompt
+    and a useful answer without unnecessarily inflating KV-cache usage.
+    """
+
+    return 8192
+
+
+def build_direct_think_setting(
+    core_intent,
+    model_name=None,
+):
+    """
+    Configure hidden reasoning only where the active model supports it.
+
+    Tiny social acts, literal live recall, and straightforward factual answers
+    do not benefit from long hidden reasoning. For Qwen-family thinking models,
+    disable it. GPT-OSS does not accept boolean false, so request low effort
+    instead. Non-thinking/unknown models receive no explicit think argument.
+
+    Recommendation/opinion/other reasoning lanes retain each model's default
+    behaviour.
+    """
+
+    if core_intent not in {
+        "share_context",
+        "acknowledge",
+        "casual_conversation",
+        "self_correction",
+        "conversation_recall",
+        "factual_question",
+    }:
+        return None
+
+    active_model = str(
+        model_name
+        or get_local_model_name()
+        or ""
+    ).strip().lower()
+
+    if active_model.startswith(
+        "gpt-oss"
+    ):
+        return "low"
+
+    if (
+        active_model.startswith(
+            "qwen3"
+        )
+        or active_model.startswith(
+            "deepseek"
+        )
+    ):
+        return False
+
+    return None
+
+
 # --------------------------------------------------
 # Requirement detection
 # --------------------------------------------------
@@ -730,7 +1312,7 @@ def finalise_weather_request(
     })
 
     response = client.chat(
-        model=MODEL,
+        model=get_local_model_name(),
         messages=final_messages
     )
 
@@ -803,7 +1385,7 @@ def handle_weather_request(
         })
 
         response = client.chat(
-            model=MODEL,
+            model=get_local_model_name(),
             messages=extraction_messages,
             tools=[
                 WEATHER_ONLY_TOOL
@@ -1192,7 +1774,7 @@ def finalise_night_routine(
     })
 
     response = client.chat(
-        model=MODEL,
+        model=get_local_model_name(),
         messages=final_messages
     )
 
@@ -1786,7 +2368,7 @@ def generate_grounded_morning_brief(
             })
 
         response = client.chat(
-            model=MODEL,
+            model=get_local_model_name(),
             messages=attempt_conversation
         )
 
@@ -2296,7 +2878,7 @@ def handle_day_overview_request(
     })
 
     response = client.chat(
-        model=MODEL,
+        model=get_local_model_name(),
         messages=working_conversation
     )
 
@@ -3300,7 +3882,7 @@ def handle_route_request(
     })
 
     response = client.chat(
-        model=MODEL,
+        model=get_local_model_name(),
         messages=route_messages,
         tools=[
             ROUTE_ONLY_TOOL
@@ -3556,7 +4138,7 @@ def finalise_inbox_review(
     })
 
     final_response = client.chat(
-        model=MODEL,
+        model=get_local_model_name(),
         messages=working_conversation
     )
 
@@ -3750,14 +4332,14 @@ def handle_inbox_attention_request(
 
         if available_tools:
             response = client.chat(
-                model=MODEL,
+                model=get_local_model_name(),
                 messages=working_conversation,
                 tools=available_tools
             )
 
         else:
             response = client.chat(
-                model=MODEL,
+                model=get_local_model_name(),
                 messages=working_conversation
             )
 
@@ -3998,7 +4580,7 @@ def build_spoiler_safe_media_evidence(
     ]
 
     synthesis = client.chat(
-        model=MODEL,
+        model=get_local_model_name(),
         messages=synthesis_messages,
     )
 
@@ -4148,36 +4730,79 @@ def _core_contract_value(
     )
 
 
-def _explicit_recall_request(
+def _explicit_long_term_recall_request(
     user_input,
 ):
     """
-    Some conversational statements genuinely ask Mairon to revive older
-    history. Those are allowed to use the Conversation Journal even when
-    the speech act is otherwise casual.
+    Long-term Conversation Journal retrieval is opt-in by wording.
+
+    A time phrase by itself is NOT enough. "I bought this last month" is an
+    ordinary statement. Oliver must actually indicate that he wants prior
+    conversation recovered.
     """
 
     text = str(
-        user_input or ""
+        user_input
+        or ""
     ).lower()
 
-    recall_markers = (
-        "remember when",
-        "do you remember",
-        "we talked about",
-        "we spoke about",
-        "you said before",
+    direct_old_recall_phrases = (
+        "previous conversation",
+        "previous chat",
+        "an older conversation",
+        "an old conversation",
+        "last time we",
+        "we talked about before",
+        "we spoke about before",
         "you told me before",
-        "last time",
-        "earlier we",
-        "that thing we talked about",
-        "what did i say",
-        "what did you say",
+        "you said before",
     )
 
-    return any(
-        marker in text
-        for marker in recall_markers
+    explicit_discussion_recall_phrases = (
+        "remember when we talked about",
+        "remember when we spoke about",
+        "remember our conversation about",
+        "remember our chat about",
+        "remember that conversation about",
+        "remember that chat about",
+    )
+
+    if any(
+        phrase in text
+        for phrase in (
+            direct_old_recall_phrases
+            + explicit_discussion_recall_phrases
+        )
+    ):
+        return True
+
+    recall_language = (
+        "do you remember",
+        "remember when",
+        "what did i say",
+        "what did you say",
+        "what did i tell you",
+        "what did you tell me",
+    )
+
+    older_time_anchor = (
+        "months ago",
+        "weeks ago",
+        "last month",
+        "last year",
+        "earlier this year",
+        "a while ago",
+    )
+
+    return (
+        any(
+            marker in text
+            for marker in recall_language
+        )
+        and any(
+            marker in text
+            for marker in older_time_anchor
+        )
     )
 
 
@@ -4186,12 +4811,18 @@ def should_retrieve_past_context_for_turn(
     core_answer_contract,
 ):
     """
-    Long-term conversation retrieval is useful only when the current turn
-    benefits from it.
+    Phase 6.5 retrieval policy:
 
-    Trivial acknowledgements and simple declarative shares should use the
-    immediate live conversation, not drag unrelated old topics into the
-    model context.
+    The live model history is already available for ordinary continuity.
+    The long-term semantic Conversation Journal is therefore used only when
+    Oliver explicitly asks to revive older history.
+
+    This prevents unrelated historical material from contaminating:
+    - personal updates;
+    - banter;
+    - corrections;
+    - ordinary factual questions;
+    - immediate "what did I say?" recall.
     """
 
     intent = _core_contract_value(
@@ -4199,21 +4830,91 @@ def should_retrieve_past_context_for_turn(
         "Intent",
     )
 
-    if intent in {
-        "acknowledge",
-        "correct_mairon",
-    }:
+    if intent == "conversation_recall":
         return False
 
-    if (
-        intent == "share_context"
-        and not _explicit_recall_request(
-            user_input
+    return _explicit_long_term_recall_request(
+        user_input
+    )
+
+
+def build_live_conversation_recall_context(
+    conversation,
+    max_user_messages=12,
+):
+    """
+    Build an authoritative USER-ONLY record for immediate conversation recall.
+
+    Prior assistant messages are deliberately excluded. They prove what Mairon
+    said, not what Oliver actually said or what is true.
+
+    User messages remain chronological so later explicit corrections can
+    supersede earlier wording.
+    """
+
+    collected = []
+
+    for message in reversed(
+        list(
+            conversation
+            or []
         )
     ):
-        return False
+        role = get_message_role(
+            message
+        )
 
-    return True
+        if role != "user":
+            continue
+
+        content = get_message_content(
+            message
+        ).strip()
+
+        if not content:
+            continue
+
+        collected.append(
+            content
+        )
+
+        if len(
+            collected
+        ) >= max_user_messages:
+            break
+
+    collected.reverse()
+
+    if not collected:
+        return (
+            "CORE LIVE CONVERSATION RECALL:\n"
+            "- No prior user-authored messages are available in this live session.\n"
+            "- If Oliver asks what he said, state that the live record does not contain it."
+        )
+
+    lines = [
+        "CORE LIVE CONVERSATION RECALL:",
+        "- The entries below are the authoritative recent things Oliver himself said.",
+        "- Prior Mairon/assistant text is intentionally excluded and is not evidence.",
+        "- Answer recall questions from this record only.",
+        "- If a later Oliver message explicitly corrects an earlier Oliver message, "
+        "the later correction supersedes the earlier detail.",
+        "- Do not use web research, media research, model memory, or unrelated journal history.",
+        "",
+        "OLIVER'S LIVE USER MESSAGES (oldest to newest):",
+    ]
+
+    for index, content in enumerate(
+        collected,
+        start=1,
+    ):
+        lines.append(
+            f"{index}. {content}"
+        )
+
+    return "\n".join(
+        lines
+    )
 
 
 def _count_cjk_characters(
@@ -4247,6 +4948,7 @@ def build_core_micro_act_instruction(
     core_answer_contract,
     conversation=None,
     retry=False,
+    user_input=None,
 ):
     """
     Build a generation-time instruction for tiny conversational acts such as
@@ -4269,11 +4971,19 @@ def build_core_micro_act_instruction(
     if intent not in {
         "share_context",
         "acknowledge",
+        "casual_conversation",
+        "self_correction",
     }:
         return None
 
     prior_user_context = (
-        build_recent_user_grounding_context(
+        build_micro_act_prior_user_context(
+            user_input=user_input,
+            intent=intent,
+            conversation=conversation,
+        )
+        if user_input is not None
+        else build_recent_user_grounding_context(
             conversation
         )
     )
@@ -4287,6 +4997,17 @@ def build_core_micro_act_instruction(
         "- For any LITERAL statement about reality, use only a direct paraphrase "
         "or trivial implication of Oliver's current message or the USER-provided "
         "context below.",
+        "- SOURCE-LOCK concrete details. Do not introduce a plausible physical object, "
+        "possession, habit, substance, surrounding, activity, bodily state, or observed "
+        "scene detail unless Oliver supplied it. If Oliver mentioned a desk, you may joke "
+        "about THE DESK; you may not spawn coffee cups, sandwiches, receipts, clutter, "
+        "caffeine, or other realistic scene details merely to decorate the joke.",
+        "- An absurd action does not erase a plausible premise. For example, 'the coffee "
+        "cups are plotting a rebellion' still assumes coffee cups exist; that premise "
+        "requires Oliver to have mentioned coffee cups.",
+        "- Never claim you personally saw, heard, watched, or physically observed Oliver "
+        "or his surroundings unless Core supplied actual sensor/image evidence for this "
+        "turn. Ordinary text conversation does not grant visual or audio perception.",
         "- Previous assistant/Mairon statements are conversational context only; "
         "they are NOT factual evidence.",
         "- Do not add plausible external details about products, geography, travel "
@@ -4307,6 +5028,22 @@ def build_core_micro_act_instruction(
         "do not invent it. Use personality instead.",
     ]
 
+    if intent == "self_correction":
+        lines.extend([
+            "- Oliver is correcting his OWN earlier wording, not accusing Mairon of an error.",
+            "- Briefly accept the revised detail. The latest Oliver correction supersedes "
+            "the earlier conflicting Oliver detail.",
+            "- Do not argue, fact-check him, or describe this as a verification dispute.",
+        ])
+
+    if intent == "casual_conversation":
+        lines.extend([
+            "- This is ordinary live banter. You may tease or joke, but keep factual "
+            "premises anchored to what Oliver actually said in the live conversation.",
+            "- Do not treat an earlier Mairon joke/invention as a real fact merely because "
+            "it appears in the visible chat history.",
+        ])
+
     if retry:
         lines.extend([
             "- Produce an alternate fresh reply to Oliver's CURRENT message.",
@@ -4316,8 +5053,9 @@ def build_core_micro_act_instruction(
             "- Do not negate or argue with an imaginary accusation from Oliver.",
             "- Prefer a dry/sarcastic reaction or clearly absurd joke over factual "
             "embellishment.",
-            "- Do not introduce new weather, traffic, clothing, venue, shopping, "
-            "transport, or itinerary details unless Oliver explicitly supplied them.",
+            "- Keep concrete nouns/details source-locked on retry too. Do not replace one "
+            "rejected invention with a new prop, habit, substance, bodily state, scene "
+            "detail, travel detail, or other plausible premise.",
         ])
 
     if prior_user_context:
@@ -4427,20 +5165,16 @@ def find_core_micro_act_relevance_violations(
     core_answer_contract,
 ):
     """
-    Cheap relevance guard for tiny social turns.
+    High-confidence deterministic relevance guard for tiny social turns.
 
-    Grounding answers:
-        "Is this factual claim supported?"
+    Semantic relevance is NOT a lexical-overlap problem. A grounded paraphrase
+    such as "disaster zone" may be a perfectly natural response to Oliver
+    saying his desk was "getting ridiculous" even though no meaningful token is
+    shared.
 
-    This guard answers:
-        "Is Mairon even replying to Oliver's current message?"
-
-    It specifically prevents retry/meta leakage such as:
-        "I'm not denying anything..."
-        "If you're implying I'm lying..."
-
-    from being accepted merely because those sentences contain no external
-    factual hallucination.
+    This cheap guard therefore catches only obvious validator/meta leakage.
+    The existing semantic Core verifier performs the real relevance judgment
+    in the same model call it already uses for grounding.
     """
 
     intent = _core_contract_value(
@@ -4451,6 +5185,8 @@ def find_core_micro_act_relevance_violations(
     if intent not in {
         "share_context",
         "acknowledge",
+        "casual_conversation",
+        "self_correction",
     }:
         return []
 
@@ -4473,10 +5209,6 @@ def find_core_micro_act_relevance_violations(
     user_lowered = user_text.lower()
 
     violations = []
-
-    # --------------------------------------------------
-    # Meta-defensive / validator-leak language.
-    # --------------------------------------------------
 
     meta_defensive_markers = (
         "i'm not denying",
@@ -4535,95 +5267,6 @@ def find_core_micro_act_relevance_violations(
             (
                 "Core social micro-act responded to an imaginary "
                 "accusation/validator instead of Oliver's current message"
-            )
-        )
-
-    # --------------------------------------------------
-    # Cheap topical anchoring.
-    #
-    # A natural reply usually either:
-    # - reuses at least one meaningful current-message token; or
-    # - is an unmistakable short social reaction.
-    # --------------------------------------------------
-
-    token_pattern = re.compile(
-        r"[a-z0-9][a-z0-9'_-]*",
-        flags=re.IGNORECASE,
-    )
-
-    stopwords = {
-        "the", "a", "an", "and", "or", "but", "for", "to", "of",
-        "in", "on", "at", "with", "from", "my", "our", "your", "their",
-        "i", "im", "i'm", "we", "were", "we're", "you", "youre", "you're",
-        "it", "its", "it's", "they", "theyre", "they're", "this", "that",
-        "these", "those", "is", "are", "was", "were", "be", "been",
-        "have", "has", "had", "do", "does", "did", "will", "would",
-        "can", "could", "should", "may", "might", "just", "very",
-        "really", "so", "now", "then", "here", "there",
-    }
-
-    user_tokens = {
-        token.lower()
-        for token in token_pattern.findall(
-            user_text
-        )
-        if (
-            len(token) >= 3
-            and token.lower()
-            not in stopwords
-        )
-    }
-
-    response_tokens = {
-        token.lower()
-        for token in token_pattern.findall(
-            response
-        )
-        if (
-            len(token) >= 3
-            and token.lower()
-            not in stopwords
-        )
-    }
-
-    topical_overlap = bool(
-        user_tokens
-        & response_tokens
-    )
-
-    social_reaction_markers = (
-        "hell yes",
-        "fuck yes",
-        "fuck yeah",
-        "there we go",
-        "there we fucking go",
-        "about time",
-        "finally",
-        "nice",
-        "love that",
-        "beautiful",
-        "fair",
-        "got you",
-        "that tracks",
-        "makes sense",
-        "let's go",
-        "lets go",
-    )
-
-    obvious_social_reaction = any(
-        marker in lowered
-        for marker in social_reaction_markers
-    )
-
-    if (
-        intent == "share_context"
-        and not topical_overlap
-        and not obvious_social_reaction
-    ):
-        violations.append(
-            (
-                "Core social micro-act is not anchored to Oliver's "
-                "current message"
             )
         )
 
@@ -4799,6 +5442,33 @@ def handle_direct_conversation(
     access.
     """
 
+    core_intent = _core_contract_value(
+        core_answer_contract,
+        "Intent",
+    )
+
+    core_is_micro_act = (
+        core_intent
+        in {
+            "share_context",
+            "acknowledge",
+            "casual_conversation",
+            "self_correction",
+        }
+    )
+
+    core_is_live_recall = (
+        core_intent
+        == "conversation_recall"
+    )
+
+    core_uses_restricted_generation_context = (
+        should_use_restricted_generation_context(
+            core_intent,
+            user_input=user_input,
+        )
+    )
+
     relationship_context = (
         prepare_relationship_turn(
             user_input
@@ -4818,10 +5488,18 @@ def handle_direct_conversation(
         )
     )
 
+    media_domain_active = bool(
+        spoiler_context.get(
+            "domain_active"
+        )
+    )
+
     core_spoiler_response = (
         build_core_spoiler_control_response(
             spoiler_context
         )
+        if media_domain_active
+        else None
     )
 
     if core_spoiler_response is not None:
@@ -4914,6 +5592,9 @@ def handle_direct_conversation(
             user_input=user_input,
             conversation=conversation,
         )
+        if core_intent
+        == "self_correction"
+        else None
     )
 
     opinion_subject = (
@@ -4955,10 +5636,13 @@ def handle_direct_conversation(
 
     research_evidence = None
 
-    if should_research_media_turn(
-        user_input=user_input,
-        conversation_policy=conversation_policy,
-        spoiler_context=spoiler_context,
+    if (
+        media_domain_active
+        and should_research_media_turn(
+            user_input=user_input,
+            conversation_policy=conversation_policy,
+            spoiler_context=spoiler_context,
+        )
     ):
         title = (
             spoiler_context.get(
@@ -5018,9 +5702,26 @@ def handle_direct_conversation(
             )
         )
 
-    base_messages = list(
-        conversation
-    )
+    if core_uses_restricted_generation_context:
+        base_messages = (
+            build_restricted_generation_context(
+                conversation
+            )
+        )
+
+        if core_intent == "factual_question":
+            print(
+                "[Context] Standalone factual context isolated from prior conversation."
+            )
+        else:
+            print(
+                "[Context] Restricted generation context isolated from prior assistant turns."
+            )
+
+    else:
+        base_messages = list(
+            conversation
+        )
 
     base_messages.append({
         "role": "system",
@@ -5058,8 +5759,11 @@ def handle_direct_conversation(
             + "."
         )
 
-    if spoiler_context.get(
-        "progress_updated"
+    if (
+        media_domain_active
+        and spoiler_context.get(
+            "progress_updated"
+        )
     ):
         profile = spoiler_context.get(
             "profile"
@@ -5149,12 +5853,13 @@ def handle_direct_conversation(
             "content": research_evidence
         })
 
-    base_messages.append({
-        "role": "system",
-        "content": build_spoiler_guard_text(
-            spoiler_context
-        )
-    })
+    if media_domain_active:
+        base_messages.append({
+            "role": "system",
+            "content": build_spoiler_guard_text(
+                spoiler_context
+            )
+        })
 
     base_messages.append({
         "role": "system",
@@ -5185,6 +5890,7 @@ def handle_direct_conversation(
                 core_answer_contract=core_answer_contract,
                 conversation=conversation,
                 retry=False,
+                user_input=user_input,
             )
         )
 
@@ -5197,6 +5903,59 @@ def handle_direct_conversation(
                 "role": "system",
                 "content": core_micro_act_instruction
             })
+
+    factual_focus_instruction = (
+        build_factual_focus_instruction(
+            core_answer_contract
+        )
+    )
+
+    if factual_focus_instruction:
+        base_messages.append({
+            "role": "system",
+            "content": factual_focus_instruction,
+        })
+
+    if core_intent == "conversation_recall":
+        live_recall_context = (
+            build_live_conversation_recall_context(
+                conversation=conversation,
+                max_user_messages=12,
+            )
+        )
+
+        print(
+            "[Conversation] Live user-authored recall grounding active."
+        )
+
+        base_messages.append({
+            "role": "system",
+            "content": live_recall_context,
+        })
+
+    source_lock_prior_window = (
+        recommended_source_lock_prior_window(
+            user_input=user_input,
+            intent=core_intent,
+        )
+    )
+
+    source_lock_instruction = build_source_lock_instruction(
+        user_input=user_input,
+        conversation=conversation,
+        intent=core_intent,
+        max_prior_user_messages=source_lock_prior_window,
+    )
+
+    if source_lock_instruction:
+        print(
+            "[Grounding] Source-lock anchors active."
+        )
+
+        base_messages.append({
+            "role": "system",
+            "content": source_lock_instruction,
+        })
 
     base_messages.append({
         "role": "user",
@@ -5212,23 +5971,17 @@ def handle_direct_conversation(
 
     response = None
     violations = []
+    retry_violations = []
     accepted_draft_text = None
-
-    core_intent = _core_contract_value(
-        core_answer_contract,
-        "Intent",
-    )
-
-    core_is_micro_act = (
-        core_intent
-        in {
-            "share_context",
-            "acknowledge",
-        }
-    )
 
     core_grounding_required = (
         should_verify_core_grounding(
+            core_answer_contract
+        )
+    )
+
+    factual_focus_fidelity_required = (
+        should_verify_factual_focus_fidelity(
             core_answer_contract
         )
     )
@@ -5237,6 +5990,19 @@ def handle_direct_conversation(
         print(
             "[Grounding] Core claim verification active."
         )
+
+    if factual_focus_fidelity_required:
+        print(
+            "[Grounding] Factual-focus source fidelity active."
+        )
+
+    active_local_model = (
+        get_local_model_name()
+    )
+
+    print(
+        f"[AI] Active Ollama model: {active_local_model}"
+    )
 
     for attempt in range(
         1,
@@ -5247,12 +6013,31 @@ def handle_direct_conversation(
         )
 
         if attempt > 1:
-            if core_is_micro_act:
+            effective_retry_violations = (
+                retry_violations
+                or violations
+            )
+
+            if core_is_live_recall:
+                attempt_messages.append({
+                    "role": "system",
+                    "content": (
+                        "CORE LIVE-RECALL RETRY: Answer Oliver's current recall "
+                        "question only from the supplied USER-authored live conversation "
+                        "record. Prefer later explicit Oliver corrections over earlier "
+                        "conflicting Oliver wording. Do not discuss guardrails, research, "
+                        "sources, media, spoilers, or validation. If the answer is absent "
+                        "from the live record, say that plainly."
+                    )
+                })
+
+            elif core_is_micro_act:
                 micro_retry_instruction = (
                     build_core_micro_act_instruction(
                         core_answer_contract=core_answer_contract,
                         conversation=conversation,
                         retry=True,
+                        user_input=user_input,
                     )
                 )
 
@@ -5262,20 +6047,53 @@ def handle_direct_conversation(
                         "content": micro_retry_instruction
                     })
 
-            else:
+            elif not core_is_live_recall:
                 attempt_messages.append({
                     "role": "system",
                     "content": build_retry_instruction(
-                        violations=violations,
+                        violations=effective_retry_violations,
                         attempt_number=attempt
                     )
                 })
+
+            source_lock_retry = build_source_lock_retry_instruction(
+                user_input=user_input,
+                violations=effective_retry_violations,
+                conversation=conversation,
+                intent=core_intent,
+                max_prior_user_messages=source_lock_prior_window,
+            )
+
+            if source_lock_retry:
+                attempt_messages.append({
+                    "role": "system",
+                    "content": source_lock_retry,
+                })
+
+            # Core-grounding repair must also reach social micro-act retries.
+            # Phase 6.8.9 kept these retries on a separate personality-only
+            # branch, which meant Qwen saw the source-lock anchors again but
+            # was never told which concrete structural violation it had just
+            # committed.
+            if core_is_micro_act:
+                core_grounding_retry = (
+                    build_core_grounding_retry_instruction(
+                        effective_retry_violations
+                    )
+                )
+
+                if core_grounding_retry:
+                    attempt_messages.append({
+                        "role": "system",
+                        "content": core_grounding_retry,
+                    })
 
             if (
                 conversation_policy.get(
                     "knowledge_honesty"
                 )
                 and not core_is_micro_act
+                and not core_is_live_recall
             ):
                 attempt_messages.append({
                     "role": "system",
@@ -5302,7 +6120,7 @@ def handle_direct_conversation(
 
                 grounding_retry = (
                     build_grounding_retry_instruction(
-                        violations
+                        effective_retry_violations
                     )
                 )
 
@@ -5315,6 +6133,7 @@ def handle_direct_conversation(
             if (
                 core_answer_contract
                 and not core_is_micro_act
+                and not core_is_live_recall
             ):
                 attempt_messages.append({
                     "role": "system",
@@ -5329,7 +6148,7 @@ def handle_direct_conversation(
 
                 core_grounding_retry = (
                     build_core_grounding_retry_instruction(
-                        violations
+                        effective_retry_violations
                     )
                 )
 
@@ -5362,9 +6181,48 @@ def handle_direct_conversation(
                 })
 
         chat_kwargs = {
-            "model": MODEL,
+            "model": active_local_model,
             "messages": attempt_messages,
         }
+
+        generation_options = (
+            build_direct_generation_options(
+                core_intent
+            )
+        )
+
+        if generation_options:
+            chat_kwargs[
+                "options"
+            ] = dict(
+                generation_options
+            )
+
+        context_window = (
+            build_direct_context_window(
+                core_intent
+            )
+        )
+
+        if context_window is not None:
+            chat_kwargs.setdefault(
+                "options",
+                {},
+            )[
+                "num_ctx"
+            ] = context_window
+
+        think_setting = (
+            build_direct_think_setting(
+                core_intent,
+                model_name=active_local_model,
+            )
+        )
+
+        if think_setting is not None:
+            chat_kwargs[
+                "think"
+            ] = think_setting
 
         if conversation_tools:
             chat_kwargs[
@@ -5417,6 +6275,57 @@ def handle_direct_conversation(
             or ""
         )
 
+        if generation_debug_enabled():
+            raw_thinking = str(
+                getattr(
+                    response.message,
+                    "thinking",
+                    "",
+                )
+                or ""
+            )
+
+            done_reason = getattr(
+                response,
+                "done_reason",
+                None,
+            )
+
+            eval_count = getattr(
+                response,
+                "eval_count",
+                None,
+            )
+
+            prompt_eval_count = getattr(
+                response,
+                "prompt_eval_count",
+                None,
+            )
+
+            print(
+                f"[Debug] Raw model content attempt {attempt}: "
+                + repr(
+                    original_draft_text
+                )
+            )
+
+            print(
+                f"[Debug] Model completion attempt {attempt}: "
+                f"done_reason={done_reason!r}, "
+                f"eval_count={eval_count!r}, "
+                f"prompt_eval_count={prompt_eval_count!r}, "
+                f"thinking_chars={len(raw_thinking)}"
+            )
+
+            if raw_thinking:
+                print(
+                    f"[Debug] Raw model thinking attempt {attempt}: "
+                    + repr(
+                        raw_thinking
+                    )
+                )
+
         draft_text = repair_core_restricted_draft(
             response_text=original_draft_text,
             core_answer_contract=core_answer_contract,
@@ -5430,12 +6339,139 @@ def handle_direct_conversation(
                 "[Core] Removed forbidden follow-up/service tail from draft."
             )
 
+        if core_is_live_recall:
+            repaired_recall_draft, removed_recall_tail = (
+                repair_live_recall_tail(
+                    draft_text
+                )
+            )
+
+            if removed_recall_tail:
+                draft_text = repaired_recall_draft
+
+                print(
+                    "[Grounding] Preserved live-recall answer prefix; removed trailing decoration."
+                )
+
+                if generation_debug_enabled():
+                    print(
+                        "[Debug] Removed live-recall tail: "
+                        + repr(
+                            removed_recall_tail
+                        )
+                    )
+
+        if factual_focus_fidelity_required:
+            repaired_factual_draft, removed_history_tail = (
+                repair_factual_personal_history_tail(
+                    user_input=user_input,
+                    draft=draft_text,
+                    conversation=conversation,
+                    max_prior_user_messages=4,
+                )
+            )
+
+            if removed_history_tail:
+                draft_text = repaired_factual_draft
+
+                print(
+                    "[Grounding] Removed unsupported factual personality/history tail."
+                )
+
+                if generation_debug_enabled():
+                    print(
+                        "[Debug] Removed factual tail: "
+                        + repr(
+                            removed_history_tail
+                        )
+                    )
+
+            repaired_factual_draft, removed_process_tail = (
+                repair_factual_process_tail(
+                    draft_text
+                )
+            )
+
+            if removed_process_tail:
+                draft_text = repaired_factual_draft
+
+                print(
+                    "[Grounding] Removed factual answer-generation/process tail."
+                )
+
+                if generation_debug_enabled():
+                    print(
+                        "[Debug] Removed factual process tail: "
+                        + repr(
+                            removed_process_tail
+                        )
+                    )
+
+            repaired_factual_draft, removed_follow_up_tail = (
+                repair_factual_follow_up_tail(
+                    draft_text
+                )
+            )
+
+            if removed_follow_up_tail:
+                draft_text = repaired_factual_draft
+
+                print(
+                    "[Grounding] Removed unsolicited factual follow-up tail."
+                )
+
+                if generation_debug_enabled():
+                    print(
+                        "[Debug] Removed factual follow-up tail: "
+                        + repr(
+                            removed_follow_up_tail
+                        )
+                    )
+
+        if generation_debug_enabled():
+            print(
+                f"[Debug] Draft attempt {attempt}: "
+                + repr(
+                    draft_text
+                )
+            )
+
         violations = []
 
         if not draft_text:
-            violations.append(
-                "Core repair removed the entire restricted response"
+            if original_draft_text.strip():
+                violations.append(
+                    "Core repair removed the entire restricted response"
+                )
+            else:
+                thinking_text = str(
+                    getattr(
+                        response.message,
+                        "thinking",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                if thinking_text:
+                    violations.append(
+                        "local model produced thinking but no visible response"
+                    )
+                else:
+                    violations.append(
+                        "local model produced no visible response"
+                    )
+
+            print(
+                "[Personality] Rejected draft: "
+                + ", ".join(
+                    violations
+                )
             )
+
+            # Nothing exists to validate. In particular, do NOT spend another
+            # model call semantically grounding an empty string.
+            continue
 
         violations.extend(
             find_personality_violations(
@@ -5449,19 +6485,24 @@ def handle_direct_conversation(
             )
         )
 
-        violations.extend(
-            find_spoiler_guard_violations(
-                response_text=draft_text,
-                spoiler_context=spoiler_context,
+        if media_domain_active:
+            violations.extend(
+                find_spoiler_guard_violations(
+                    response_text=draft_text,
+                    spoiler_context=spoiler_context,
+                )
             )
-        )
 
-        violations.extend(
-            find_repetition_violations(
-                response_text=draft_text,
-                conversation=conversation,
+        # Accuracy outranks stylistic novelty for explicit live recall.
+        # A correct recall answer may legitimately resemble the earlier user
+        # correction or a previous concise answer.
+        if not core_is_live_recall:
+            violations.extend(
+                find_repetition_violations(
+                    response_text=draft_text,
+                    conversation=conversation,
+                )
             )
-        )
 
         violations.extend(
             find_core_answer_contract_violations(
@@ -5482,7 +6523,7 @@ def handle_direct_conversation(
             violations.extend(
                 verify_core_grounded_draft(
                     client=client,
-                    model=MODEL,
+                    model=active_local_model,
                     user_input=user_input,
                     draft=draft_text,
                     core_answer_contract=core_answer_contract,
@@ -5490,11 +6531,49 @@ def handle_direct_conversation(
                 )
             )
 
+        if factual_focus_fidelity_required:
+            violations.extend(
+                find_factual_answer_integrity_violations(
+                    draft=draft_text,
+                )
+            )
+
+            violations.extend(
+                find_factual_process_commentary_violations(
+                    draft=draft_text,
+                )
+            )
+
+            factual_history_violations = (
+                find_factual_personal_history_violations(
+                    user_input=user_input,
+                    draft=draft_text,
+                    conversation=conversation,
+                    max_prior_user_messages=4,
+                )
+            )
+
+            if factual_history_violations:
+                violations.extend(
+                    factual_history_violations
+                )
+            else:
+                violations.extend(
+                    verify_factual_focus_fidelity(
+                        client=client,
+                        model=active_local_model,
+                        user_input=user_input,
+                        draft=draft_text,
+                        core_answer_contract=core_answer_contract,
+                        conversation=conversation,
+                    )
+                )
+
         if research_evidence:
             violations.extend(
                 verify_media_draft(
                     client=client,
-                    model=MODEL,
+                    model=get_local_model_name(),
                     user_input=(
                         spoiler_context.get(
                             "pending_question"
@@ -5524,6 +6603,16 @@ def handle_direct_conversation(
             "[Personality] Rejected draft: "
             + ", ".join(
                 violations
+            )
+        )
+
+        retry_violations.extend(
+            violations
+        )
+
+        retry_violations = list(
+            dict.fromkeys(
+                retry_violations
             )
         )
 
@@ -5569,6 +6658,9 @@ def handle_direct_conversation(
                 in {
                     "share_context",
                     "acknowledge",
+                    "casual_conversation",
+                    "self_correction",
+                    "conversation_recall",
                 }
             ):
                 final_response_text = (
@@ -5930,7 +7022,7 @@ def get_response(
             )
 
         response = client.chat(
-            model=MODEL,
+            model=get_local_model_name(),
             messages=working_conversation,
             tools=tools
         )
@@ -6400,7 +7492,7 @@ def get_response(
                 })
 
                 final_response = client.chat(
-                    model=MODEL,
+                    model=get_local_model_name(),
                     messages=final_messages
                 )
 
@@ -6468,7 +7560,7 @@ def get_response(
                 })
 
                 final_response = client.chat(
-                    model=MODEL,
+                    model=get_local_model_name(),
                     messages=final_messages
                 )
 

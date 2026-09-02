@@ -62,9 +62,11 @@ def run():
         is True
     )
 
-    # The verifier prompt itself is generated inside verify_core_grounded_draft,
-    # so this regression protects the policy wording in source rather than
-    # pretending a fake model can prove semantic judgement quality.
+    # The verifier prompt itself is generated inside verify_core_grounded_draft.
+    # This historical regression protects the semantic policy invariants:
+    # obvious impossible/personified banter remains allowed, while plausible
+    # concrete premises and ordinary factual claims still require grounding.
+    # Internal classification labels are not part of the contract.
     source_path = (
         SRC_DIR
         / "core"
@@ -76,13 +78,26 @@ def run():
     )
 
     required_phrases = [
+        # Obvious impossible/personified banter remains allowed.
         "Clearly absurd, impossible, anthropomorphic, sarcastic, teasing, or",
         "The shoes will need their own passport",
         "Hope they're not plotting a mutiny",
-        "CLEARLY_NON_LITERAL_BANTER",
+
+        # Plausible literal claims remain evidence-gated.
         "XT6s are waterproof",
         "they are currently in China",
         "you will visit the Great Wall",
+
+        # Phase 6.8.6 strengthens the old binary banter label into
+        # premise-aware decomposition: the joke predicate can be
+        # non-literal while its concrete scene premise still requires
+        # support.
+        "Decompose each meaningful proposition BEFORE deciding what is banter.",
+        "A clearly non-literal predicate/action does NOT exempt the concrete premise",
+        "Only the obviously impossible/non-literal predicate itself is exempt",
+        "the dust bunnies are plotting a coup",
+        "the desk is plotting revenge",
+        "the XM6s are furious",
     ]
 
     for phrase in required_phrases:

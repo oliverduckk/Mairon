@@ -33,6 +33,14 @@ load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 input_name = os.getenv("MAIRON_USER_NAME")
 
+local_model_name = str(
+    os.getenv(
+        "MAIRON_LOCAL_MODEL",
+        "qwen3:14b",
+    )
+    or "qwen3:14b"
+).strip()
+
 
 # --------------------------------------------------
 # AI providers
@@ -70,7 +78,9 @@ if api_key:
 # --------------------------------------------------
 
 print("Mairon v0.1 starting...")
-print("Default AI: Local Qwen3 14B")
+print(
+    f"Default AI: Local {local_model_name}"
+)
 
 if cloud_ai:
     print(

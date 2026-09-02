@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
@@ -368,6 +369,80 @@ def _parse_field_lines(
     return fields
 
 
+def _parse_resolved_referents(
+    contract_text: str,
+) -> Dict[str, str]:
+    """
+    Transitional parser for the rendered resolved-reference section.
+
+    This lives beside _parse_field_lines because the current main/router seam
+    still transports Answer Contracts as text. Once the actual AnswerContract
+    object crosses that seam directly, both legacy parsers can disappear.
+    """
+
+    resolved = {}
+    in_section = False
+
+    for raw_line in str(
+        contract_text
+        or ""
+    ).splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        if line == (
+            "RESOLVED CONVERSATION REFERENCES:"
+        ):
+            in_section = True
+            continue
+
+        if not in_section:
+            continue
+
+        # A new all-caps section header ends this section.
+        if (
+            line.endswith(":")
+            and line.upper() == line
+        ):
+            break
+
+        match = re.match(
+            r"^-\s*['\"](?P<pronoun>[^'\"]+)['\"]\s+"
+            r"refers\s+to:\s*(?P<referent>.+?)\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        pronoun = (
+            match.group(
+                "pronoun"
+            )
+            or ""
+        ).strip()
+
+        referent = (
+            match.group(
+                "referent"
+            )
+            or ""
+        ).strip()
+
+        if (
+            pronoun
+            and referent
+        ):
+            resolved[
+                pronoun
+            ] = referent
+
+    return resolved
+
+
 def runtime_from_legacy_text(
     contract_text: Optional[str],
 ) -> Optional[
@@ -451,6 +526,11 @@ def runtime_from_legacy_text(
             )
         ),
         model_instruction=text,
+        resolved_referents=(
+            _parse_resolved_referents(
+                text
+            )
+        ),
         source="legacy_text",
     )
 

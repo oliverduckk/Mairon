@@ -327,9 +327,18 @@ def run():
     assert all(
         call[
             "options"
-        ] == {
-            "temperature": 0,
-        }
+        ][
+            "temperature"
+        ] == 0
+        for call in client.calls
+    )
+
+    assert all(
+        call[
+            "options"
+        ][
+            "num_predict"
+        ] == 160
         for call in client.calls
     )
 

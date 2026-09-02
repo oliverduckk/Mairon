@@ -78,6 +78,31 @@ def route_epistemic_authority(
             ),
         )
 
+    if turn.intent == "self_correction":
+        return EpistemicRoute(
+            authority="user_turn_and_live_conversation",
+            mode="self_correction",
+            verification_required=False,
+            allow_model_memory=False,
+            reason=(
+                "Oliver's latest explicit self-correction is authoritative for "
+                "what he meant; older conflicting user wording is superseded."
+            ),
+        )
+
+    if turn.intent == "conversation_recall":
+        return EpistemicRoute(
+            authority="live_conversation",
+            mode="conversation_recall",
+            verification_required=True,
+            allow_model_memory=False,
+            reason=(
+                "A question about what was said in this conversation must be "
+                "answered from the live user-authored conversation, not model "
+                "memory, web research, or unrelated journal retrieval."
+            ),
+        )
+
     if turn.intent == "correct_mairon":
         return EpistemicRoute(
             authority="conversation_and_verification",
@@ -87,6 +112,18 @@ def route_epistemic_authority(
             reason=(
                 "A correction requires reconciling Mairon's prior claim with "
                 "the best available evidence."
+            ),
+        )
+
+    if turn.intent == "casual_conversation":
+        return EpistemicRoute(
+            authority="live_conversation",
+            mode="social_conversation",
+            verification_required=False,
+            allow_model_memory=False,
+            reason=(
+                "Ordinary banter should stay anchored to the live conversation "
+                "instead of importing unrelated world facts or old journal material."
             ),
         )
 

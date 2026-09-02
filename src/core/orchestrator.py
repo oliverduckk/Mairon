@@ -30,6 +30,9 @@ from core.workflows.email_search import (
 from core.workflows.order_status import (
     check_order_status,
 )
+from core.workflows.self_correction import (
+    build_self_correction_response,
+)
 
 
 @dataclass
@@ -379,6 +382,33 @@ class MaironCore:
                 epistemic_route=route,
                 answer_contract=contract,
                 workflow_result=workflow_result,
+                direct_response=direct_response,
+            )
+
+        # --------------------------------------------------
+        # Deterministic user self-correction
+        # --------------------------------------------------
+
+        if turn.intent == "self_correction":
+            contract = build_answer_contract(
+                turn=turn,
+                route=route,
+            )
+
+            direct_response = (
+                build_self_correction_response(
+                    user_input
+                )
+            )
+
+            self.conversation_state.update_from_turn(
+                turn
+            )
+
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
                 direct_response=direct_response,
             )
 

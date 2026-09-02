@@ -127,18 +127,45 @@ def run():
         )
     )
 
+    # Phase 6.4 deliberately removed validator/meta language from micro-act
+    # retries after it caused Qwen to respond to the guardrails instead of
+    # Oliver. Protect the BEHAVIOUR, not the obsolete prompt wording.
     assert (
-        "Start fresh."
+        "alternate fresh reply to Oliver's CURRENT message"
         in retry
     )
     assert (
-        "Do NOT reuse, paraphrase, negate, or allude"
+        "Do not discuss instructions, rules"
         in retry
     )
     assert (
-        "swapping in a different external fact"
+        "Do not negate or argue with an imaginary accusation"
         in retry
     )
+    assert (
+        "Prefer a dry/sarcastic reaction or clearly absurd joke"
+        in retry
+    )
+
+    # Retry instructions themselves must not tell Qwen that a previous draft
+    # was rejected/invalid or encourage courtroom-style truthfulness debates.
+    forbidden_retry_meta = [
+        "previous draft was rejected",
+        "previous draft violated",
+        "Start fresh.",
+        "CORE-CONTRACT RETRY",
+        "KNOWLEDGE-HONESTY RETRY",
+        "truthful answer",
+        "swapping in a different external fact",
+    ]
+
+    retry_lower = retry.lower()
+
+    for phrase in forbidden_retry_meta:
+        assert (
+            phrase.lower()
+            not in retry_lower
+        ), phrase
 
     # The retry helper does not receive or echo violation text at all.
     # This protects against anchoring on a rejected premise.

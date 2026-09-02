@@ -102,14 +102,28 @@ OPINION_PATTERNS = [
     r"\bunderrated\b",
 ]
 
-CORRECTION_PATTERNS = [
+CONVERSATION_RECALL_PATTERNS = [
+    r"\bwhat did i say\b",
+    r"\bwhat did i tell you\b",
+    r"\bwhat was it i said\b",
+    r"\bremind me what i said\b",
+    r"\bwhat did you say\b",
+    r"\bwhat did you tell me\b",
+]
+
+SELF_CORRECTION_PATTERNS = [
+    r"\bscratch that\b",
+    r"\bi meant\b",
+    r"\bcorrection\s*[:,]",
+    r"\bi got that wrong\b",
+    r"\bi said that wrong\b",
+    r"\blet me correct myself\b",
+]
+
+MAIRON_CORRECTION_PATTERNS = [
     r"\byou(?:'re| are) wrong\b",
     r"\bthat's wrong\b",
     r"\bthat is wrong\b",
-    r"\bactually\b",
-    r"\bnot (?:a|an|the)\b",
-    r"\bwas(?:n't| not)\b",
-    r"\bis(?:n't| not)\b",
     r"\byou just said\b",
     r"\byou said\b",
 
@@ -120,6 +134,10 @@ CORRECTION_PATTERNS = [
     r"\bi\s+didn'?t\s+ask\b",
     r"\bi\s+did\s+not\s+ask\b",
 ]
+
+# Backward-compatible name for any older tests/helpers that imported the
+# original constant directly. New routing uses the more precise name above.
+CORRECTION_PATTERNS = MAIRON_CORRECTION_PATTERNS
 
 BANTER_PATTERNS = [
     r"\blmao\b",
@@ -174,7 +192,8 @@ def _extract_application_name(
 
 
 DISCOURSE_PREFIX_PATTERN = re.compile(
-    r"^(?:(?:mate|bro|bruh|dude|man|yeah|yep|nah|nope|okay|ok|lol|lmao|haha+)"
+    r"^(?:(?:mate|bro|bruh|dude|man|yeah|yep|nah|nope|okay|ok|lol|lmao|haha+|"
+    r"anyway|well|also|at\s+least)"
     r"(?:\s*[,!.-]\s*|\s+))+",
     flags=re.IGNORECASE,
 )
@@ -226,6 +245,65 @@ def _strip_discourse_prefixes(
 
 def _matches_any(text: str, patterns) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _is_personal_declarative_share(
+    text: str,
+) -> bool:
+    """
+    Recognise ordinary user-provided personal/context statements without
+    enumerating every verb Oliver might use.
+
+    This is intentionally a speech-act test, not a factual-domain test.
+    Questions and request-shaped first-person sentences are excluded.
+    """
+
+    value = str(
+        text
+        or ""
+    ).strip()
+
+    if not value:
+        return False
+
+    if _matches_any(
+        value,
+        QUESTION_PATTERNS,
+    ):
+        return False
+
+    # "I need you to...", "I want you to..." and similar request shapes
+    # are not declarative context merely because they begin with "I".
+    if re.match(
+        r"^\s*i\s+(?:need|want|would\s+like|want\s+you|need\s+you|"
+        r"am\s+asking\s+you|ask\s+you)\b",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return False
+
+    if re.match(
+        r"^\s*i\b",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    if re.match(
+        r"^\s*(?:my|our|we)\b",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    if re.match(
+        r"^\s*(?:it|this|that|they|these|those)\b",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return False
 
 
 def _extract_merchant_from_order_text(text: str) -> Optional[str]:
@@ -678,13 +756,50 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         )
         return state
 
-    if _matches_any(text, CORRECTION_PATTERNS):
+    if _matches_any(
+        text,
+        CONVERSATION_RECALL_PATTERNS,
+    ):
+        state.speech_act = "question"
+        state.intent = "conversation_recall"
+        state.factuality = "conversation_grounded"
+        state.should_continue_conversation = False
+        state.should_recommend = False
+        state.should_use_tools = False
+        state.confidence = 0.97
+        state.add_reason(
+            "user explicitly asks what was said in conversation"
+        )
+        return state
+
+    if _matches_any(
+        text,
+        SELF_CORRECTION_PATTERNS,
+    ):
+        state.speech_act = "self_correction"
+        state.intent = "self_correction"
+        state.factuality = "user_provided_revision"
+        state.should_continue_conversation = False
+        state.should_recommend = False
+        state.should_use_tools = False
+        state.confidence = 0.96
+        state.add_reason(
+            "user explicitly revises their own earlier statement"
+        )
+        return state
+
+    if _matches_any(
+        text,
+        MAIRON_CORRECTION_PATTERNS,
+    ):
         state.speech_act = "correction"
         state.intent = "correct_mairon"
         state.factuality = "requires_reconciliation"
         state.should_continue_conversation = True
         state.confidence = 0.9
-        state.add_reason("user appears to be correcting a previous Mairon claim")
+        state.add_reason(
+            "user appears to be correcting or challenging a previous Mairon claim"
+        )
         return state
 
     if _matches_any(text, THANKS_PATTERNS):
@@ -718,8 +833,19 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         return state
 
     if (
-        _matches_any(text, DECLARATIVE_SHARE_PATTERNS)
-        and not _matches_any(text, QUESTION_PATTERNS)
+        (
+            _is_personal_declarative_share(
+                text
+            )
+            or _matches_any(
+                text,
+                DECLARATIVE_SHARE_PATTERNS,
+            )
+        )
+        and not _matches_any(
+            text,
+            QUESTION_PATTERNS,
+        )
     ):
         state.speech_act = "declarative_share"
         state.intent = "share_context"

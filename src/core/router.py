@@ -141,6 +141,57 @@ def assess_cloud_complexity(
     )
 
 
+
+
+def _local_model_label(
+    local_ai,
+):
+    """Return the active local model name without hard-coding provider branding."""
+
+    module = (
+        (local_ai or {}).get(
+            "module"
+        )
+        if isinstance(
+            local_ai,
+            dict,
+        )
+        else None
+    )
+
+    getter = getattr(
+        module,
+        "get_local_model_name",
+        None,
+    )
+
+    if callable(
+        getter
+    ):
+        try:
+            value = str(
+                getter()
+                or ""
+            ).strip()
+
+            if value:
+                return value
+
+        except Exception:
+            pass
+
+    value = getattr(
+        module,
+        "MODEL",
+        None,
+    )
+
+    return str(
+        value
+        or "local model"
+    ).strip()
+
+
 def route_message(
     local_ai,
     cloud_ai,
@@ -228,7 +279,10 @@ def route_message(
     # --------------------------------------------------
 
     print(
-        "[AI] Using local: Qwen3 14B"
+        "[AI] Using local: "
+        + _local_model_label(
+            local_ai
+        )
     )
 
     (
@@ -325,7 +379,10 @@ def decline_cloud_escalation(
     )
 
     print(
-        "[AI] Using local: Qwen3 14B"
+        "[AI] Using local: "
+        + _local_model_label(
+            local_ai
+        )
     )
 
     (
