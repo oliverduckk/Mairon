@@ -1,3 +1,7 @@
+from core.desktop_catalog import (
+    DESKTOP_TARGETS,
+    desktop_display_name,
+)
 from core.evidence import (
     Evidence,
     EvidenceBundle,
@@ -11,23 +15,38 @@ from tools.tool_registry import (
 
 
 APP_DISPLAY_NAMES = {
-    "calculator": "Calculator",
-    "notepad": "Notepad",
+    target_id: metadata["display_name"]
+    for target_id, metadata in DESKTOP_TARGETS.items()
 }
+
+
+def _launch_answer(
+    target_id: str,
+) -> str:
+    if target_id == "downloads":
+        return "Downloads is open."
+
+    if target_id == "mairon_project":
+        return "Mairon's open in VS Code."
+
+    return (
+        f"{desktop_display_name(target_id)}'s open."
+    )
 
 
 def launch_approved_application(
     app_name: str,
 ) -> WorkflowResult:
     """
-    Deterministically launch one allowlisted desktop application.
+    Deterministically open one allowlisted desktop target.
 
-    Core owns this workflow. Qwen does not decide whether Mairon has the
-    capability, which tool to call, or whether the action succeeded.
+    Core owns target identity. Qwen does not choose executable paths or
+    construct commands.
     """
 
     app_name = str(
-        app_name or ""
+        app_name
+        or ""
     ).strip().lower()
 
     if app_name not in APP_DISPLAY_NAMES:
@@ -35,8 +54,8 @@ def launch_approved_application(
             success=False,
             status="unsupported_application",
             error=(
-                "That application is not currently in Mairon's "
-                "approved launch allowlist."
+                "That desktop target is not currently in Mairon's "
+                "approved allowlist."
             ),
             data={
                 "app_name": app_name,
@@ -62,24 +81,18 @@ def launch_approved_application(
             ),
             data={
                 "app_name": app_name,
-                "raw_result": str(
-                    result
-                ),
+                "raw_result": str(result),
             },
         )
 
-    if result.get(
-        "success"
-    ) is not True:
+    if result.get("success") is not True:
         return WorkflowResult(
             success=False,
             status="launch_failed",
             error=(
-                result.get(
-                    "message"
-                )
+                result.get("message")
                 or (
-                    f"{APP_DISPLAY_NAMES[app_name]} "
+                    f"{desktop_display_name(app_name)} "
                     "could not be opened."
                 )
             ),
@@ -89,9 +102,9 @@ def launch_approved_application(
             },
         )
 
-    display_name = APP_DISPLAY_NAMES[
+    answer_fact = _launch_answer(
         app_name
-    ]
+    )
 
     evidence = EvidenceBundle(
         authority="desktop",
@@ -101,8 +114,8 @@ def launch_approved_application(
     evidence.add(
         Evidence(
             claim=(
-                f"The local desktop tool successfully launched "
-                f"{display_name}."
+                "The local desktop tool successfully requested opening "
+                f"{desktop_display_name(app_name)}."
             ),
             provenance="desktop_tool",
             confidence="verified",
@@ -116,9 +129,7 @@ def launch_approved_application(
     return WorkflowResult(
         success=True,
         status="launched",
-        answer_fact=(
-            f"{display_name}'s open."
-        ),
+        answer_fact=answer_fact,
         evidence=evidence,
         data={
             "app_name": app_name,

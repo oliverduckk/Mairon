@@ -3,6 +3,9 @@ from typing import Optional
 
 from core.turn_state import TurnState
 from core.email_intent import is_inbox_attention_request
+from core.desktop_catalog import (
+    extract_desktop_action_request,
+)
 
 
 THANKS_PATTERNS = [
@@ -16,13 +19,6 @@ QUESTION_PATTERNS = [
     r"\?$",
     r"^\s*(?:what|why|who|where|when|how|does|do|did|is|are|can|could|would|should|has|have|will)\b",
 ]
-
-APPLICATION_LAUNCH_PATTERN = re.compile(
-    r"\b(?:open|launch|start)(?:\s+up)?\s+(?:the\s+)?"
-    r"(?P<app>calculator|notepad)\b",
-    flags=re.IGNORECASE,
-)
-
 
 ACTION_PATTERNS = [
     r"^\s*(?:check|send|turn|open|close|start|stop|set|remind|search|find|look|show|tell|wake|shutdown|shut down|restart|download|upload|move|copy)\b",
@@ -340,34 +336,6 @@ CONTENT_GENERATION_REQUEST_PATTERNS = [
 FOLLOW_UP_PRONOUNS = {
     "it", "that", "this", "they", "them", "those", "these", "he", "she",
 }
-
-
-def _extract_application_name(
-    text: str,
-) -> Optional[str]:
-    match = APPLICATION_LAUNCH_PATTERN.search(
-        str(
-            text or ""
-        )
-    )
-
-    if not match:
-        return None
-
-    app_name = (
-        match.group(
-            "app"
-        )
-        or ""
-    ).strip().lower()
-
-    if app_name not in {
-        "calculator",
-        "notepad",
-    }:
-        return None
-
-    return app_name
 
 
 DISCOURSE_PREFIX_PATTERN = re.compile(
@@ -776,18 +744,54 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.add_reason("empty input")
         return state
 
-    app_name = _extract_application_name(
-        raw
+    desktop_action = (
+        extract_desktop_action_request(
+            raw,
+            conversation_state=(
+                conversation_state
+            ),
+        )
     )
 
-    if app_name:
+    if desktop_action:
+        action = desktop_action[
+            "action"
+        ]
+
+        app_name = desktop_action[
+            "target_id"
+        ]
+
         state.speech_act = "request_action"
-        state.intent = "launch_application"
-        state.subject = app_name
+
+        state.intent = {
+            "open": "launch_application",
+            "close": "close_application",
+            "focus": "focus_application",
+        }[
+            action
+        ]
+
+        state.subject = desktop_action[
+            "display_name"
+        ]
+
         state.entities[
             "app_name"
         ] = app_name
-        state.requested_action = "launch_application"
+
+        state.entities[
+            "desktop_action"
+        ] = action
+
+        state.requested_action = {
+            "open": "launch_application",
+            "close": "close_application",
+            "focus": "focus_application",
+        }[
+            action
+        ]
+
         state.requires_private_data = False
         state.requires_live_data = True
         state.factuality = "action_result"
@@ -798,9 +802,24 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.should_continue_conversation = False
         state.confidence = 0.99
 
-        state.add_reason(
-            "explicit launch request for an approved desktop application"
-        )
+        if desktop_action.get(
+            "inherited"
+        ):
+            state.is_follow_up = True
+
+            state.resolved_referents[
+                "it"
+            ] = desktop_action[
+                "display_name"
+            ]
+
+            state.add_reason(
+                "inherited active desktop target from Core desktop referent state"
+            )
+        else:
+            state.add_reason(
+                "explicit action request for an approved desktop target"
+            )
 
         return state
 

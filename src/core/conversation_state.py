@@ -67,6 +67,12 @@ class ConversationState:
         default_factory=list
     )
 
+    # Desktop working referent survives unrelated social/banter turns.
+    active_desktop_target: Optional[str] = None
+    recent_desktop_targets: List[str] = field(
+        default_factory=list
+    )
+
     def remember_subject(self, subject: Optional[str]) -> None:
         value = str(subject or "").strip()
 
@@ -121,6 +127,60 @@ class ConversationState:
             self.pending_question = (
                 turn.raw_text
             )
+
+        if (
+            turn.intent
+            in {
+                "launch_application",
+                "close_application",
+                "focus_application",
+            }
+        ):
+            target_id = str(
+                turn.entities.get(
+                    "app_name",
+                    "",
+                )
+                or ""
+            ).strip().lower()
+
+            if target_id:
+                self.remember_desktop_target(
+                    target_id
+                )
+
+    # --------------------------------------------------
+    # Desktop-specific working referent
+    # --------------------------------------------------
+
+    def remember_desktop_target(
+        self,
+        target_id: str,
+    ) -> None:
+        value = str(
+            target_id
+            or ""
+        ).strip().lower()
+
+        if not value:
+            return
+
+        self.active_desktop_target = value
+
+        self.recent_desktop_targets = [
+            item
+            for item in self.recent_desktop_targets
+            if item != value
+        ]
+
+        self.recent_desktop_targets.insert(
+            0,
+            value,
+        )
+
+        self.recent_desktop_targets = (
+            self.recent_desktop_targets[:8]
+        )
 
     # --------------------------------------------------
     # Gmail-specific working referents

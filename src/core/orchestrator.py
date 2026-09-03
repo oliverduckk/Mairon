@@ -24,6 +24,9 @@ from core.workflow_result import (
 from core.workflows.application_launch import (
     launch_approved_application,
 )
+from core.workflows.application_control import (
+    control_approved_application,
+)
 from core.workflows.email_read import (
     read_selected_email,
 )
@@ -346,7 +349,85 @@ class MaironCore:
                         and workflow_result.error
                     )
                     else (
-                        "I couldn't open that application."
+                        "I couldn't open that desktop target."
+                    )
+                )
+
+            self.conversation_state.update_from_turn(
+                turn
+            )
+
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
+                workflow_result=workflow_result,
+                direct_response=direct_response,
+            )
+
+        # --------------------------------------------------
+        # Deterministic desktop window control
+        # --------------------------------------------------
+
+        if turn.intent in {
+            "close_application",
+            "focus_application",
+        }:
+            app_name = str(
+                turn.entities.get(
+                    "app_name",
+                    "",
+                )
+            ).strip().lower()
+
+            action = (
+                "close"
+                if turn.intent == "close_application"
+                else "focus"
+            )
+
+            workflow_result = (
+                control_approved_application(
+                    app_name=app_name,
+                    action=action,
+                )
+            )
+
+            contract = build_answer_contract(
+                turn=turn,
+                route=route,
+                evidence=(
+                    workflow_result.evidence
+                    if workflow_result
+                    else None
+                ),
+            )
+
+            if (
+                workflow_result
+                and workflow_result.answer_fact
+            ):
+                contract.required_claims.append(
+                    workflow_result.answer_fact
+                )
+
+            if (
+                workflow_result
+                and workflow_result.success
+                and workflow_result.answer_fact
+            ):
+                direct_response = (
+                    workflow_result.answer_fact
+                )
+            else:
+                direct_response = (
+                    workflow_result.error
+                    if (
+                        workflow_result
+                        and workflow_result.error
+                    )
+                    else (
+                        "I couldn't complete that desktop action."
                     )
                 )
 
