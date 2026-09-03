@@ -42,7 +42,10 @@ def route_epistemic_authority(
             ),
         )
 
-    if turn.intent == "email_search":
+    if turn.intent in {
+        "email_search",
+        "email_read",
+    }:
         return EpistemicRoute(
             authority="gmail",
             mode="tool_verified",
@@ -51,7 +54,8 @@ def route_epistemic_authority(
             live_data_required=True,
             private_data_required=True,
             reason=(
-                "Email contents/status must come from Gmail, not model memory."
+                "Email existence and contents must come from verified Gmail "
+                "data, not model memory or prior assistant prose."
             ),
         )
 

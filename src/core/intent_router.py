@@ -2,6 +2,7 @@ import re
 from typing import Optional
 
 from core.turn_state import TurnState
+from core.email_intent import is_inbox_attention_request
 
 
 THANKS_PATTERNS = [
@@ -49,6 +50,116 @@ EMAIL_LOOKUP_PATTERNS = [
     r"\b(?:email|emails|message|messages) about .{1,100}\b",
 ]
 
+
+EMAIL_READ_PATTERNS = [
+    # Ask for contents / meaning.
+    r"\bwhat\s+(?:did|does|do)\b[^?]{0,120}\b(?:email|message)\b[^?]{0,60}"
+    r"\b(?:say|says|said|contain|contains|include|includes|mean)\b",
+
+    r"\bwhat(?:'s|\s+is|\s+was)\s+in\b[^?]{0,120}\b(?:email|message)\b",
+
+    r"\b(?:email|message)\b[^?]{0,100}\b(?:actually\s+)?"
+    r"(?:say|says|said|contain|contains|include|includes)\b",
+
+    # Explicit read/summarise actions.
+    r"\b(?:read|summari[sz]e|explain)\b[^?]{0,120}\b(?:email|message)\b",
+    r"\b(?:read|summari[sz]e|explain)\s+(?:it|that|this)\b",
+]
+
+
+def _extract_email_read_target(
+    text: str,
+) -> Optional[str]:
+    """
+    Extract an explicitly named Gmail referent without knowing any company,
+    sender, or topic in advance.
+
+    Examples:
+      "What did that PayPal email say?" -> PayPal
+      "What does the email from Qantas say?" -> Qantas
+      "Summarise the email about my application." -> my application
+
+    Bare "that email" deliberately returns None and is resolved only from
+    unambiguous active Gmail state.
+    """
+
+    patterns = [
+        r"\b(?:that|this|the)\s+(.{1,100}?)\s+(?:email|message)\b",
+        r"\b(?:email|message)\s+from\s+(.+?)(?="
+        r"\s+(?:today|yesterday|this|last|past|previous)\b|"
+        r"\s+(?:say|says|said|contain|contains|include|includes|mean)\b|"
+        r"[?.!,]|$)",
+        r"\b(?:email|message)\s+about\s+(.+?)(?="
+        r"\s+(?:today|yesterday|this|last|past|previous)\b|"
+        r"\s+(?:say|says|said|contain|contains|include|includes|mean)\b|"
+        r"[?.!,]|$)",
+    ]
+
+    stop_values = {
+        "that",
+        "this",
+        "the",
+        "an",
+        "a",
+        "my",
+        "your",
+    }
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        value = re.sub(
+            r"\s+",
+            " ",
+            match.group(1).strip(
+                " ?!.,"
+            ),
+        )
+
+        if (
+            value
+            and value.lower()
+            not in stop_values
+            and len(value) <= 120
+        ):
+            return value
+
+    return None
+
+
+def _recent_email_context_for_target(
+    conversation_state,
+    target: Optional[str],
+    allow_bare: bool,
+):
+    if conversation_state is None:
+        return None
+
+    resolver = getattr(
+        conversation_state,
+        "find_email_referent",
+        None,
+    )
+
+    if not callable(
+        resolver
+    ):
+        return None
+
+    return resolver(
+        target=target,
+        require_message=True,
+        allow_bare=allow_bare,
+    )
+
+
 CONTEXTUAL_EMAIL_FOLLOWUP_PATTERNS = [
     r"\bdid i get anything from\b",
     r"\bdid i receive anything from\b",
@@ -56,6 +167,17 @@ CONTEXTUAL_EMAIL_FOLLOWUP_PATTERNS = [
     r"\bhave i received anything from\b",
     r"\banything from .{1,100}\b",
     r"\banything from (?:them|him|her)\b",
+
+    # Temporal-only refinements inherit the ACTIVE targeted Gmail subject.
+    # These are contextual only: without active email_search state they retain
+    # their ordinary conversational/factual meaning.
+    r"^\s*(?:and\s+)?(?:how|what)\s+about\s+"
+    r"(?:today|yesterday|this\s+week|last\s+week|past\s+week|"
+    r"(?:the\s+)?(?:last|past|previous)\s+\d+\s+days?)\s*[?.!]*\s*$",
+
+    r"^\s*(?:and\s+)?"
+    r"(?:today|yesterday|this\s+week|last\s+week|past\s+week|"
+    r"(?:the\s+)?(?:last|past|previous)\s+\d+\s+days?)\s*[?.!]*\s*$",
 ]
 
 DECLARATIVE_SHARE_PATTERNS = [
@@ -703,6 +825,252 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
             state.subject = "order"
 
         state.add_reason("explicit order/delivery status question")
+        return state
+
+    # Inbox triage/attention is a distinct Gmail intent from targeted sender
+    # or topic lookup. Detect it BEFORE the broad email_search patterns so
+    # phrases such as "which emails need my attention?" cannot be converted
+    # into a literal Gmail search string.
+    if is_inbox_attention_request(
+        text
+    ):
+        state.speech_act = "question"
+        state.intent = "inbox_attention"
+        state.requested_action = "review_inbox"
+        state.requires_private_data = True
+        state.requires_live_data = True
+        state.factuality = "tool_verified"
+        state.preferred_authority = "gmail"
+        state.should_use_tools = True
+        state.should_answer_directly = False
+        state.should_recommend = False
+        state.should_continue_conversation = False
+        state.confidence = 0.98
+        state.add_reason(
+            "explicit inbox attention/triage request"
+        )
+        return state
+
+    # --------------------------------------------------
+    # Specific Gmail body/detail reads
+    # --------------------------------------------------
+    #
+    # This is intentionally earlier than broad email_search routing.
+    # "What did that PayPal email say?" is not an existence search.
+    email_read_request = _matches_any(
+        text,
+        EMAIL_READ_PATTERNS,
+    )
+
+    explicit_email_read_target = (
+        _extract_email_read_target(
+            raw
+        )
+        if email_read_request
+        else None
+    )
+
+    active_specific_email = bool(
+        conversation_state is not None
+        and getattr(
+            conversation_state,
+            "active_intent",
+            None,
+        )
+        in {
+            "email_search",
+            "email_read",
+        }
+    )
+
+    # A judgement/action follow-up about the active email is still a Gmail
+    # evidence question. It must not be answered from Mairon's prior prose.
+    email_action_assessment_request = bool(
+        active_specific_email
+        and re.search(
+            r"^\s*(?:and\s+)?(?:"
+            r"do\s+i\s+need\s+to\s+(?:do\s+anything|act|reply|respond|worry)"
+            r"(?:\s+about\s+(?:it|that|this))?|"
+            r"is\s+(?:it|that|this)\s+(?:important|urgent|actionable)|"
+            r"does\s+(?:it|that|this)\s+(?:need|require)\s+"
+            r"(?:action|a\s+reply|a\s+response)|"
+            r"anything\s+i\s+need\s+to\s+(?:do|worry\s+about)"
+            r")\s*[?.!]*\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    # A compact deictic request such as "what did it say?" is Gmail-specific
+    # only while a specific email search/read remains actively selected.
+    deictic_email_read_request = bool(
+        active_specific_email
+        and re.search(
+            r"^\s*(?:and\s+)?"
+            r"(?:what\s+(?:did|does)\s+(?:it|that)\s+say|"
+            r"what(?:'s|\s+is|\s+was)\s+in\s+(?:it|that)|"
+            r"(?:read|summari[sz]e|explain)\s+(?:it|that))"
+            r"\s*[?.!]*\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    if (
+        email_read_request
+        or deictic_email_read_request
+        or email_action_assessment_request
+    ):
+        state.speech_act = "question"
+        state.intent = "email_read"
+        state.requested_action = (
+            "assess_email_action"
+            if email_action_assessment_request
+            else "read_email"
+        )
+
+        if email_action_assessment_request:
+            state.entities[
+                "email_read_purpose"
+            ] = "action_assessment"
+
+        state.requires_private_data = True
+        state.requires_live_data = True
+        state.factuality = "tool_verified"
+        state.preferred_authority = "gmail"
+        state.should_use_tools = True
+        state.should_answer_directly = False
+        state.should_recommend = bool(
+            email_action_assessment_request
+        )
+        state.should_continue_conversation = False
+        state.confidence = 0.99
+
+        target = (
+            explicit_email_read_target
+        )
+
+        prior_context = (
+            _recent_email_context_for_target(
+                conversation_state,
+                target=target,
+                allow_bare=(
+                    target is None
+                    and active_specific_email
+                ),
+            )
+        )
+
+        if prior_context:
+            messages = list(
+                prior_context.get(
+                    "messages",
+                    [],
+                )
+                or []
+            )
+
+            state.is_follow_up = True
+
+            search_text = str(
+                prior_context.get(
+                    "search_text"
+                )
+                or target
+                or ""
+            ).strip()
+
+            if search_text:
+                state.entities[
+                    "search_text"
+                ] = search_text
+
+                state.subject = (
+                    f"email matching {search_text}"
+                )
+
+            state.entities[
+                "time_scope"
+            ] = str(
+                prior_context.get(
+                    "time_scope",
+                    "rolling_days",
+                )
+            )
+
+            state.entities[
+                "days"
+            ] = str(
+                prior_context.get(
+                    "days",
+                    30,
+                )
+            )
+
+            if len(
+                messages
+            ) == 1:
+                message_id = str(
+                    messages[0].get(
+                        "message_id"
+                    )
+                    or ""
+                ).strip()
+
+                if message_id:
+                    state.entities[
+                        "message_id"
+                    ] = message_id
+
+            elif len(
+                messages
+            ) > 1:
+                state.entities[
+                    "email_candidate_count"
+                ] = str(
+                    len(
+                        messages
+                    )
+                )
+
+            state.add_reason(
+                "resolved email-read request from verified Gmail referent state"
+            )
+
+        elif target:
+            # No existing verified referent: Core may perform a targeted Gmail
+            # search in this turn and read the unique result.
+            state.entities[
+                "search_text"
+            ] = target
+
+            state.entities[
+                "time_scope"
+            ] = _extract_email_time_scope(
+                raw
+            )
+
+            state.entities[
+                "days"
+            ] = str(
+                _extract_email_days(
+                    raw
+                )
+            )
+
+            state.subject = (
+                f"email matching {target}"
+            )
+
+            state.add_reason(
+                "email-read request names a target that Core must search and verify"
+            )
+
+        else:
+            state.add_reason(
+                "email-read request lacks an unambiguous verified Gmail referent"
+            )
+
         return state
 
     contextual_email_followup = (

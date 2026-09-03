@@ -1,4 +1,7 @@
 import base64
+import html
+import re
+from html.parser import HTMLParser
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -179,8 +182,27 @@ def decode_body(
         return ""
 
     try:
+        # Gmail commonly omits base64 padding. urlsafe_b64decode accepts
+        # padded input reliably, so restore it without changing payload data.
+        value = str(
+            data
+        ).strip()
+
+        padding = (
+            -len(value)
+            % 4
+        )
+
+        if padding:
+            value += (
+                "="
+                * padding
+            )
+
         decoded = base64.urlsafe_b64decode(
-            data.encode("utf-8")
+            value.encode(
+                "utf-8"
+            )
         )
 
         return decoded.decode(
@@ -192,44 +214,350 @@ def decode_body(
         return ""
 
 
-def extract_plain_text(
-    payload
+def _extract_first_mime_body(
+    payload,
+    wanted_mime_type
 ):
     """
-    Recursively locate plain-text email content.
+    Recursively return the first inline MIME part of the requested type.
 
-    HTML content is deliberately ignored for now.
+    Gmail multipart/alternative commonly contains both text/plain and
+    text/html. Callers deliberately request text/plain first.
     """
 
-    mime_type = payload.get(
-        "mimeType",
-        ""
-    )
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        return ""
+
+    mime_type = str(
+        payload.get(
+            "mimeType",
+            "",
+        )
+        or ""
+    ).lower()
 
     body = payload.get(
         "body",
-        {}
+        {},
     )
 
-    if mime_type == "text/plain":
-        return decode_body(
-            body.get("data")
+    if (
+        mime_type
+        == wanted_mime_type
+        and isinstance(
+            body,
+            dict,
+        )
+    ):
+        decoded = decode_body(
+            body.get(
+                "data"
+            )
         )
 
-    parts = payload.get(
-        "parts",
-        []
-    )
+        if decoded:
+            return decoded
 
-    for part in parts:
-        text = extract_plain_text(
-            part
+    for part in (
+        payload.get(
+            "parts",
+            [],
+        )
+        or []
+    ):
+        text = _extract_first_mime_body(
+            part,
+            wanted_mime_type,
         )
 
         if text:
             return text
 
     return ""
+
+
+class _VisibleHTMLTextExtractor(
+    HTMLParser
+):
+    """
+    Convert an email's visible HTML into plain text using only stdlib.
+
+    Script/style/head content is discarded. Block boundaries are converted to
+    newlines so paragraphs, lists and table rows remain readable rather than
+    collapsing into one giant sentence.
+    """
+
+    BLOCK_TAGS = {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "div",
+        "dl",
+        "dt",
+        "dd",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "td",
+        "th",
+        "tr",
+        "ul",
+    }
+
+    IGNORED_TAGS = {
+        "head",
+        "script",
+        "style",
+        "svg",
+        "noscript",
+    }
+
+    def __init__(
+        self,
+    ):
+        super().__init__(
+            convert_charrefs=True
+        )
+
+        self._pieces = []
+        self._ignored_depth = 0
+
+    def _newline(
+        self,
+    ):
+        if (
+            not self._pieces
+            or self._pieces[
+                -1
+            ] != "\n"
+        ):
+            self._pieces.append(
+                "\n"
+            )
+
+    def handle_starttag(
+        self,
+        tag,
+        attrs,
+    ):
+        tag = str(
+            tag
+            or ""
+        ).lower()
+
+        if tag in self.IGNORED_TAGS:
+            self._ignored_depth += 1
+            return
+
+        if self._ignored_depth:
+            return
+
+        if tag == "br":
+            self._newline()
+
+        elif tag in self.BLOCK_TAGS:
+            self._newline()
+
+    def handle_startendtag(
+        self,
+        tag,
+        attrs,
+    ):
+        self.handle_starttag(
+            tag,
+            attrs,
+        )
+
+        self.handle_endtag(
+            tag
+        )
+
+    def handle_endtag(
+        self,
+        tag,
+    ):
+        tag = str(
+            tag
+            or ""
+        ).lower()
+
+        if tag in self.IGNORED_TAGS:
+            if self._ignored_depth:
+                self._ignored_depth -= 1
+            return
+
+        if self._ignored_depth:
+            return
+
+        if tag in self.BLOCK_TAGS:
+            self._newline()
+
+    def handle_data(
+        self,
+        data,
+    ):
+        if self._ignored_depth:
+            return
+
+        value = str(
+            data
+            or ""
+        )
+
+        if value:
+            self._pieces.append(
+                value
+            )
+
+    def text(
+        self,
+    ):
+        raw = "".join(
+            self._pieces
+        )
+
+        raw = html.unescape(
+            raw
+        )
+
+        raw = clean_email_text(
+            raw
+        )
+
+        lines = []
+
+        for line in raw.splitlines():
+            line = re.sub(
+                r"[ \t\f\v]+",
+                " ",
+                line,
+            ).strip()
+
+            if line:
+                lines.append(
+                    line
+                )
+
+        return "\n".join(
+            lines
+        ).strip()
+
+
+def html_to_visible_text(
+    html_text
+):
+    """
+    Safely reduce HTML email markup to visible local plain text.
+
+    No network resources are fetched and no embedded code is executed.
+    """
+
+    if not html_text:
+        return ""
+
+    parser = (
+        _VisibleHTMLTextExtractor()
+    )
+
+    try:
+        parser.feed(
+            str(
+                html_text
+            )
+        )
+
+        parser.close()
+
+        return parser.text()
+
+    except Exception:
+        return ""
+
+
+def extract_message_text(
+    payload
+):
+    """
+    Extract readable email body text.
+
+    Authority order:
+      1. genuine text/plain MIME content;
+      2. visible text converted locally from text/html.
+
+    HTML is a fallback only. This avoids needless markup while supporting
+    senders that publish HTML-only messages.
+    """
+
+    plain = _extract_first_mime_body(
+        payload,
+        "text/plain",
+    )
+
+    plain = clean_email_text(
+        plain
+    ).strip()
+
+    if plain:
+        return (
+            plain,
+            "text/plain",
+        )
+
+    html_body = _extract_first_mime_body(
+        payload,
+        "text/html",
+    )
+
+    html_text = html_to_visible_text(
+        html_body
+    )
+
+    if html_text:
+        return (
+            html_text,
+            "text/html",
+        )
+
+    return (
+        "",
+        None,
+    )
+
+
+def extract_plain_text(
+    payload
+):
+    """
+    Backward-compatible body extractor.
+
+    Historically this returned only text/plain. It now preserves that
+    preference while safely falling back to visible HTML text.
+    """
+
+    text, _ = extract_message_text(
+        payload
+    )
+
+    return text
 
 
 def normalise_message_summary(
@@ -308,8 +636,9 @@ def normalise_full_message(
     """
     Return the contents of one explicitly selected email.
 
-    The body remains size-limited to avoid overwhelming
-    local model context.
+    Plain-text MIME content is preferred. HTML-only messages are converted
+    locally to visible text. The body remains size-limited to avoid
+    overwhelming local model context.
     """
 
     result = normalise_message_summary(
@@ -326,17 +655,23 @@ def normalise_full_message(
         []
     )
 
-    body = clean_email_text(
-        extract_plain_text(
+    body, body_format = (
+        extract_message_text(
             payload
         )
+    )
+
+    body = clean_email_text(
+        body
     ).strip()
 
     MAX_BODY_CHARACTERS = 5000
 
     if len(body) > MAX_BODY_CHARACTERS:
         body = (
-            body[:MAX_BODY_CHARACTERS]
+            body[
+                :MAX_BODY_CHARACTERS
+            ]
             + "..."
         )
 
@@ -348,6 +683,9 @@ def normalise_full_message(
     )
 
     result["body"] = body
+    result["body_format"] = (
+        body_format
+    )
 
     return result
 
@@ -562,6 +900,7 @@ def build_exact_query(
         query_parts
     )
 
+
 def build_loose_query(
     search_text,
     days,
@@ -690,15 +1029,8 @@ def find_emails(
         or before_epoch is not None
     )
 
-    # Exact calendar windows must never silently expand beyond what
-    # Oliver asked for.
     if exact_window:
         expand_search = False
-
-    # --------------------------------------------------
-    # Search 1:
-    # requested period/window + exact phrase
-    # --------------------------------------------------
 
     exact_query = build_exact_query(
         search_text,
@@ -743,11 +1075,6 @@ def find_emails(
         ] = before_epoch
 
         return exact_result
-
-    # --------------------------------------------------
-    # Search 2:
-    # requested period/window + loose keywords
-    # --------------------------------------------------
 
     if search_text:
         print(
@@ -799,10 +1126,6 @@ def find_emails(
 
             return loose_result
 
-    # --------------------------------------------------
-    # Exact-window searches stop here.
-    # --------------------------------------------------
-
     if exact_window:
         return {
             "success": True,
@@ -820,11 +1143,6 @@ def find_emails(
             "after_epoch": after_epoch,
             "before_epoch": before_epoch
         }
-
-    # --------------------------------------------------
-    # Search 3:
-    # optionally expand narrow rolling searches to 30 days
-    # --------------------------------------------------
 
     if (
         expand_search

@@ -74,6 +74,9 @@ from core.temporal_context import (
     build_relative_date_context,
     find_relative_date_weekday_violations,
 )
+from core.email_intent import (
+    is_inbox_attention_request,
+)
 
 from core.source_lock import (
     build_source_lock_instruction,
@@ -1403,43 +1406,6 @@ def explicitly_requires_email_read(
     )
 
 
-def is_inbox_attention_request(
-    user_input
-):
-    """
-    Detect inbox-review requests where Oliver wants Mairon
-    to decide what is important or actionable.
-    """
-
-    text = user_input.lower()
-
-    attention_phrases = [
-        "need my attention",
-        "needs my attention",
-        "need attention",
-        "needs attention",
-        "important emails",
-        "important email",
-        "emails matter",
-        "email matters",
-        "need to act",
-        "needs action",
-        "need action",
-        "action required",
-        "actionable emails",
-        "actionable email",
-        "what should i respond",
-        "what do i need to respond",
-        "inbox brief",
-        "inbox review",
-    ]
-
-    return any(
-        phrase in text
-        for phrase in attention_phrases
-    )
-
-
 def get_inbox_review_days(
     user_input
 ):
@@ -1482,6 +1448,593 @@ def get_inbox_review_days(
         return 30
 
     return 7
+
+
+
+# --------------------------------------------------
+# Deterministic Gmail summary retrieval
+# --------------------------------------------------
+
+EMAIL_SUMMARY_NOUN_PATTERN = re.compile(
+    r"\b(?:emails?|inbox|messages?)\b",
+    flags=re.IGNORECASE,
+)
+
+
+EMAIL_SUMMARY_WRITE_ACTION_PATTERN = re.compile(
+    r"\b(?:send|email|reply|respond|forward|delete|trash|archive|"
+    r"mark\s+as|move|label)\b",
+    flags=re.IGNORECASE,
+)
+
+
+EMAIL_SUMMARY_TARGETED_SEARCH_PATTERN = re.compile(
+    r"\b(?:from|about|regarding|concerning)\s+"
+    r"(?!(?:today|yesterday|this|last|past|previous|recent)\b)\S+",
+    flags=re.IGNORECASE,
+)
+
+
+EMAIL_SUMMARY_REQUEST_PATTERN = re.compile(
+    r"\b(?:"
+    r"what|which|show|list|"
+    r"any|"
+    r"do\s+i\s+have|have\s+i|"
+    r"received|arrived|came\s+in|"
+    r"recent|recently|unread"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+
+EMAIL_SUMMARY_TIME_PATTERN = re.compile(
+    r"\b(?:today|yesterday|recent|recently|unread|"
+    r"this\s+week|last\s+week|past\s+week|"
+    r"this\s+month|last\s+month|past\s+month|"
+    r"(?:last|past|previous)\s+\d+\s+days?)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def is_recent_email_summary_request(
+    user_input
+):
+    """
+    Detect straightforward private-inbox SUMMARY retrieval.
+
+    This is intentionally separate from:
+    - targeted search ("email from Qantas", "email about my order");
+    - body/detail reads ("what did that email say?");
+    - inbox triage ("what needs my attention?");
+    - write actions ("reply", "send", "delete").
+
+    Simple retrieval is Core-owned because Gmail summaries already contain
+    the authoritative sender/subject/time/read-state facts. There is no reason
+    to ask Qwen to decide whether Gmail should be used.
+    """
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        str(
+            user_input
+            or ""
+        ).strip(),
+    )
+
+    if not text:
+        return False
+
+    if not EMAIL_SUMMARY_NOUN_PATTERN.search(
+        text
+    ):
+        return False
+
+    if EMAIL_SUMMARY_WRITE_ACTION_PATTERN.search(
+        text
+    ):
+        return False
+
+    if is_inbox_attention_request(
+        text
+    ):
+        return False
+
+    if explicitly_requires_email_read(
+        text
+    ):
+        return False
+
+    # Targeted entity/topic searches belong to find_emails' normal constrained
+    # search workflow rather than the broad inbox-list workflow.
+    if EMAIL_SUMMARY_TARGETED_SEARCH_PATTERN.search(
+        text
+    ):
+        return False
+
+    # Normal request language.
+    if EMAIL_SUMMARY_REQUEST_PATTERN.search(
+        text
+    ):
+        return True
+
+    # Terse natural requests such as "emails today" / "unread inbox".
+    return bool(
+        EMAIL_SUMMARY_TIME_PATTERN.search(
+            text
+        )
+    )
+
+
+def _local_midnight(
+    date_value
+):
+    return datetime(
+        date_value.year,
+        date_value.month,
+        date_value.day,
+        tzinfo=LOCAL_TIMEZONE,
+    )
+
+
+def resolve_email_summary_window(
+    user_input,
+    now=None,
+):
+    """
+    Resolve a private-inbox summary window in Core.
+
+    Exact calendar windows use local midnight epoch bounds and find_emails().
+    Rolling windows use get_recent_emails().
+
+    Qwen never decides what "today" or "yesterday" means.
+    """
+
+    current = (
+        now
+        if now is not None
+        else datetime.now(
+            LOCAL_TIMEZONE
+        )
+    )
+
+    if current.tzinfo is None:
+        current = current.replace(
+            tzinfo=LOCAL_TIMEZONE
+        )
+
+    current = current.astimezone(
+        LOCAL_TIMEZONE
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        str(
+            user_input
+            or ""
+        ).lower().strip(),
+    )
+
+    today = current.date()
+
+    unread_only = bool(
+        re.search(
+            r"\bunread\b",
+            text,
+        )
+    )
+
+    def exact_window(
+        start_date,
+        end_date,
+        label,
+    ):
+        start = _local_midnight(
+            start_date
+        )
+
+        end = _local_midnight(
+            end_date
+        )
+
+        return {
+            "mode": "exact",
+            "label": label,
+            "after_epoch": int(
+                start.timestamp()
+            ),
+            "before_epoch": int(
+                end.timestamp()
+            ),
+            "unread_only": unread_only,
+        }
+
+    if re.search(
+        r"\byesterday\b",
+        text,
+    ):
+        target = (
+            today
+            - timedelta(
+                days=1
+            )
+        )
+
+        return exact_window(
+            target,
+            today,
+            "yesterday",
+        )
+
+    if re.search(
+        r"\btoday\b",
+        text,
+    ):
+        return exact_window(
+            today,
+            today
+            + timedelta(
+                days=1
+            ),
+            "today",
+        )
+
+    if re.search(
+        r"\bthis\s+week\b",
+        text,
+    ):
+        start = (
+            today
+            - timedelta(
+                days=today.weekday()
+            )
+        )
+
+        return exact_window(
+            start,
+            today
+            + timedelta(
+                days=1
+            ),
+            "this week",
+        )
+
+    if re.search(
+        r"\b(?:last|past)\s+week\b",
+        text,
+    ):
+        this_week_start = (
+            today
+            - timedelta(
+                days=today.weekday()
+            )
+        )
+
+        last_week_start = (
+            this_week_start
+            - timedelta(
+                days=7
+            )
+        )
+
+        return exact_window(
+            last_week_start,
+            this_week_start,
+            "last week",
+        )
+
+    match = re.search(
+        r"\b(?:last|past|previous)\s+(\d+)\s+days?\b",
+        text,
+    )
+
+    if match:
+        days = max(
+            1,
+            min(
+                int(
+                    match.group(1)
+                ),
+                90,
+            ),
+        )
+
+        return {
+            "mode": "rolling",
+            "label": (
+                f"the last {days} day"
+                + (
+                    ""
+                    if days == 1
+                    else "s"
+                )
+            ),
+            "days": days,
+            "unread_only": unread_only,
+        }
+
+    if re.search(
+        r"\b(?:last|past)\s+month\b",
+        text,
+    ):
+        return {
+            "mode": "rolling",
+            "label": "the last 30 days",
+            "days": 30,
+            "unread_only": unread_only,
+        }
+
+    # "recent", "recently", bare "unread emails", or a bare request such as
+    # "what emails have I received?" use a conservative seven-day window.
+    return {
+        "mode": "rolling",
+        "label": "the last 7 days",
+        "days": 7,
+        "unread_only": unread_only,
+    }
+
+
+def _format_email_summary_time(
+    email,
+):
+    raw_ms = email.get(
+        "internal_date_ms"
+    )
+
+    try:
+        value = int(
+            raw_ms
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    local_time = datetime.fromtimestamp(
+        value / 1000,
+        tz=LOCAL_TIMEZONE,
+    )
+
+    return local_time.strftime(
+        "%-I:%M %p"
+        if os.name != "nt"
+        else "%I:%M %p"
+    ).lstrip(
+        "0"
+    )
+
+
+def format_recent_email_summary(
+    result,
+    window,
+):
+    """
+    Deterministically render Gmail metadata.
+
+    No model rewriting is required for a straightforward inbox listing.
+    """
+
+    if not result.get(
+        "success"
+    ):
+        return (
+            "I couldn't read your Gmail summaries because Gmail returned an error: "
+            + str(
+                result.get(
+                    "message",
+                    "unknown Gmail error",
+                )
+            )
+        )
+
+    emails = list(
+        result.get(
+            "emails",
+            []
+        )
+        or []
+    )
+
+    label = str(
+        window.get(
+            "label",
+            "recently",
+        )
+    )
+
+    unread_only = bool(
+        window.get(
+            "unread_only"
+        )
+    )
+
+    if not emails:
+        if unread_only:
+            return (
+                f"You don't have any unread emails {label}."
+            )
+
+        return (
+            f"You haven't received any emails {label}."
+        )
+
+    emails.sort(
+        key=lambda email: (
+            int(
+                email.get(
+                    "internal_date_ms",
+                    0,
+                )
+                or 0
+            )
+        ),
+        reverse=True,
+    )
+
+    count = len(
+        emails
+    )
+
+    noun = (
+        "email"
+        if count == 1
+        else "emails"
+    )
+
+    if count >= 20:
+        heading = (
+            f"Here are the {count} most recent {noun} I found {label}:"
+        )
+
+    else:
+        heading = (
+            f"You received {count} {noun} {label}:"
+        )
+
+    lines = [
+        heading
+    ]
+
+    for email in emails:
+        sender = str(
+            email.get(
+                "from"
+            )
+            or "Unknown sender"
+        ).strip()
+
+        subject = str(
+            email.get(
+                "subject"
+            )
+            or "(No subject)"
+        ).strip()
+
+        time_label = (
+            _format_email_summary_time(
+                email
+            )
+        )
+
+        unread_marker = (
+            " [unread]"
+            if email.get(
+                "unread"
+            )
+            else ""
+        )
+
+        if time_label:
+            lines.append(
+                f"- {time_label} — {sender} — {subject}{unread_marker}"
+            )
+
+        else:
+            lines.append(
+                f"- {sender} — {subject}{unread_marker}"
+            )
+
+    return "\n".join(
+        lines
+    )
+
+
+def handle_recent_email_summary_request(
+    user_input,
+    conversation,
+):
+    """
+    Deterministic read-only Gmail summary workflow.
+
+    Core decides the private data source and exact time window. Qwen is not
+    involved because the requested output is already present in structured
+    Gmail metadata.
+    """
+
+    window = resolve_email_summary_window(
+        user_input
+    )
+
+    if window[
+        "mode"
+    ] == "exact":
+        print(
+            "[Core] Gmail summary: exact local calendar window."
+        )
+
+        print(
+            "[Tool] Mairon Core required: find_emails"
+        )
+
+        result = execute_tool(
+            "find_emails",
+            {
+                "search_text": "",
+                "days": 1,
+                "unread_only": window[
+                    "unread_only"
+                ],
+                "max_results": 20,
+                "after_epoch": window[
+                    "after_epoch"
+                ],
+                "before_epoch": window[
+                    "before_epoch"
+                ],
+                "expand_search": False,
+            },
+        )
+
+    else:
+        print(
+            "[Core] Gmail summary: rolling recent-email window."
+        )
+
+        print(
+            "[Tool] Mairon Core required: get_recent_emails"
+        )
+
+        result = execute_tool(
+            "get_recent_emails",
+            {
+                "days": window[
+                    "days"
+                ],
+                "max_results": 20,
+                "unread_only": window[
+                    "unread_only"
+                ],
+            },
+        )
+
+    answer = format_recent_email_summary(
+        result=result,
+        window=window,
+    )
+
+    working_conversation = list(
+        conversation
+    )
+
+    working_conversation.append({
+        "role": "user",
+        "content": user_input,
+    })
+
+    working_conversation.append({
+        "role": "assistant",
+        "content": answer,
+    })
+
+    return (
+        answer,
+        working_conversation,
+        None,
+        None,
+    )
 
 
 # --------------------------------------------------
@@ -4457,11 +5010,15 @@ def finalise_inbox_review(
     """
     Finish inbox triage with tools completely removed.
 
-    Internal workflow limits and tool mechanics must never
-    appear in the user-facing answer.
+    Empty model output is invalid here just as it is in the general tool loop.
+    A blank specialised-workflow response is retried rather than surfaced.
     """
 
-    working_conversation.append({
+    base_messages = list(
+        working_conversation
+    )
+
+    base_messages.append({
         "role": "system",
         "content": (
             "Produce the final inbox-attention brief now. "
@@ -4486,20 +5043,77 @@ def finalise_inbox_review(
         )
     })
 
-    final_response = client.chat(
-        model=get_local_model_name(),
-        messages=working_conversation
+    messages = list(
+        base_messages
     )
 
-    working_conversation.append(
-        final_response.message
+    for attempt in range(
+        3
+    ):
+        final_response = client.chat(
+            model=get_local_model_name(),
+            messages=messages,
+        )
+
+        content = str(
+            final_response.message.content
+            or ""
+        ).strip()
+
+        if content:
+            working_conversation.extend(
+                messages[
+                    len(
+                        working_conversation
+                    ):
+                ]
+            )
+
+            working_conversation.append(
+                final_response.message
+            )
+
+            return (
+                content,
+                working_conversation,
+                None,
+                None,
+            )
+
+        if attempt < 2:
+            print(
+                "[Core] Empty inbox-review response rejected; retrying."
+            )
+
+            messages.append(
+                final_response.message
+            )
+
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Your previous inbox-review response was empty. "
+                    "That is invalid. Produce a concise non-empty final "
+                    "brief using the supplied Gmail evidence."
+                ),
+            })
+
+    fallback = (
+        "I checked the inbox review data, but the local model repeatedly "
+        "returned an empty brief. I rejected the empty responses rather "
+        "than pretending the review was complete."
     )
+
+    working_conversation.append({
+        "role": "assistant",
+        "content": fallback,
+    })
 
     return (
-        final_response.message.content,
+        fallback,
         working_conversation,
         None,
-        None
+        None,
     )
 
 
@@ -4507,42 +5121,368 @@ def finalise_inbox_review(
 # Deterministic inbox-attention workflow
 # --------------------------------------------------
 
+def _build_inbox_triage_items(
+    emails,
+):
+    """
+    Build the minimum evidence required for attention classification.
+
+    Arrival timestamps/dates are intentionally omitted because they are not
+    relevant to the judgement and letting the model paraphrase them created
+    false claims such as "early this morning" and "last night".
+    """
+
+    items = []
+
+    for index, email in enumerate(
+        list(
+            emails
+            or []
+        ),
+        start=1,
+    ):
+        items.append({
+            "index": index,
+            "sender": str(
+                email.get(
+                    "from"
+                )
+                or "Unknown sender"
+            ).strip(),
+            "subject": str(
+                email.get(
+                    "subject"
+                )
+                or "(No subject)"
+            ).strip(),
+            "snippet": str(
+                email.get(
+                    "snippet"
+                )
+                or ""
+            ).strip(),
+            "unread": bool(
+                email.get(
+                    "unread"
+                )
+            ),
+        })
+
+    return items
+
+
+def _parse_inbox_triage_classification(
+    content,
+    expected_count,
+):
+    """
+    Parse the model's bounded judgement output.
+
+    Qwen may choose categories. Core owns message identity, sender/subject
+    rendering, counts, and final answer structure.
+    """
+
+    text = str(
+        content
+        or ""
+    ).strip()
+
+    if not text:
+        return None
+
+    # Accept a fenced JSON object without accepting arbitrary prose around it.
+    if text.startswith("```"):
+        text = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        text = re.sub(
+            r"\s*```$",
+            "",
+            text,
+        ).strip()
+
+    try:
+        payload = json.loads(
+            text
+        )
+
+    except Exception:
+        return None
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        return None
+
+    raw_items = payload.get(
+        "items"
+    )
+
+    if not isinstance(
+        raw_items,
+        list,
+    ):
+        return None
+
+    categories = {}
+    allowed = {
+        "ACTION",
+        "FYI",
+        "IGNORE",
+    }
+
+    for item in raw_items:
+        if not isinstance(
+            item,
+            dict,
+        ):
+            return None
+
+        try:
+            index = int(
+                item.get(
+                    "index"
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+        category = str(
+            item.get(
+                "category"
+            )
+            or ""
+        ).strip().upper()
+
+        aliases = {
+            "ACTION NEEDED": "ACTION",
+            "ACTION_NEEDED": "ACTION",
+            "INFORMATIONAL": "FYI",
+            "INFO": "FYI",
+            "NOISE": "IGNORE",
+        }
+
+        category = aliases.get(
+            category,
+            category,
+        )
+
+        if (
+            index < 1
+            or index > expected_count
+            or category not in allowed
+            or index in categories
+        ):
+            return None
+
+        categories[
+            index
+        ] = category
+
+    if set(
+        categories
+    ) != set(
+        range(
+            1,
+            expected_count + 1,
+        )
+    ):
+        return None
+
+    return categories
+
+
+def _format_inbox_triage_answer(
+    items,
+    categories,
+    window_label,
+):
+    """
+    Deterministically render the classification.
+
+    The model cannot rename emails, alter senders, invent arrival times,
+    miscount ACTION items, or change section semantics.
+    """
+
+    groups = {
+        "ACTION": [],
+        "FYI": [],
+        "IGNORE": [],
+    }
+
+    for item in items:
+        category = categories[
+            item[
+                "index"
+            ]
+        ]
+
+        groups[
+            category
+        ].append(
+            item
+        )
+
+    lines = []
+
+    action_count = len(
+        groups[
+            "ACTION"
+        ]
+    )
+
+    if action_count == 0:
+        lines.append(
+            "Nothing in your inbox "
+            + str(
+                window_label
+            )
+            + " appears to require action based on the sender, subject and snippet."
+        )
+
+    else:
+        noun = (
+            "email"
+            if action_count == 1
+            else "emails"
+        )
+
+        lines.append(
+            f"{action_count} {noun} "
+            + (
+                "looks"
+                if action_count == 1
+                else "look"
+            )
+            + " actionable based on the sender, subject and snippet."
+        )
+
+    def append_group(
+        heading,
+        group,
+    ):
+        if not group:
+            return
+
+        if lines:
+            lines.append(
+                ""
+            )
+
+        lines.append(
+            f"{heading}:"
+        )
+
+        for item in group:
+            lines.append(
+                "- "
+                + item[
+                    "subject"
+                ]
+                + " — "
+                + item[
+                    "sender"
+                ]
+            )
+
+    append_group(
+        "ACTION NEEDED",
+        groups[
+            "ACTION"
+        ],
+    )
+
+    append_group(
+        "FYI",
+        groups[
+            "FYI"
+        ],
+    )
+
+    append_group(
+        "IGNORE",
+        groups[
+            "IGNORE"
+        ],
+    )
+
+    return "\n".join(
+        lines
+    )
+
+
 def handle_inbox_attention_request(
     client,
     user_input,
     conversation
 ):
     """
-    Run inbox triage as a constrained local workflow.
+    One-pass bounded inbox triage.
 
-    Core fetches the requested email window once.
-
-    Qwen may inspect only specific matching emails and may
-    never wander into weather, web search, memory, routes,
-    Calendar, or other unrelated capabilities.
+    Core owns Gmail retrieval and all factual rendering. Qwen receives only a
+    numbered minimal evidence packet and returns category labels in JSON.
     """
 
-    days = get_inbox_review_days(
+    window = resolve_email_summary_window(
         user_input
     )
 
-    print(
-        "[Core] Inbox review: fetching read and unread "
-        f"email from the last {days} day(s)."
-    )
+    if window[
+        "mode"
+    ] == "exact":
+        print(
+            "[Core] Inbox review: exact local calendar window."
+        )
 
-    print(
-        "[Tool] Mairon Core required: get_recent_emails"
-    )
+        print(
+            "[Tool] Mairon Core required: find_emails"
+        )
 
-    inbox_result = execute_tool(
-        "get_recent_emails",
-        {
-            "days": days,
-            "max_results": 20,
-            "unread_only": False
-        }
-    )
+        inbox_result = execute_tool(
+            "find_emails",
+            {
+                "search_text": "",
+                "days": 1,
+                "max_results": 20,
+                "unread_only": False,
+                "after_epoch": window[
+                    "after_epoch"
+                ],
+                "before_epoch": window[
+                    "before_epoch"
+                ],
+                "expand_search": False,
+            },
+        )
+
+    else:
+        print(
+            "[Core] Inbox review: rolling recent-email window."
+        )
+
+        print(
+            "[Tool] Mairon Core required: get_recent_emails"
+        )
+
+        inbox_result = execute_tool(
+            "get_recent_emails",
+            {
+                "days": window[
+                    "days"
+                ],
+                "max_results": 20,
+                "unread_only": False,
+            },
+        )
 
     working_conversation = list(
         conversation
@@ -4550,12 +5490,12 @@ def handle_inbox_attention_request(
 
     working_conversation.append({
         "role": "system",
-        "content": get_runtime_context()
+        "content": get_runtime_context(),
     })
 
     working_conversation.append({
         "role": "user",
-        "content": user_input
+        "content": user_input,
     })
 
     if not inbox_result.get(
@@ -4573,274 +5513,167 @@ def handle_inbox_attention_request(
 
         working_conversation.append({
             "role": "assistant",
-            "content": answer
+            "content": answer,
         })
 
         return (
             answer,
             working_conversation,
             None,
-            None
+            None,
         )
 
-    emails = inbox_result.get(
-        "emails",
-        []
+    emails = list(
+        inbox_result.get(
+            "emails",
+            [],
+        )
+        or []
     )
 
     if not emails:
         answer = (
-            f"You don't have any emails in the last {days} "
-            "day(s) in that review window."
+            "You don't have any emails "
+            + str(
+                window.get(
+                    "label",
+                    "in that review window",
+                )
+            )
+            + "."
         )
 
         working_conversation.append({
             "role": "assistant",
-            "content": answer
+            "content": answer,
         })
 
         return (
             answer,
             working_conversation,
             None,
-            None
+            None,
         )
 
-    valid_message_ids = {
-        email.get("message_id")
-        for email in emails
-        if email.get("message_id")
-    }
-
-    working_conversation.append({
-        "role": "system",
-        "content": (
-            "You are performing a private local inbox-attention review for Oliver. "
-            "Stay strictly on the inbox task. "
-
-            "The email summaries below were fetched from Gmail by Mairon Core "
-            "and include both read and unread messages. "
-            "Read status is not the same as importance.\n\n"
-
-            "Classify messages using these rules:\n"
-
-            "- ACTION NEEDED: Oliver genuinely needs to do something, reply, "
-            "pay, submit, fix, confirm, attend, investigate, or make a decision.\n"
-
-            "- FYI: useful information worth knowing, but no action is currently required.\n"
-
-            "- IGNORE: ordinary marketing, promotions, newsletters, surveys, "
-            "sales, or noise.\n\n"
-
-            "Use sender, subject, date, and snippet first. "
-            "Most messages should be classifiable from those summaries alone. "
-
-            "Only use read_email when a message appears potentially important "
-            "but the summary genuinely does not contain enough information to "
-            "decide whether Oliver should act. "
-
-            "Do not read promotional emails merely to inspect them. "
-            "Do not search memory. "
-            "Do not discuss Unicode or formatting. "
-            "Do not discuss tools or implementation. "
-            "Do not drift into unrelated topics. "
-
-            "Security notifications such as sign-ins, password resets, "
-            "account changes, OAuth authorizations, or recovery events should "
-            "generally be surfaced if Oliver may need to verify that he initiated them. "
-
-            "Keep the eventual final answer concise and useful.\n\n"
-
-            "EMAIL SUMMARIES:\n"
-            f"{json.dumps(emails, ensure_ascii=False)}"
-        )
-    })
-
-    available_tools = (
-        [READ_EMAIL_ONLY_TOOL]
-        if READ_EMAIL_ONLY_TOOL
-        else []
+    items = _build_inbox_triage_items(
+        emails
     )
 
-    read_count = 0
-    read_cache = {}
+    review_messages = (
+        get_isolated_system_context(
+            conversation
+        )
+    )
 
-    # --------------------------------------------------
-    # Allow a few focused inspection rounds
-    # --------------------------------------------------
+    review_messages.append({
+        "role": "system",
+        "content": get_runtime_context(),
+    })
 
-    for _ in range(6):
+    review_messages.append({
+        "role": "system",
+        "content": (
+            "You are performing ONE bounded inbox-attention classification. "
+            "The JSON data below is authoritative Gmail summary evidence.\n\n"
 
-        # Once the inspection budget is used, immediately
-        # remove tools and force a normal final answer.
-        if read_count >= MAX_INBOX_READS:
-            return finalise_inbox_review(
-                client,
-                working_conversation
+            "Categories:\n"
+            "ACTION = the summary shows Oliver genuinely needs to reply, pay, "
+            "submit, fix, confirm, attend, investigate, verify, or make a decision.\n"
+            "FYI = useful information worth knowing, but no action is apparent.\n"
+            "IGNORE = ordinary marketing, promotions, newsletters, surveys, "
+            "recommendation blasts, sales, or low-priority noise.\n\n"
+
+            "Unread status is not importance. A security/account event may be "
+            "ACTION when the summary indicates Oliver should verify it.\n\n"
+
+            "Use ONLY sender, subject and snippet. Do not infer body contents. "
+            "Do not reason about arrival date/time; timestamps are intentionally "
+            "not supplied because they are irrelevant to this classification.\n\n"
+
+            "Return ONLY valid JSON in this exact shape:\n"
+            '{"items":[{"index":1,"category":"ACTION"}]}\n'
+            "Include every supplied index exactly once. Category must be exactly "
+            "ACTION, FYI, or IGNORE. No prose, markdown, reasons, or extra keys.\n\n"
+
+            "CORE-VERIFIED ITEMS:\n"
+            + json.dumps(
+                items,
+                ensure_ascii=False,
             )
+        ),
+    })
 
-        if available_tools:
-            response = client.chat(
-                model=get_local_model_name(),
-                messages=working_conversation,
-                tools=available_tools
-            )
+    categories = None
 
-        else:
-            response = client.chat(
-                model=get_local_model_name(),
-                messages=working_conversation
-            )
-
-        tool_calls = (
-            response.message.tool_calls
-            or []
+    for attempt in range(
+        2
+    ):
+        response = client.chat(
+            model=get_local_model_name(),
+            messages=review_messages,
+            think=False,
         )
 
-        # Qwen has finished inspecting messages.
-        #
-        # Do not return its intermediate response directly.
-        # Force one final tool-free pass so it returns to
-        # Oliver's ORIGINAL inbox-review request and
-        # considers all email summaries, not merely the
-        # last message it inspected.
-        if not tool_calls:
-            working_conversation.append(
-                response.message
-            )
+        content = str(
+            response.message.content
+            or ""
+        ).strip()
 
-            return finalise_inbox_review(
-                client,
-                working_conversation
+        categories = (
+            _parse_inbox_triage_classification(
+                content=content,
+                expected_count=len(
+                    items
+                ),
             )
-
-        working_conversation.append(
-            response.message
         )
 
-        for tool_call in tool_calls:
-            tool_name = (
-                tool_call.function.name
-            )
+        if categories is not None:
+            break
 
-            arguments = normalise_tool_arguments(
-                tool_call.function.arguments
-            )
-
-            if tool_name != "read_email":
-                working_conversation.append({
-                    "role": "tool",
-                    "tool_name": tool_name,
-                    "content": json.dumps({
-                        "success": False,
-                        "message": (
-                            "That capability is not available "
-                            "during inbox review."
-                        )
-                    })
-                })
-
-                continue
-
-            message_id = (
-                arguments.get(
-                    "message_id"
-                )
-                or ""
-            ).strip()
-
-            if message_id not in valid_message_ids:
-                working_conversation.append({
-                    "role": "tool",
-                    "tool_name": "read_email",
-                    "content": json.dumps({
-                        "success": False,
-                        "message": (
-                            "That message is not part of the "
-                            "current inbox review."
-                        )
-                    })
-                })
-
-                continue
-
-            # Re-reading an already inspected message does
-            # not consume another inspection.
-            if message_id in read_cache:
-                read_result = read_cache[
-                    message_id
-                ]
-
-                working_conversation.append({
-                    "role": "tool",
-                    "tool_name": "read_email",
-                    "content": json.dumps(
-                        read_result,
-                        ensure_ascii=False
-                    )
-                })
-
-                continue
-
-            # If Qwen requested several reads in one model
-            # response, satisfy only those that fit within
-            # the review's private inspection budget.
-            if read_count >= MAX_INBOX_READS:
-                working_conversation.append({
-                    "role": "tool",
-                    "tool_name": "read_email",
-                    "content": json.dumps({
-                        "success": False,
-                        "message": (
-                            "This message was not expanded. "
-                            "Use its existing sender, subject, "
-                            "date, and snippet when completing "
-                            "the inbox review."
-                        )
-                    })
-                })
-
-                continue
-
+        if attempt == 0:
             print(
-                "[Tool] Mairon requested: read_email"
+                "[Core] Invalid inbox classification rejected; retrying once."
             )
 
-            read_result = execute_tool(
-                "read_email",
-                {
-                    "message_id": message_id
-                }
-            )
-
-            read_cache[
-                message_id
-            ] = read_result
-
-            read_count += 1
-
-            working_conversation.append({
-                "role": "tool",
-                "tool_name": "read_email",
-                "content": json.dumps(
-                    read_result,
-                    ensure_ascii=False
-                )
+            review_messages.append({
+                "role": "system",
+                "content": (
+                    "Your previous output was invalid. Return ONLY the required "
+                    "JSON classification object. Include every item exactly once."
+                ),
             })
 
-        # If that batch used the remaining reads, don't
-        # expose another tool-enabled round to Qwen.
-        if read_count >= MAX_INBOX_READS:
-            return finalise_inbox_review(
-                client,
-                working_conversation
-            )
+    if categories is None:
+        answer = (
+            "I retrieved the inbox summaries, but the local model failed to "
+            "return a valid classification twice. I rejected the malformed output."
+        )
 
-    # If Qwen somehow loops without finishing, Core ends
-    # the workflow cleanly rather than exposing internals.
-    return finalise_inbox_review(
-        client,
-        working_conversation
+    else:
+        answer = (
+            _format_inbox_triage_answer(
+                items=items,
+                categories=categories,
+                window_label=str(
+                    window.get(
+                        "label",
+                        "in that review window",
+                    )
+                ),
+            )
+        )
+
+    working_conversation.append({
+        "role": "assistant",
+        "content": answer,
+    })
+
+    return (
+        answer,
+        working_conversation,
+        None,
+        None,
     )
 
 
@@ -5620,6 +6453,206 @@ def find_core_micro_act_relevance_violations(
         )
 
     return violations
+
+
+
+def _sentence_contains_unattributed_direct_recommendation(
+    sentence,
+):
+    """
+    Detect direct advice from Mairon while avoiding source-attributed advice.
+
+    When Core forbids recommendations, Mairon may still REPORT that an
+    authoritative source told Oliver to do something:
+
+        "The email says you should verify your account."
+
+    That is source content, not Mairon's own recommendation.
+
+    By contrast:
+
+        "You should probably click the link."
+        "It's not urgent, but you should check it anyway."
+
+    are Mairon recommendations and violate the structured Answer Contract.
+    """
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        str(
+            sentence
+            or ""
+        ).strip(),
+    )
+
+    if not text:
+        return False
+
+    # Markdown emphasis must not be able to bypass the policy check:
+    #   "you *should* check" == "you should check"
+    text = re.sub(
+        r"[*_~`]+",
+        "",
+        text,
+    )
+
+    lowered = text.lower()
+
+    recommendation_patterns = (
+        r"(?:^|[,;:]\s*|\bbut\s+|\bso\s+|\bthough\s+|\balthough\s+|\bhowever\s+)"
+        r"you\s+(?:really\s+|probably\s+|definitely\s+)?should\b",
+
+        r"(?:^|[,;:]\s*|\bbut\s+|\bso\s+)"
+        r"you(?:'d|\s+would)\s+be\s+better\s+off\b",
+
+        r"(?:^|[,;:]\s*)"
+        r"(?:i\s+recommend|i(?:'d|\s+would)\s+recommend|"
+        r"i\s+suggest|i(?:'d|\s+would)\s+suggest)\b",
+
+        r"^\s*(?:probably\s+)?(?:best|better)\s+to\b",
+
+        r"^\s*(?:you\s+may\s+want\s+to|you\s+might\s+want\s+to)\b",
+
+        r"^\s*(?:consider|make\s+sure|go\s+ahead\s+and)\b",
+
+        # Bare imperative advice. These are general assistant-action verbs,
+        # not Gmail/domain-specific terms. They catch constructions such as:
+        #   "Read the policy page or ignore it."
+        #   "Check the settings before Sunday."
+        #
+        # The prefix allowance covers a sentence fragment after a dash/colon
+        # while source-attribution checks below still permit:
+        #   "The email says: review the changes."
+        r"(?:^|[-–—:;]\s*)"
+        r"(?:read|check|review|click|open|ignore|reply|respond|send|pay|"
+        r"submit|confirm|verify|change|update|contact|call|wait|keep|"
+        r"delete|archive|save|download|visit|follow|use)\b",
+    )
+
+    match = None
+
+    for pattern in recommendation_patterns:
+        match = re.search(
+            pattern,
+            lowered,
+            flags=re.IGNORECASE,
+        )
+
+        if match:
+            break
+
+    if not match:
+        return False
+
+    prefix = lowered[
+        :match.start()
+    ]
+
+    # Reported source instructions are allowed. The recommendation belongs to
+    # the source, not to Mairon.
+    source_attribution_markers = (
+        "the email says",
+        "the email said",
+        "the message says",
+        "the message said",
+        "it says",
+        "it said",
+        "paypal says",
+        "paypal said",
+        "they say",
+        "they said",
+        "the sender says",
+        "the sender said",
+        "asks you to",
+        "asked you to",
+        "tells you to",
+        "told you to",
+        "requires you to",
+        "required you to",
+        "instructs you to",
+        "instructed you to",
+        "the email:",
+        "the message:",
+        "the sender:",
+    )
+
+    if any(
+        marker in prefix
+        for marker in source_attribution_markers
+    ):
+        return False
+
+    return True
+
+
+def find_forbidden_recommendation_violations(
+    response_text,
+    core_answer_contract,
+):
+    """
+    Enforce the structured `Recommendations allowed` permission.
+
+    This is intentionally domain-independent. A Core contract that says
+    recommendations are forbidden must not rely on the model merely noticing
+    prose instructions inside the rendered contract.
+    """
+
+    if not core_answer_contract:
+        return []
+
+    allowed = _core_contract_value(
+        core_answer_contract,
+        "Recommendations allowed",
+    )
+
+    if (
+        str(
+            allowed
+            or ""
+        ).strip().lower()
+        != "false"
+    ):
+        return []
+
+    text = str(
+        response_text
+        or ""
+    ).strip()
+
+    if not text:
+        return []
+
+    # Split on normal sentence boundaries and also treat list bullets/newlines
+    # as independent advice units.
+    units = []
+
+    for line in text.splitlines():
+        cleaned = re.sub(
+            r"^\s*(?:[-*•]|\d+[.)])\s*",
+            "",
+            line,
+        ).strip()
+
+        if not cleaned:
+            continue
+
+        units.extend(
+            re.split(
+                r"(?<=[.!?])\s+",
+                cleaned,
+            )
+        )
+
+    for unit in units:
+        if _sentence_contains_unattributed_direct_recommendation(
+            unit
+        ):
+            return [
+                "current Core contract forbids unsolicited recommendations"
+            ]
+
+    return []
 
 
 def find_core_answer_contract_violations(
@@ -7060,6 +8093,13 @@ def handle_direct_conversation(
         )
 
         violations.extend(
+            find_forbidden_recommendation_violations(
+                response_text=draft_text,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
+        violations.extend(
             find_core_micro_act_relevance_violations(
                 response_text=draft_text,
                 user_input=user_input,
@@ -7471,6 +8511,19 @@ def get_response(
         )
 
     # --------------------------------------------------
+    # Straightforward Gmail summary retrieval is Core-owned.
+    # Do not ask Qwen whether it should use private Gmail.
+    # --------------------------------------------------
+
+    if is_recent_email_summary_request(
+        user_input
+    ):
+        return handle_recent_email_summary_request(
+            user_input=user_input,
+            conversation=conversation,
+        )
+
+    # --------------------------------------------------
     # Overall day questions combine routine + Calendar.
     # --------------------------------------------------
 
@@ -7481,6 +8534,29 @@ def get_response(
             client,
             user_input,
             conversation
+        )
+
+    # --------------------------------------------------
+    # Core-verified Gmail body reads are tool-free at the language layer.
+    #
+    # Core has already selected and read the exact message and placed the
+    # verified body inside the Answer Contract. Qwen's only job here is to
+    # summarise/explain that supplied evidence; it must not search Gmail again.
+    # --------------------------------------------------
+
+    if (
+        _core_contract_value(
+            core_answer_contract,
+            "Intent",
+        )
+        == "email_read"
+    ):
+        return handle_direct_conversation(
+            client=client,
+            user_input=user_input,
+            conversation=conversation,
+            allow_cloud_escalation=allow_cloud_escalation,
+            core_answer_contract=core_answer_contract,
         )
 
     # --------------------------------------------------
@@ -7566,6 +8642,12 @@ def get_response(
 
     email_read_reminder_sent = False
     core_email_read_performed = False
+
+    # A tool-capable model turn is never allowed to silently finish with an
+    # empty user-visible answer. Empty output gets a focused retry; repeated
+    # emptiness fails closed with a real message instead of printing nothing.
+    empty_final_retries = 0
+    max_empty_final_retries = 2
 
     tool_rounds = 0
 
@@ -7696,6 +8778,57 @@ def get_response(
         # --------------------------------------------------
 
         if not tool_calls:
+
+            response_content = str(
+                response.message.content
+                or ""
+            ).strip()
+
+            if not response_content:
+                empty_final_retries += 1
+
+                working_conversation.append(
+                    response.message
+                )
+
+                if (
+                    empty_final_retries
+                    <= max_empty_final_retries
+                ):
+                    print(
+                        "[Core] Empty tool-loop response rejected; retrying."
+                    )
+
+                    working_conversation.append({
+                        "role": "system",
+                        "content": (
+                            "Your previous response contained no user-visible answer "
+                            "and no tool call. That is invalid. Complete Oliver's "
+                            "original request now. If authoritative external/private "
+                            "data is required, call the appropriate available tool. "
+                            "Otherwise provide a non-empty final answer."
+                        ),
+                    })
+
+                    continue
+
+                fallback = (
+                    "I couldn't produce a usable answer for that request. "
+                    "I rejected repeated empty model responses rather than "
+                    "pretending the request was completed."
+                )
+
+                working_conversation.append({
+                    "role": "assistant",
+                    "content": fallback,
+                })
+
+                return (
+                    fallback,
+                    working_conversation,
+                    None,
+                    None,
+                )
 
             # ==============================================
             # Webpage read enforcement
