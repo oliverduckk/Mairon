@@ -4,7 +4,6 @@ import glob
 import os
 import shutil
 import subprocess
-from urllib.parse import urlencode
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -12,6 +11,11 @@ from typing import Dict, List, Optional, Set
 from core.desktop_catalog import (
     desktop_display_name,
     get_desktop_target,
+)
+from core.web_catalog import (
+    build_trusted_site_url,
+    get_trusted_site,
+    trusted_site_display_name,
 )
 
 
@@ -224,32 +228,51 @@ def _launch_folder(
 
 
 
-def open_chrome_search(
-    query: str,
+def open_chrome_trusted_site(
+    site_id: str,
+    query: Optional[str] = None,
 ) -> dict:
     """
-    Open an explicit Google search in Chrome.
+    Open one Core-approved trusted site in Chrome.
 
-    Query text is URL-encoded as data and never becomes shell text.
+    site_id must exist in core.web_catalog. Query text is URL-encoded by the
+    Core-owned catalogue and can never replace the selected scheme/host/path.
     """
 
     if os.name != "nt":
         return _windows_only_error()
 
-    value = str(
-        query
+    site_id = str(
+        site_id
         or ""
-    ).strip()
+    ).strip().lower()
 
-    if (
-        not value
-        or len(
-            value
-        ) > 500
-    ):
+    site = get_trusted_site(
+        site_id
+    )
+
+    if site is None:
         return {
             "success": False,
-            "message": "That search query is empty or too long.",
+            "status": "untrusted_site",
+            "message": (
+                "That website is not in Mairon's trusted browser catalogue."
+            ),
+        }
+
+    url = build_trusted_site_url(
+        site_id=site_id,
+        query=query,
+    )
+
+    if not url:
+        return {
+            "success": False,
+            "status": "unsupported_site_action",
+            "message": (
+                f"{trusted_site_display_name(site_id)} does not support "
+                "that browser action."
+            ),
         }
 
     chrome = _find_chrome()
@@ -257,17 +280,11 @@ def open_chrome_search(
     if not chrome:
         return {
             "success": False,
+            "status": "chrome_not_found",
             "message": (
                 "I couldn't find Chrome on the Windows desktop node."
             ),
         }
-
-    url = (
-        "https://www.google.com/search?"
-        + urlencode({
-            "q": value,
-        })
-    )
 
     result = _launch_process([
         chrome,
@@ -279,22 +296,53 @@ def open_chrome_search(
     ) is not True:
         return {
             "success": False,
+            "status": "browser_open_failed",
             "message": (
                 result.get(
                     "message"
                 )
-                or "I couldn't open that Chrome search."
+                or (
+                    f"I couldn't open {trusted_site_display_name(site_id)} "
+                    "in Chrome."
+                )
             ),
         }
 
     return {
         "success": True,
-        "status": "search_opened",
+        "status": (
+            "search_opened"
+            if query is not None
+            else "site_opened"
+        ),
         "browser": "chrome",
-        "query": value,
+        "site_id": site_id,
+        "query": (
+            str(
+                query
+            )
+            if query is not None
+            else None
+        ),
         "url": url,
-        "message": "Chrome search opened.",
+        "message": (
+            f"{trusted_site_display_name(site_id)} opened in Chrome."
+        ),
     }
+
+
+def open_chrome_search(
+    query: str,
+) -> dict:
+    """
+    Backward-compatible Phase 8.3 Google-search wrapper.
+    """
+
+    return open_chrome_trusted_site(
+        site_id="google",
+        query=query,
+    )
+
 
 
 def launch_steam_game_appid(

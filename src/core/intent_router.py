@@ -4,9 +4,11 @@ from typing import Optional
 from core.turn_state import TurnState
 from core.email_intent import is_inbox_attention_request
 from core.desktop_catalog import (
-    extract_browser_search_request,
     extract_desktop_action_request,
     extract_steam_game_launch_candidate,
+)
+from core.web_catalog import (
+    extract_browser_action_request,
 )
 
 
@@ -746,34 +748,87 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.add_reason("empty input")
         return state
 
-    browser_search = (
-        extract_browser_search_request(
-            raw
+    browser_action = (
+        extract_browser_action_request(
+            raw,
+            conversation_state=(
+                conversation_state
+            ),
         )
     )
 
-    if browser_search:
-        query = str(
-            browser_search.get(
-                "query",
+    if browser_action:
+        browser_mode = str(
+            browser_action.get(
+                "action",
                 "",
             )
             or ""
+        ).strip().lower()
+
+        site_id = str(
+            browser_action.get(
+                "site_id",
+                "",
+            )
+            or ""
+        ).strip().lower()
+
+        display_name = str(
+            browser_action.get(
+                "display_name",
+                "",
+            )
+            or site_id
         ).strip()
 
+        query = (
+            str(
+                browser_action.get(
+                    "query"
+                )
+                or ""
+            ).strip()
+            if browser_mode == "search"
+            else ""
+        )
+
         state.speech_act = "request_action"
-        state.intent = "browser_search"
-        state.subject = query
+        state.intent = (
+            "browser_search"
+            if browser_mode == "search"
+            else "browser_open"
+        )
+
+        state.subject = (
+            query
+            if browser_mode == "search"
+            else display_name
+        )
 
         state.entities[
             "browser"
         ] = "chrome"
 
         state.entities[
-            "search_query"
-        ] = query
+            "browser_site"
+        ] = site_id
 
-        state.requested_action = "open_browser_search"
+        state.entities[
+            "browser_site_name"
+        ] = display_name
+
+        if browser_mode == "search":
+            state.entities[
+                "search_query"
+            ] = query
+
+        state.requested_action = (
+            "open_browser_search"
+            if browser_mode == "search"
+            else "open_browser_site"
+        )
+
         state.requires_private_data = False
         state.requires_live_data = True
         state.factuality = "action_result"
@@ -784,9 +839,18 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.should_continue_conversation = False
         state.confidence = 0.99
 
-        state.add_reason(
-            "explicit Chrome/Google search action"
-        )
+        if browser_action.get(
+            "inherited"
+        ):
+            state.is_follow_up = True
+
+            state.add_reason(
+                "inherited active trusted browser site from Core browser state"
+            )
+        else:
+            state.add_reason(
+                "explicit trusted browser site/search action"
+            )
 
         return state
 

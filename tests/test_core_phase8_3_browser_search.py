@@ -162,25 +162,36 @@ def run():
     # --------------------------------------------------
 
     original_workflow = (
-        orchestrator_module.open_browser_search
+        orchestrator_module.open_browser_action
     )
+
+    calls = []
 
     try:
         def fake_workflow(
-            query,
+            site_id,
+            query=None,
         ):
+            calls.append(
+                (
+                    site_id,
+                    query,
+                )
+            )
+
             return WorkflowResult(
                 success=True,
                 status="browser_search_opened",
                 answer_fact=(
-                    f'Searching Chrome for "{query}".'
+                    f'Searching Google for "{query}".'
                 ),
                 data={
+                    "site_id": site_id,
                     "query": query,
                 },
             )
 
-        orchestrator_module.open_browser_search = (
+        orchestrator_module.open_browser_action = (
             fake_workflow
         )
 
@@ -191,8 +202,15 @@ def run():
         )
 
         assert decision.direct_response == (
-            'Searching Chrome for "Mairon project".'
+            'Searching Google for "Mairon project".'
         )
+
+        assert calls == [
+            (
+                "google",
+                "Mairon project",
+            )
+        ]
 
         assert (
             core.conversation_state
@@ -200,8 +218,14 @@ def run():
             == "chrome"
         )
 
+        assert (
+            core.conversation_state
+            .active_browser_site
+            == "google"
+        )
+
     finally:
-        orchestrator_module.open_browser_search = (
+        orchestrator_module.open_browser_action = (
             original_workflow
         )
 

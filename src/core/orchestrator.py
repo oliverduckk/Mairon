@@ -28,6 +28,7 @@ from core.workflows.application_control import (
     control_approved_application,
 )
 from core.workflows.browser_search import (
+    open_browser_action,
     open_browser_search,
 )
 from core.workflows.steam_game_launch import (
@@ -303,21 +304,37 @@ class MaironCore:
         direct_response = None
 
         # --------------------------------------------------
-        # Deterministic browser search workflow
+        # Deterministic trusted browser navigation/search
         # --------------------------------------------------
 
-        if turn.intent == "browser_search":
-            query = str(
+        if turn.intent in {
+            "browser_search",
+            "browser_open",
+        }:
+            site_id = str(
                 turn.entities.get(
-                    "search_query",
-                    "",
+                    "browser_site",
+                    "google",
                 )
-                or ""
-            ).strip()
+                or "google"
+            ).strip().lower()
+
+            query = (
+                str(
+                    turn.entities.get(
+                        "search_query",
+                        "",
+                    )
+                    or ""
+                ).strip()
+                if turn.intent == "browser_search"
+                else None
+            )
 
             workflow_result = (
-                open_browser_search(
-                    query=query
+                open_browser_action(
+                    site_id=site_id,
+                    query=query,
                 )
             )
 
@@ -352,7 +369,7 @@ class MaironCore:
                         workflow_result
                         and workflow_result.error
                     )
-                    else "I couldn't open that Chrome search."
+                    else "I couldn't complete that browser action."
                 )
             )
 

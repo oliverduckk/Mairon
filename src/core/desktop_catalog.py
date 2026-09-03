@@ -350,21 +350,6 @@ def extract_desktop_action_request(
     }
 
 
-BROWSER_SEARCH_PATTERNS = (
-    re.compile(
-        r"^\s*(?:open|launch|start)\s+(?:google\s+)?chrome\s+and\s+"
-        r"(?:search|google|look\s+up)(?:\s+for)?\s+(?P<query>.+?)\s*[.!?]*$",
-        flags=re.IGNORECASE,
-    ),
-    re.compile(
-        r"^\s*search\s+google(?:\s+for)?\s+(?P<query>.+?)\s*[.!?]*$",
-        flags=re.IGNORECASE,
-    ),
-    re.compile(
-        r"^\s*google\s+(?P<query>.+?)\s*[.!?]*$",
-        flags=re.IGNORECASE,
-    ),
-)
 
 STEAM_GAME_LAUNCH_PATTERN = re.compile(
     r"^\s*(?:open|launch|start|run|play)(?:\s+up)?\s+(?:the\s+)?"

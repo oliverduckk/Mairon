@@ -73,6 +73,16 @@ class ConversationState:
         default_factory=list
     )
 
+    # Trusted browser-site working referent.
+    #
+    # Enables:
+    #   "open YouTube" -> "search for Tame Impala"
+    # without treating arbitrary previous assistant prose as authority.
+    active_browser_site: Optional[str] = None
+    recent_browser_sites: List[str] = field(
+        default_factory=list
+    )
+
     # Keep the last Steam-game action separate from desktop-app referents.
     # Until game close/control is implemented, this prevents "close it" from
     # accidentally targeting an older desktop app after a game launch.
@@ -154,10 +164,26 @@ class ConversationState:
                     target_id
                 )
 
-        elif turn.intent == "browser_search":
+        elif turn.intent in {
+            "browser_search",
+            "browser_open",
+        }:
             self.remember_desktop_target(
                 "chrome"
             )
+
+            site_id = str(
+                turn.entities.get(
+                    "browser_site",
+                    "",
+                )
+                or ""
+            ).strip().lower()
+
+            if site_id:
+                self.remember_browser_site(
+                    site_id
+                )
 
         elif turn.intent == "launch_steam_game":
             self.active_desktop_target = None
@@ -202,6 +228,39 @@ class ConversationState:
 
         self.recent_desktop_targets = (
             self.recent_desktop_targets[:8]
+        )
+
+    # --------------------------------------------------
+    # Browser-specific working referent
+    # --------------------------------------------------
+
+    def remember_browser_site(
+        self,
+        site_id: str,
+    ) -> None:
+        value = str(
+            site_id
+            or ""
+        ).strip().lower()
+
+        if not value:
+            return
+
+        self.active_browser_site = value
+
+        self.recent_browser_sites = [
+            item
+            for item in self.recent_browser_sites
+            if item != value
+        ]
+
+        self.recent_browser_sites.insert(
+            0,
+            value,
+        )
+
+        self.recent_browser_sites = (
+            self.recent_browser_sites[:8]
         )
 
     # --------------------------------------------------
