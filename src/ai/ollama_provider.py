@@ -61,12 +61,20 @@ from personality.opinion_ledger import (
 from core.claim_grounding import (
     build_core_grounding_fallback,
     build_core_grounding_retry_instruction,
+    build_mairon_agency_modality_instruction,
     build_recent_user_grounding_context,
+    find_mairon_agency_modality_violations,
+    find_incidental_public_attribution_violations,
     should_verify_core_grounding,
     should_verify_factual_focus_fidelity,
     verify_core_grounded_draft,
     verify_factual_focus_fidelity,
 )
+from core.temporal_context import (
+    build_relative_date_context,
+    find_relative_date_weekday_violations,
+)
+
 from core.source_lock import (
     build_source_lock_instruction,
     build_source_lock_retry_instruction,
@@ -92,7 +100,7 @@ from routine.morning_routine import (
 )
 
 
-DEFAULT_LOCAL_MODEL = "qwen3:14b"
+DEFAULT_LOCAL_MODEL = "qwen3.5:9b"
 
 # Backward-compatible constant for older imports/tests. Runtime generation
 # uses get_local_model_name() so MAIRON_LOCAL_MODEL can be changed without
@@ -600,14 +608,197 @@ def build_micro_act_prior_user_context(
     )
 
 
-def build_factual_focus_instruction(
-    core_answer_contract,
+def _current_turn_needs_recent_assistant_dialogue_context(
+    user_input,
+    intent,
 ):
     """
-    Keep ordinary factual questions focused on the current question.
+    Detect a narrow class of turns that explicitly respond to Mairon's
+    immediately previous reply.
 
-    Personality may decorate the answer only when the decoration is about the
-    current subject/answer. Old banter is not a free callback pool.
+    This is NOT a grounding decision. It only decides whether generation needs
+    a compact copy of the previous accepted assistant utterance so phrases such
+    as "that's a banger top 3", "your thoughts", or "nah that's wrong" remain
+    conversationally coherent.
+    """
+
+    if intent not in {
+        "share_context",
+        "acknowledge",
+        "casual_conversation",
+    }:
+        return False
+
+    text = str(
+        user_input
+        or ""
+    ).strip().lower()
+
+    if not text:
+        return False
+
+    assistant_reference_patterns = (
+        r"\b(?:you|your|yours)\b.{0,48}\b(?:said|say|answer|answered|reply|response|thoughts?|opinion|opinions|pick|picks|picked|list|listed|rank|ranking|think|thinking|chose|choice|recommend|recommendation)\b",
+        r"\b(?:said|say|answer|answered|reply|response|thoughts?|opinion|opinions|pick|picks|picked|list|listed|rank|ranking|think|thinking|chose|choice|recommend|recommendation)\b.{0,48}\b(?:you|your|yours)\b",
+        r"\b(?:can't|cannot|couldn't)\s+(?:even\s+)?argue\s+with\s+that\b",
+        r"\b(?:agree|agreed)\s+with\s+you\b",
+        r"\b(?:you're|you\s+are)\s+(?:right|wrong)\b",
+        r"\b(?:that|this)(?:\s+is|'s)\s+(?:right|wrong)\b",
+        r"^\s*(?:that'?s|that\s+was)\s+(?:a\s+)?(?:good|great|solid|banger|fair|wild|crazy|interesting|valid|reasonable)\b",
+    )
+
+    return any(
+        re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+        for pattern in assistant_reference_patterns
+    )
+
+
+def _get_latest_assistant_text(
+    conversation,
+):
+    for message in reversed(
+        list(
+            conversation
+            or []
+        )
+    ):
+        if isinstance(
+            message,
+            dict,
+        ):
+            role = message.get(
+                "role"
+            )
+            content = message.get(
+                "content"
+            )
+
+        else:
+            role = getattr(
+                message,
+                "role",
+                None,
+            )
+            content = getattr(
+                message,
+                "content",
+                None,
+            )
+
+        if role != "assistant":
+            continue
+
+        text = str(
+            content
+            or ""
+        ).strip()
+
+        if text:
+            return text
+
+    return None
+
+
+def build_recent_assistant_dialogue_context(
+    user_input,
+    intent,
+    conversation,
+):
+    """
+    Provide the immediately previous accepted Mairon reply as NON-EVIDENCE
+    dialogue context when Oliver explicitly refers back to it.
+
+    Critical boundary:
+      - generation may use this packet to understand conversational references;
+      - grounding/verification still receives canonical conversation separately
+        and MUST NOT treat prior assistant prose as factual evidence.
+    """
+
+    if not _current_turn_needs_recent_assistant_dialogue_context(
+        user_input=user_input,
+        intent=intent,
+    ):
+        return None
+
+    previous_text = _get_latest_assistant_text(
+        conversation
+    )
+
+    if not previous_text:
+        return None
+
+    max_chars = 1200
+
+    if len(
+        previous_text
+    ) > max_chars:
+        previous_text = (
+            previous_text[
+                :max_chars
+            ].rstrip()
+            + "…"
+        )
+
+    return (
+        "CORE DIALOGUE CONTINUITY (NOT FACTUAL EVIDENCE):\n"
+        "Oliver's current message explicitly refers to Mairon's immediately "
+        "previous accepted reply. Use the quoted reply ONLY to understand that "
+        "reference, maintain conversational continuity, and avoid claiming you "
+        "have not said something you just said.\n"
+        "Do NOT treat any factual claim inside the prior reply as evidence. Do "
+        "NOT copy unsupported facts from it into the new answer. Core/user "
+        "grounding remains authoritative.\n"
+        "Previous accepted Mairon reply:\n"
+        + previous_text
+    )
+
+
+FACTUAL_EXPLANATION_REQUEST_PATTERN = re.compile(
+    r"\b(?:why|explain|elaborate|describe|compare|comparison|"
+    r"difference\s+between|differences?\s+between|what\s+happened|"
+    r"tell\s+me\s+about|walk\s+me\s+through|in\s+detail|details?|"
+    r"reasons?|pros?\s+and\s+cons?)\b"
+    r"|^\s*how\s+(?!(?:many|much|old|far|long|tall|big|fast|often)\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def _factual_question_requests_explanation(
+    user_input,
+):
+    text = str(
+        user_input
+        or ""
+    ).strip()
+
+    if not text:
+        return False
+
+    return bool(
+        FACTUAL_EXPLANATION_REQUEST_PATTERN.search(
+            text
+        )
+    )
+
+
+def build_factual_focus_instruction(
+    core_answer_contract,
+    user_input=None,
+):
+    """
+    Keep ordinary factual questions inside the scope Oliver actually asked for.
+
+    This is deliberately NOT a hard output-token limit. Qwen may use as many
+    tokens as the requested factual explanation needs. The distinction is:
+    - simple fact lookup -> answer the requested fact and stop;
+    - explicit explanation/comparison/detail request -> explain fully.
+
+    That prevents unnecessary factual tails from becoming new hallucination
+    opportunities without crippling long legitimate answers.
     """
 
     intent = _core_contract_value(
@@ -618,17 +809,47 @@ def build_factual_focus_instruction(
     if intent != "factual_question":
         return None
 
-    return (
-        "CORE FACTUAL-FOCUS MODE:\n"
-        "- Answer Oliver's CURRENT factual question directly and truthfully FIRST.\n"
-        "- Never give a disposable joke/fake answer and then retract it with 'just kidding', 'sike', or similar wording.\n"
-        "- A very short personality line may follow only when it is directly about the current question/answer, does not contradict the answer, and adds no unsupported Oliver/Mairon history.\n"
-        "- Do not append a callback, joke, or comment about an unrelated prior topic.\n"
+    explanation_requested = (
+        _factual_question_requests_explanation(
+            user_input
+        )
+    )
+
+    lines = [
+        "CORE FACTUAL-FOCUS MODE:",
+        "- Answer Oliver's CURRENT factual question directly and truthfully FIRST.",
+        "- Never give a disposable joke/fake answer and then retract it with "
+        "'just kidding', 'sike', or similar wording.",
+        "- Stay inside the factual scope Oliver actually requested. Do not add "
+        "extra public-world facts, statistics, geography, history, comparisons, "
+        "examples, or claims about what 'most people' think merely to make a "
+        "short answer sound fuller.",
+        "- A personality line may follow only if it adds NO new factual claim "
+        "about the world, Oliver, Mairon history, or Mairon's supposed past "
+        "experience/capability.",
+        "- Do not append a callback, joke, or comment about an unrelated prior topic.",
         "- Do not revive prior products, devices, travel topics, jokes, or assistant "
-        "phrasing merely because they are present in conversation history.\n"
-        "- Do not discuss internal answer-generation process, model memory, training data, "
-        "whether a fact is hard-coded, whether it was worth checking, or whether you are "
-        "'sticking with the correct answer'. Oliver asked for the fact, not implementation commentary."
+        "phrasing merely because they are present in conversation history.",
+        "- Do not discuss internal answer-generation process, model memory, training "
+        "data, whether a fact is hard-coded, whether it was worth checking, or "
+        "whether you are 'sticking with the correct answer'.",
+    ]
+
+    if explanation_requested:
+        lines.extend([
+            "- Oliver explicitly requested explanation/detail/comparison. Provide "
+            "enough factual detail to satisfy that request completely; the scope "
+            "rule above means relevant detail is allowed.",
+        ])
+    else:
+        lines.extend([
+            "- This appears to be a simple factual lookup. Once the requested fact "
+            "has been answered, STOP rather than volunteering additional factual "
+            "claims Oliver did not ask for.",
+        ])
+
+    return "\\n".join(
+        lines
     )
 
 
@@ -882,6 +1103,127 @@ def repair_live_recall_tail(
     )
 
 
+MIN_DIRECT_OUTPUT_BUDGET = 1024
+MAX_DIRECT_OUTPUT_BUDGET = 4096
+GENERATION_TRUNCATION_VIOLATION = (
+    "generation hit the output limit before completion"
+)
+
+
+def generation_stopped_for_length(
+    done_reason,
+):
+    return (
+        str(
+            done_reason
+            or ""
+        ).strip().lower()
+        == "length"
+    )
+
+
+def build_runtime_output_budget(
+    generation_options=None,
+    truncation_retry_count=0,
+):
+    """
+    Return a generic output safety ceiling for a direct-conversation attempt.
+
+    This is deliberately independent of topic, requested item count, or intent.
+    num_predict is only a maximum; a one-word answer still stops naturally at
+    EOS. If Ollama actually hits the ceiling, the next attempt gets more room.
+    """
+
+    options = dict(
+        generation_options
+        or {}
+    )
+
+    try:
+        configured_budget = int(
+            options.get(
+                "num_predict",
+                0,
+            )
+            or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        configured_budget = 0
+
+    base_budget = max(
+        configured_budget,
+        MIN_DIRECT_OUTPUT_BUDGET,
+    )
+
+    try:
+        retry_count = max(
+            0,
+            int(
+                truncation_retry_count
+                or 0
+            ),
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        retry_count = 0
+
+    return min(
+        base_budget
+        * (
+            2 ** retry_count
+        ),
+        MAX_DIRECT_OUTPUT_BUDGET,
+    )
+
+
+def build_runtime_context_window(
+    base_context_window,
+    output_budget,
+):
+    """
+    Expand active context only when a genuinely long retry needs it.
+
+    Normal turns stay at the established 8192-token context for speed/memory.
+    A response that already exhausted smaller output ceilings may use a larger
+    window rather than being truncated by the combined prompt + answer size.
+    """
+
+    try:
+        base_window = int(
+            base_context_window
+            or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        base_window = 0
+
+    try:
+        budget = int(
+            output_budget
+            or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        budget = 0
+
+    if budget >= 4096:
+        return max(
+            base_window,
+            16384,
+        )
+
+    return base_window
+
+
 def build_direct_generation_options(
     core_intent,
 ):
@@ -913,6 +1255,12 @@ def build_direct_generation_options(
         return {
             "temperature": 0.2,
             "num_predict": 96,
+        }
+
+    if core_intent == "share_opinion":
+        return {
+            "temperature": 0.35,
+            "num_predict": 112,
         }
 
     return None
@@ -962,6 +1310,7 @@ def build_direct_think_setting(
         "self_correction",
         "conversation_recall",
         "factual_question",
+        "share_opinion",
     }:
         return None
 
@@ -5728,6 +6077,18 @@ def handle_direct_conversation(
         "content": get_runtime_context()
     })
 
+    relative_date_context = (
+        build_relative_date_context(
+            user_input
+        )
+    )
+
+    if relative_date_context:
+        base_messages.append({
+            "role": "system",
+            "content": relative_date_context,
+        })
+
     if past_context:
         print(
             "[Context] Retrieved relevant prior conversation."
@@ -5736,6 +6097,26 @@ def handle_direct_conversation(
         base_messages.append({
             "role": "system",
             "content": past_context
+        })
+
+    assistant_dialogue_context = (
+        build_recent_assistant_dialogue_context(
+            user_input=user_input,
+            intent=core_intent,
+            conversation=conversation,
+        )
+        if core_uses_restricted_generation_context
+        else None
+    )
+
+    if assistant_dialogue_context:
+        print(
+            "[Context] Immediate prior Mairon reply supplied as non-evidence dialogue context."
+        )
+
+        base_messages.append({
+            "role": "system",
+            "content": assistant_dialogue_context,
         })
 
     if conversation_policy.get(
@@ -5875,6 +6256,16 @@ def handle_direct_conversation(
         )
     })
 
+    # Mairon's identity/capability boundary applies to ALL direct-conversation
+    # lanes, not only social micro-acts or media-specific prompts.
+    base_messages.append({
+        "role": "system",
+        "content": build_mairon_agency_modality_instruction(
+            user_input=user_input,
+            conversation=conversation,
+        ),
+    })
+
     if core_answer_contract:
         print(
             "[Core] Applying per-turn Answer Contract."
@@ -5904,9 +6295,28 @@ def handle_direct_conversation(
                 "content": core_micro_act_instruction
             })
 
+    if core_intent == "share_opinion":
+        base_messages.append({
+            "role": "system",
+            "content": (
+                "OPINION-LANE RESPONSE MODE:\n"
+                "- Give the subjective opinion Oliver actually asked for.\n"
+                "- Be concise when the request is simple, but use whatever length is "
+                "needed to finish the requested answer cleanly.\n"
+                "- Do not turn a resolved opinion question into recommendation intake "
+                "or append a generic follow-up question unless clarification is needed.\n"
+                "- Do not invent concrete public-world credits, creator names, "
+                "authorship, direction, production roles, or named creative-era/history "
+                "labels. If such a factual detail is not supplied by Oliver/Core and is "
+                "not necessary to answer the opinion request, omit it.\n"
+                "- Personality is welcome; fabricated credits are not."
+            ),
+        })
+
     factual_focus_instruction = (
         build_factual_focus_instruction(
-            core_answer_contract
+            core_answer_contract,
+            user_input=user_input,
         )
     )
 
@@ -5973,6 +6383,7 @@ def handle_direct_conversation(
     violations = []
     retry_violations = []
     accepted_draft_text = None
+    truncation_retry_count = 0
 
     core_grounding_required = (
         should_verify_core_grounding(
@@ -6088,6 +6499,50 @@ def handle_direct_conversation(
                         "content": core_grounding_retry,
                     })
 
+            if any(
+                (
+                    "unsupported autonomous"
+                    in str(violation)
+                    or "media modality drift"
+                    in str(violation)
+                )
+                for violation in effective_retry_violations
+            ):
+                attempt_messages.append({
+                    "role": "system",
+                    "content": (
+                        "AGENCY/MODALITY RETRY: Keep Mairon's capabilities honest. "
+                        "Do not invent concrete activity before/between turns and do not "
+                        "claim Mairon will independently perform an action later. Keep "
+                        "off-turn activity hypothetical/personified rather than factual. "
+                        "Preserve the medium established by the conversation unless Oliver "
+                        "explicitly changed it."
+                    ),
+                })
+
+            if any(
+                "relative-date weekday mismatch"
+                in str(violation)
+                for violation in effective_retry_violations
+            ):
+                relative_retry_context = (
+                    build_relative_date_context(
+                        user_input
+                    )
+                )
+
+                if relative_retry_context:
+                    attempt_messages.append({
+                        "role": "system",
+                        "content": (
+                            "TEMPORAL RETRY: The previous draft contradicted Core's "
+                            "resolved calendar relation. Use the exact date/weekday below "
+                            "if a calendar reference is necessary; otherwise omit the "
+                            "unrequested weekday entirely.\n"
+                            + relative_retry_context
+                        ),
+                    })
+
             if (
                 conversation_policy.get(
                     "knowledge_honesty"
@@ -6158,6 +6613,25 @@ def handle_direct_conversation(
                         "content": core_grounding_retry
                     })
 
+            if any(
+                GENERATION_TRUNCATION_VIOLATION
+                in str(
+                    violation
+                )
+                for violation in effective_retry_violations
+            ):
+                attempt_messages.append({
+                    "role": "system",
+                    "content": (
+                        "COMPLETION RETRY: The previous draft was cut off by the "
+                        "model's output limit. Answer the ORIGINAL request again and "
+                        "finish it completely. Be concise where possible, but do not "
+                        "omit requested sections, items, steps, explanations, or the "
+                        "natural ending merely to fit a short response. End normally; "
+                        "do not mention token limits or this retry."
+                    ),
+                })
+
             if (
                 spoiler_context.get(
                     "must_ask_progress"
@@ -6198,6 +6672,22 @@ def handle_direct_conversation(
                 generation_options
             )
 
+        # Output budgets are safety ceilings, not desired response lengths.
+        # Short answers still stop immediately at EOS; only an actual length
+        # stop expands the ceiling on the next attempt.
+        chat_kwargs.setdefault(
+            "options",
+            {},
+        )[
+            "num_predict"
+        ] = build_runtime_output_budget(
+            generation_options=chat_kwargs.get(
+                "options",
+                {}
+            ),
+            truncation_retry_count=truncation_retry_count,
+        )
+
         context_window = (
             build_direct_context_window(
                 core_intent
@@ -6205,6 +6695,16 @@ def handle_direct_conversation(
         )
 
         if context_window is not None:
+            context_window = build_runtime_context_window(
+                base_context_window=context_window,
+                output_budget=chat_kwargs.get(
+                    "options",
+                    {},
+                ).get(
+                    "num_predict"
+                ),
+            )
+
             chat_kwargs.setdefault(
                 "options",
                 {},
@@ -6275,6 +6775,12 @@ def handle_direct_conversation(
             or ""
         )
 
+        done_reason = getattr(
+            response,
+            "done_reason",
+            None,
+        )
+
         if generation_debug_enabled():
             raw_thinking = str(
                 getattr(
@@ -6283,12 +6789,6 @@ def handle_direct_conversation(
                     "",
                 )
                 or ""
-            )
-
-            done_reason = getattr(
-                response,
-                "done_reason",
-                None,
             )
 
             eval_count = getattr(
@@ -6473,6 +6973,34 @@ def handle_direct_conversation(
             # model call semantically grounding an empty string.
             continue
 
+        if generation_stopped_for_length(
+            done_reason
+        ):
+            violations = [
+                GENERATION_TRUNCATION_VIOLATION
+            ]
+
+            print(
+                "[Generation] Draft hit the output limit; retrying with more headroom."
+            )
+
+            retry_violations.extend(
+                violations
+            )
+
+            retry_violations = list(
+                dict.fromkeys(
+                    retry_violations
+                )
+            )
+
+            truncation_retry_count += 1
+
+            # A length-stopped draft is incomplete by definition. Do not waste
+            # grounding/verifier calls on content Core already knows cannot be the
+            # final answer.
+            continue
+
         violations.extend(
             find_personality_violations(
                 draft_text
@@ -6482,6 +7010,23 @@ def handle_direct_conversation(
         violations.extend(
             find_conversation_policy_violations(
                 draft_text
+            )
+        )
+
+        # Core owns what Mairon can/do/will do. This validator is deliberately
+        # domain-independent and runs on every direct-conversation draft.
+        violations.extend(
+            find_mairon_agency_modality_violations(
+                user_input=user_input,
+                draft=draft_text,
+                conversation=conversation,
+            )
+        )
+
+        violations.extend(
+            find_relative_date_weekday_violations(
+                user_input=user_input,
+                draft=draft_text,
             )
         )
 
@@ -6501,6 +7046,9 @@ def handle_direct_conversation(
                 find_repetition_violations(
                     response_text=draft_text,
                     conversation=conversation,
+                    allow_stable_repeat=bool(
+                        opinion_entry
+                    ),
                 )
             )
 
@@ -6516,6 +7064,20 @@ def handle_direct_conversation(
                 response_text=draft_text,
                 user_input=user_input,
                 core_answer_contract=core_answer_contract,
+            )
+        )
+
+        # Acceptance-stage invariant: subjective/opinion lanes may introduce
+        # their own picks, but concrete real-world creator/credit attributions
+        # are not free personality detail. Unless Oliver explicitly asked for
+        # the attribution, a named author/director/creator must be present in
+        # user/Core grounding.
+        violations.extend(
+            find_incidental_public_attribution_violations(
+                user_input=user_input,
+                draft=draft_text,
+                core_answer_contract=core_answer_contract,
+                conversation=conversation,
             )
         )
 

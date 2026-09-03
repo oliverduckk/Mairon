@@ -1,4 +1,3 @@
-import ast
 import inspect
 import os
 import sys
@@ -28,7 +27,12 @@ from ai.ollama_provider import (
 
 def run():
     # --------------------------------------------------
-    # 1. Default local model remains backward-compatible.
+    # 1. Qwen3.5 9B is now Mairon's source-code default.
+    #
+    # Phase 6.8 originally kept qwen3:14b as the fallback
+    # while qwen3.5:9b was evaluated through an environment
+    # override. Conversational acceptance later promoted
+    # qwen3.5:9b to the actual default.
     # --------------------------------------------------
 
     original = os.environ.get(
@@ -44,12 +48,21 @@ def run():
         assert (
             get_local_model_name()
             == DEFAULT_LOCAL_MODEL
-            == "qwen3:14b"
+            == "qwen3.5:9b"
         )
 
         # --------------------------------------------------
-        # 2. Runtime model override requires no source edit.
+        # 2. Runtime model override still requires no source edit.
         # --------------------------------------------------
+
+        os.environ[
+            "MAIRON_LOCAL_MODEL"
+        ] = "qwen3:14b"
+
+        assert (
+            get_local_model_name()
+            == "qwen3:14b"
+        )
 
         os.environ[
             "MAIRON_LOCAL_MODEL"
@@ -87,7 +100,8 @@ def run():
             is None
         )
 
-        # Straightforward factual Qwen-family turns disable hidden thinking.
+        # Later Phase 6.8 work established that straightforward
+        # factual Qwen turns should also disable hidden thinking.
         assert (
             build_direct_think_setting(
                 "factual_question",
@@ -109,73 +123,29 @@ def run():
 
     # --------------------------------------------------
     # 3. Explicit live recall bypasses style-repetition
-    #    rejection. Test the AST, not comment placement.
+    #    rejection. Accuracy outranks novelty.
     # --------------------------------------------------
 
     source = inspect.getsource(
         handle_direct_conversation
     )
 
-    tree = ast.parse(
-        source
+    # Assert the behaviour structurally rather than depending on a
+    # particular explanatory comment. Explicit live recall must bypass
+    # repetition rejection so accuracy is not sacrificed for novelty.
+    import re
+
+    repetition_guard = re.search(
+        r"if\s+not\s+core_is_live_recall\s*:\s*"
+        r"violations\.extend\(\s*"
+        r"find_repetition_violations\(",
+        source,
     )
 
-    guarded_repetition_call_found = False
-
-    for node in ast.walk(
-        tree
-    ):
-        if not isinstance(
-            node,
-            ast.If,
-        ):
-            continue
-
-        test_dump = ast.dump(
-            node.test,
-            include_attributes=False,
-        )
-
-        if not (
-            "core_is_live_recall"
-            in test_dump
-            and isinstance(
-                node.test,
-                ast.UnaryOp,
-            )
-            and isinstance(
-                node.test.op,
-                ast.Not,
-            )
-        ):
-            continue
-
-        for child in ast.walk(
-            node
-        ):
-            if not isinstance(
-                child,
-                ast.Call,
-            ):
-                continue
-
-            func = child.func
-
-            if (
-                isinstance(
-                    func,
-                    ast.Name,
-                )
-                and func.id
-                == "find_repetition_violations"
-            ):
-                guarded_repetition_call_found = True
-                break
-
-        if guarded_repetition_call_found:
-            break
-
-    assert guarded_repetition_call_found
+    assert (
+        repetition_guard
+        is not None
+    )
 
     print(
         "Mairon Core Phase 6.8 generator-swap/live-recall tests: PASS"

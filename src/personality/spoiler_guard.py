@@ -1206,6 +1206,18 @@ def empty_spoiler_context():
 def _looks_like_media_follow_up(
     user_input,
 ):
+    """
+    Return True only for genuinely referential media follow-ups.
+
+    Older logic treated almost any question beginning with "what", "why",
+    "how", "is", etc. as a follow-up. That let a new-topic question such as
+    "what are your top 3 Hollywood actors?" inherit One Piece from the prior
+    turn and wake the spoiler/research subsystem.
+
+    A follow-up now needs a deictic referent (it/that/he/she/they/etc.) or a
+    question whose grammatical target is one of those referents.
+    """
+
     text = _normalise_text(
         user_input
     )
@@ -1213,14 +1225,27 @@ def _looks_like_media_follow_up(
     if not text:
         return False
 
+    direct_deictic = re.search(
+        r"^(?:and\s+|but\s+)?(?:what\s+about\s+)?"
+        r"(?:it|that|this|he|him|she|her|they|them|those|these)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if direct_deictic:
+        return True
+
+    question_with_deictic_target = re.search(
+        r"^(?:and\s+|but\s+)?"
+        r"(?:who|what|why|how|when|where)\b"
+        r".{0,40}?\b"
+        r"(?:it|that|this|he|him|she|her|they|them|those|these)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+
     return bool(
-        re.search(
-            r"^(?:and\s+|but\s+|what\s+about\s+)?"
-            r"(?:it|that|this|he|she|they|them|those|these|who|what|why|how|"
-            r"does|do|did|is|are|was|were|when|where)\b",
-            text,
-            flags=re.IGNORECASE,
-        )
+        question_with_deictic_target
     )
 
 

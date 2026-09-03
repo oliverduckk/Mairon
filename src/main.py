@@ -1,6 +1,8 @@
 import os
 import re
 
+from core.response_timer import ResponseTimer
+
 from dotenv import load_dotenv
 
 from ai.provider import create_provider
@@ -20,7 +22,13 @@ from core.router import (
 )
 
 from continuity.conversation_journal import (
+    get_response_timing_report,
     record_conversation_turn,
+)
+
+from memory.preference_store import (
+    build_user_preference_recall_response,
+    capture_user_preference,
 )
 
 
@@ -36,9 +44,9 @@ input_name = os.getenv("MAIRON_USER_NAME")
 local_model_name = str(
     os.getenv(
         "MAIRON_LOCAL_MODEL",
-        "qwen3:14b",
+        "qwen3.5:9b",
     )
-    or "qwen3:14b"
+    or "qwen3.5:9b"
 ).strip()
 
 
@@ -101,6 +109,12 @@ print()
 print(
     "Voice input: type /voice for one message "
     "or /voice on for continuous voice mode."
+)
+print()
+
+print(
+    "Response timing: automatic "
+    "(/timing for statistics)."
 )
 print()
 
@@ -230,10 +244,15 @@ Conversation continuity:
 
 Persistent memory:
 - Explicit persistent fact memory is separate from the private conversation journal.
-- Only save information to explicit persistent fact memory when {input_name} explicitly
-  asks you to remember, save, or store it.
-- Do not permanently save ordinary conversation, jokes, hypothetical examples,
-  temporary information, or inferred information unless {input_name} explicitly asks.
+- Generic fact memory remains opt-in: only save ordinary facts to explicit persistent
+  fact memory when {input_name} explicitly asks you to remember, save, or store them.
+- Core separately maintains a narrow typed preference state for high-confidence explicit
+  favourites/rankings such as "my top 3 manga are X, Y, Z". Those explicit preference
+  declarations may be persisted automatically without a separate "remember this" command.
+- Do not promote ordinary likes, jokes, hypothetical examples, temporary information,
+  or inferred preferences into persistent state.
+- Mairon's own recurring subjective stances are handled by Core's Opinion Ledger. If an
+  established Mairon stance is supplied, preserve it rather than silently rerolling it.
 - When {input_name} asks about a personal fact, preference, or information that may
   have been saved previously, search persistent memory before saying that you do not know.
 - If persistent memory contains no relevant result, say that you do not remember
@@ -486,6 +505,8 @@ def get_user_input():
 
 local_state = None
 cloud_state = None
+last_user_input = None
+last_assistant_answer = None
 
 # Mairon Core owns deterministic intent routing, short-lived
 # conversational referents, factual-authority decisions, and workflows.
@@ -498,17 +519,38 @@ mairon_core = MaironCore()
 def emit_final_response(
     user_input,
     answer,
+    response_timer=None,
 ):
     """
     Display, journal, and optionally speak one completed Mairon turn.
 
-    Core-owned deterministic answers and model-generated answers both pass
-    through the same final-output path.
+    response_timer measures ACTIVE processing time only:
+    - starts once final user text exists;
+    - stops when the answer is ready to display;
+    - excludes STT, TTS playback, and time Oliver spends at approval prompts.
     """
 
+    global last_user_input
+    global last_assistant_answer
+
+    response_seconds = None
+
+    if response_timer is not None:
+        response_seconds = (
+            response_timer.stop()
+        )
+
     print(
-        f"Mairon: {answer}\n"
+        f"Mairon: {answer}"
     )
+
+    if response_seconds is not None:
+        print(
+            "[Timing] Response ready in "
+            f"{response_seconds:.2f}s"
+        )
+
+    print()
 
     try:
         record_conversation_turn(
@@ -519,12 +561,25 @@ def emit_final_response(
                 if speak_next_response
                 else "text"
             ),
+            response_seconds=(
+                response_seconds
+            ),
         )
 
     except Exception as error:
         print(
             f"[Context] Conversation journal write failed: {error}"
         )
+
+    last_user_input = str(
+        user_input
+        or ""
+    )
+
+    last_assistant_answer = str(
+        answer
+        or ""
+    )
 
     if speak_next_response:
         try:
@@ -543,6 +598,102 @@ def emit_final_response(
             print(
                 f"\n[Voice] TTS failed: {error}\n"
             )
+
+
+def _format_timing_value(
+    value,
+):
+    if value is None:
+        return "-"
+
+    return (
+        f"{float(value):.2f}s"
+    )
+
+
+def print_response_timing_report():
+    """
+    Show response-ready statistics without generating or journaling an AI turn.
+    """
+
+    try:
+        report = (
+            get_response_timing_report(
+                recent_limit=20
+            )
+        )
+
+    except Exception as error:
+        print(
+            f"[Timing] Could not read timing statistics: {error}\n"
+        )
+        return
+
+    print()
+    print("[Timing] Response-ready statistics")
+    print(
+        "Only turns recorded since timing was enabled are included."
+    )
+
+    for label, key in (
+        ("This session", "session"),
+        ("Last 20", "recent"),
+        ("Lifetime", "lifetime"),
+    ):
+        stats = report[
+            key
+        ]
+
+        count = int(
+            stats.get(
+                "count",
+                0,
+            )
+            or 0
+        )
+
+        if count == 0:
+            print(
+                f"{label}: no measured turns yet"
+            )
+            continue
+
+        print(
+            f"{label}: "
+            f"{count} turns | "
+            "avg "
+            + _format_timing_value(
+                stats.get(
+                    "average_seconds"
+                )
+            )
+            + " | median "
+            + _format_timing_value(
+                stats.get(
+                    "median_seconds"
+                )
+            )
+            + " | p95 "
+            + _format_timing_value(
+                stats.get(
+                    "p95_seconds"
+                )
+            )
+            + " | fastest "
+            + _format_timing_value(
+                stats.get(
+                    "fastest_seconds"
+                )
+            )
+            + " | slowest "
+            + _format_timing_value(
+                stats.get(
+                    "slowest_seconds"
+                )
+            )
+        )
+
+    print()
 
 
 # --------------------------------------------------
@@ -573,6 +724,96 @@ while True:
             "Mairon: Shutting down."
         )
         break
+
+    if user_input.lower() == "/timing":
+        print_response_timing_report()
+        continue
+
+    response_timer = ResponseTimer()
+
+    # --------------------------------------------------
+    # Typed user preference state
+    # --------------------------------------------------
+
+    try:
+        user_preference_result = capture_user_preference(
+            user_text=user_input,
+            previous_assistant_text=last_assistant_answer,
+            previous_user_text=last_user_input,
+        )
+
+        if (
+            user_preference_result
+            and user_preference_result.get(
+                "changed"
+            )
+        ):
+            print(
+                "[Preference] Updated "
+                + str(
+                    input_name
+                )
+                + " "
+                + str(
+                    user_preference_result.get(
+                        "domain",
+                        "",
+                    )
+                )
+                + " "
+                + str(
+                    user_preference_result.get(
+                        "preference_key",
+                        "",
+                    )
+                ).replace(
+                    "_",
+                    " ",
+                )
+                + "."
+            )
+
+    except Exception as error:
+        print(
+            f"[Preference] User preference capture failed: {error}"
+        )
+
+    try:
+        preference_recall_answer = (
+            build_user_preference_recall_response(
+                user_text=user_input,
+                user_name=input_name,
+            )
+        )
+
+    except Exception as error:
+        print(
+            f"[Preference] Preference recall failed: {error}"
+        )
+
+        preference_recall_answer = None
+
+    if preference_recall_answer is not None:
+        print(
+            "[Preference] Core-owned preference recall."
+        )
+
+        emit_final_response(
+            user_input=user_input,
+            answer=preference_recall_answer,
+            response_timer=response_timer,
+        )
+
+        local_state = (
+            append_visible_turn_to_model_history(
+                current_state=local_state,
+                user_input=user_input,
+                assistant_text=preference_recall_answer,
+                system_instructions=mairon_instructions,
+            )
+        )
+
+        continue
 
     # --------------------------------------------------
     # Mairon Core
@@ -632,6 +873,7 @@ while True:
             emit_final_response(
                 user_input=user_input,
                 answer=answer,
+                response_timer=response_timer,
             )
 
             local_state = (
@@ -654,6 +896,7 @@ while True:
                 answer=(
                     core_decision.direct_response
                 ),
+                response_timer=response_timer,
             )
 
             local_state = (
@@ -722,9 +965,15 @@ while True:
 
         print()
 
-        approval = input(
-            "Use GPT-5.6 Luna? [y/N]: "
-        ).strip().lower()
+        response_timer.pause()
+
+        try:
+            approval = input(
+                "Use GPT-5.6 Luna? [y/N]: "
+            ).strip().lower()
+
+        finally:
+            response_timer.resume()
 
         if approval in (
             "y",
@@ -775,9 +1024,15 @@ while True:
 
         print()
 
-        approval = input(
-            "Create this event? [y/N]: "
-        ).strip().lower()
+        response_timer.pause()
+
+        try:
+            approval = input(
+                "Create this event? [y/N]: "
+            ).strip().lower()
+
+        finally:
+            response_timer.resume()
 
         if approval in (
             "y",
@@ -802,4 +1057,5 @@ while True:
     emit_final_response(
         user_input=user_input,
         answer=result.answer,
+        response_timer=response_timer,
     )

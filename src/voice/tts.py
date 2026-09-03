@@ -35,7 +35,7 @@ PRIMARY_WEIGHT = 0.75
 SECONDARY_WEIGHT = 0.25
 
 VOICE_LANGUAGE = "en-us"
-VOICE_SPEED = 0.90
+VOICE_SPEED = 0.94
 
 
 def download_file(url, destination, label):

@@ -884,6 +884,7 @@ def _get_conversation_assistant_texts(
 def find_repetition_violations(
     response_text,
     conversation=None,
+    allow_stable_repeat=False,
 ):
     """
     Conservative repetition guard.
@@ -891,6 +892,12 @@ def find_repetition_violations(
     It catches obvious reused punchlines/catchphrases and near-copy
     responses, but does not demand novelty for every factual phrase.
     """
+
+    # Established Core-owned persona state (for example Mairon's stored top-3
+    # manga ranking) is allowed to repeat. Consistency is the desired behavior
+    # in that lane; the generic novelty guard must not fight the opinion ledger.
+    if allow_stable_repeat:
+        return []
 
     candidate = str(
         response_text or ""

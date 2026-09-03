@@ -94,9 +94,11 @@ def should_research_media_turn(
     Research is deliberately biased toward:
     - current/release-sensitive discussion;
     - specific factual/canon questions;
-    - fact-checks/corrections;
-    - subjective ranking/opinion turns where invented canon would be a
-      particularly bad way to justify the opinion.
+    - fact-checks/corrections/challenges.
+
+    A subjective opinion/ranking by itself is NOT enough to trigger research.
+    Those turns should remain fast and should omit unsupported canon details
+    rather than launching a heavyweight verification workflow.
 
     Spoiler-progress questions themselves are never researched until
     Core knows the spoiler ceiling.
@@ -166,11 +168,6 @@ def should_research_media_turn(
     if _matches_any(
         text,
         CURRENT_PATTERNS,
-    ):
-        return True
-
-    if conversation_policy.get(
-        "opinion_turn"
     ):
         return True
 

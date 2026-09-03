@@ -84,6 +84,50 @@ EXPLICIT_REVISION_REQUESTS = [
     r"\bfinal official top\s+\d+\b",
 ]
 
+RANK_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+GENERIC_RANKING_PATTERN = re.compile(
+    r"\b(?:your|you)\s+(?:current\s+)?top\s+"
+    r"(?P<count>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+    r"(?P<domain>[a-z][a-z0-9'&\- ]{0,80})$",
+    flags=re.IGNORECASE,
+)
+
+RANKING_SUBJECT_TRAILING_QUALIFIERS = (
+    "of all time",
+    "right now",
+    "currently",
+    "today",
+    "overall",
+)
+
+# Linguistic aliases preserve existing ledger keys for common singular/plural
+# variants without restricting which ranked subjects Mairon may persist.
+RANKING_SUBJECT_ALIASES = {
+    "mangas": "manga",
+    "animes": "anime",
+    "books": "book",
+    "novels": "novel",
+    "games": "game",
+    "movies": "movie",
+    "films": "movie",
+    "film": "movie",
+    "shows": "show",
+    "artists": "artist",
+    "albums": "album",
+}
+
 
 def _now():
     return datetime.now(
@@ -134,6 +178,106 @@ def _matches_any(
     )
 
 
+def _parse_rank_count(
+    value,
+):
+    token = str(
+        value
+        or ""
+    ).strip().lower()
+
+    if token.isdigit():
+        return int(
+            token
+        )
+
+    return RANK_COUNT_WORDS.get(
+        token
+    )
+
+
+def _normalise_ranking_subject_phrase(
+    value,
+):
+    subject = _normalise(
+        value
+    )
+
+    for qualifier in RANKING_SUBJECT_TRAILING_QUALIFIERS:
+        suffix = (
+            " "
+            + qualifier
+        )
+
+        if subject.endswith(
+            suffix
+        ):
+            subject = subject[
+                :-len(
+                    suffix
+                )
+            ].strip()
+            break
+
+    # Keep the category semantic and generic. The ledger does not need a
+    # hard-coded vocabulary of manga/anime/actors/exercises/etc.; any concise
+    # explicit ranked subject can become stable persona state.
+    words = subject.split()
+
+    if not words or len(words) > 8:
+        return None
+
+    subject = RANKING_SUBJECT_ALIASES.get(
+        subject,
+        subject,
+    )
+
+    return subject
+
+
+def _classify_generic_category_ranking(
+    text,
+):
+    match = GENERIC_RANKING_PATTERN.search(
+        text
+    )
+
+    if not match:
+        return None
+
+    count = _parse_rank_count(
+        match.group(
+            "count"
+        )
+    )
+
+    domain = _normalise_ranking_subject_phrase(
+        match.group(
+            "domain"
+        )
+    )
+
+    if not count or not domain:
+        return None
+
+    domain_key = _normalise_key(
+        domain
+    )
+
+    return {
+        "key": (
+            f"general::{domain_key}::top_{count}"
+        ),
+        "title": domain.title(),
+        "domain": domain,
+        "kind": "category_ranking",
+        "count": count,
+        "label": (
+            f"Mairon top {count} {domain}"
+        ),
+    }
+
+
 def classify_opinion_subject(
     user_input,
     media_title=None,
@@ -148,6 +292,15 @@ def classify_opinion_subject(
     text = _normalise(
         user_input
     )
+
+    generic_category_ranking = (
+        _classify_generic_category_ranking(
+            text
+        )
+    )
+
+    if generic_category_ranking:
+        return generic_category_ranking
 
     title = (
         str(
@@ -350,6 +503,23 @@ def _looks_like_matching_historical_prompt(
         "kind"
     )
 
+    if kind == "category_ranking":
+        recovered_subject = (
+            _classify_generic_category_ranking(
+                value
+            )
+        )
+
+        return bool(
+            recovered_subject
+            and recovered_subject.get(
+                "key"
+            )
+            == subject.get(
+                "key"
+            )
+        )
+
     if kind == "character_ranking":
         count = subject.get(
             "count"
@@ -506,6 +676,9 @@ def recover_opinion_from_journal(
         "title": subject[
             "title"
         ],
+        "domain": subject.get(
+            "domain"
+        ),
         "kind": subject[
             "kind"
         ],
@@ -667,6 +840,9 @@ def record_opinion_if_needed(
         "title": subject[
             "title"
         ],
+        "domain": subject.get(
+            "domain"
+        ),
         "kind": subject[
             "kind"
         ],

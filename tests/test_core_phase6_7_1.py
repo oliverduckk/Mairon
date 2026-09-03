@@ -27,6 +27,10 @@ def run():
     # --------------------------------------------------
     # 1. Tiny Core-owned/restricted lanes must disable
     #    Qwen3 hidden thinking.
+    #
+    # Acceptance cleanup 2 intentionally extends this fast
+    # path to share_opinion for qwen3.5 because lightweight
+    # preference/ranking questions do not need hidden reasoning.
     # --------------------------------------------------
 
     for intent in (
@@ -36,23 +40,25 @@ def run():
         "self_correction",
         "conversation_recall",
         "factual_question",
+        "share_opinion",
     ):
         assert (
             build_direct_think_setting(
-                intent
+                intent,
+                model_name="qwen3.5:9b",
             )
             is False
         ), intent
 
-    # Heavier reasoning/opinion/action lanes retain provider/model default.
+    # Heavier recommendation/action lanes retain provider/model default.
     for intent in (
         "recommendation_request",
-        "share_opinion",
         "action_request",
     ):
         assert (
             build_direct_think_setting(
-                intent
+                intent,
+                model_name="qwen3.5:9b",
             )
             is None
         ), intent

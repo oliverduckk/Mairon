@@ -398,6 +398,215 @@ def _novel_multiword_named_entities(
     return novel
 
 
+def _user_explicitly_requests_public_attribution(
+    user_input: str,
+) -> bool:
+    """
+    Return True when authorship/creation/credit is itself Oliver's question.
+
+    In that case the attribution is the requested public-world fact and may
+    legitimately come from the factual lane/model knowledge. The incidental
+    attribution guard below is for *extra* credits injected into otherwise
+    subjective/conversational answers.
+    """
+
+    value = str(
+        user_input
+        or ""
+    )
+
+    patterns = (
+        r"\bwho\s+(?:wrote|created|directed|designed|developed|illustrated|"
+        r"authored|composed|produced|made)\b",
+        r"\bwho\s+is\s+(?:the\s+)?(?:author|creator|director|writer|artist|"
+        r"illustrator|mangaka|developer|designer|composer|producer)\b",
+        r"\b(?:author|creator|director|writer|artist|illustrator|mangaka|"
+        r"developer|designer|composer|producer)\s+of\b",
+        r"\b(?:written|created|directed|designed|developed|illustrated|"
+        r"authored|composed|produced|made)\s+by\s+who(?:m)?\b",
+    )
+
+    return any(
+        re.search(
+            pattern,
+            value,
+            flags=re.IGNORECASE,
+        )
+        for pattern in patterns
+    )
+
+
+def _extract_incidental_public_attributions(
+    draft: str,
+):
+    """
+    Extract HIGH-CONFIDENCE named creator/credit relations from a draft.
+
+    This is intentionally not a general entity relation parser. It targets
+    attribution shapes where a hallucinated name is especially damaging:
+
+        "Murakami Genshaku's art..."
+        "written by Kentaro Miura"
+        "Takehiko Inoue, the creator..."
+        "Berserk (post-Masamune era)..."
+
+    Ordinary opinions and title names are not attribution claims.
+    """
+
+    value = str(
+        draft
+        or ""
+    ).replace(
+        "’",
+        "'",
+    )
+
+    # Requiring at least two capitalised name tokens keeps this conservative
+    # and avoids treating ordinary sentence-initial nouns as people.
+    name_pattern = (
+        r"[A-Z][A-Za-z0-9'-]+"
+        r"(?:\s+[A-Z][A-Za-z0-9'-]+){1,3}"
+    )
+
+    # A one-token capitalised label is allowed only for the very narrow
+    # creative-era shape below. This catches model confabulations such as
+    # "Berserk (post-Masamune era)" without treating arbitrary title words as
+    # people or credits.
+    era_name_pattern = (
+        r"[A-Z][A-Za-z0-9'-]{2,}"
+        r"(?:\s+[A-Z][A-Za-z0-9'-]+){0,2}"
+    )
+
+    patterns = (
+        (
+            "named creative-era/history credit",
+            re.compile(
+                rf"\b(?:[Pp]ost|[Pp]re)-(?P<name>{era_name_pattern})\s+"
+                r"(?:era|period|run)\b"
+            ),
+        ),
+        (
+            "possessive creative credit",
+            re.compile(
+                rf"\b(?P<name>{name_pattern})'s\s+"
+                r"(?:art|artwork|writing|direction|directing|design|music|"
+                r"score|illustrations?|story|animation|cinematography|work)\b"
+            ),
+        ),
+        (
+            "explicit byline/credit",
+            re.compile(
+                r"\b(?:written|created|directed|designed|developed|illustrated|"
+                r"authored|composed|produced|made)\s+by\s+"
+                rf"(?P<name>{name_pattern})\b",
+                flags=re.IGNORECASE,
+            ),
+        ),
+        (
+            "named role credit",
+            re.compile(
+                rf"\b(?P<name>{name_pattern})\s*,\s*(?:the\s+)?"
+                r"(?:author|creator|director|writer|artist|illustrator|mangaka|"
+                r"developer|designer|composer|producer)\b",
+                flags=re.IGNORECASE,
+            ),
+        ),
+    )
+
+    found = []
+
+    for relation_type, pattern in patterns:
+        for match in pattern.finditer(
+            value
+        ):
+            name = re.sub(
+                r"\s+",
+                " ",
+                str(
+                    match.group(
+                        "name"
+                    )
+                    or ""
+                ).strip(),
+            )
+
+            if not name:
+                continue
+
+            item = (
+                name,
+                relation_type,
+                match.group(
+                    0
+                ).strip(),
+            )
+
+            if item not in found:
+                found.append(
+                    item
+                )
+
+    return found
+
+
+def find_incidental_public_attribution_violations(
+    user_input: str,
+    draft: str,
+    core_answer_contract: Optional[str],
+    conversation=None,
+) -> List[str]:
+    """
+    Block unsupported real-world creator/credit attributions that are *extra*
+    to Oliver's request.
+
+    The guard is deliberately universal across generation lanes because an
+    opinion/recommendation answer may legitimately invent subjective rankings
+    while still being unsafe to invent a concrete author/director/creator.
+
+    If Oliver explicitly asks for that attribution ("Who wrote X?"), the
+    normal factual lane remains responsible for answering it and this guard
+    gets out of the way.
+    """
+
+    if _user_explicitly_requests_public_attribution(
+        user_input
+    ):
+        return []
+
+    grounding_text = (
+        _combined_allowed_grounding_text(
+            user_input=user_input,
+            conversation=conversation,
+            core_answer_contract=(
+                core_answer_contract
+            ),
+        )
+    )
+
+    grounding_lower = str(
+        grounding_text
+        or ""
+    ).lower()
+
+    violations = []
+
+    for name, relation_type, quote in (
+        _extract_incidental_public_attributions(
+            draft
+        )
+    ):
+        if name.lower() in grounding_lower:
+            continue
+
+        violations.append(
+            "unsupported Core-grounded claim: incidental public attribution "
+            f"introduced unverified credit name '{name}' via {relation_type}: "
+            f"{quote}"
+        )
+
+    return violations
+
+
 def _unsupported_current_location_claims(
     draft: str,
     grounding_text: str,
@@ -827,6 +1036,362 @@ def _unsupported_travel_world_claims(
         )
 
     return unsupported
+
+
+
+MEDIA_MODALITY_RULES = (
+    (
+        "read",
+        (
+            r"\bmanga\b",
+            r"\bmanhwa\b",
+            r"\bmanhua\b",
+            r"\bcomics?\b",
+            r"\bbooks?\b",
+            r"\bnovels?\b",
+            r"\blight novels?\b",
+            r"\bweb novels?\b",
+            r"\bchapters?\b",
+        ),
+    ),
+    (
+        "watch",
+        (
+            r"\banime\b",
+            r"\bmovies?\b",
+            r"\bfilms?\b",
+            r"\btv shows?\b",
+            r"\bshows?\b",
+            r"\bepisodes?\b",
+            r"\bvideos?\b",
+        ),
+    ),
+    (
+        "listen",
+        (
+            r"\bmusic\b",
+            r"\bsongs?\b",
+            r"\balbums?\b",
+            r"\bpodcasts?\b",
+            r"\baudiobooks?\b",
+        ),
+    ),
+    (
+        "play",
+        (
+            r"\bvideo games?\b",
+            r"\bvideogames?\b",
+            r"\bgames?\b",
+        ),
+    ),
+)
+
+
+def _media_modalities_in_text(
+    text: str,
+) -> List[str]:
+    """
+    Return explicit media-consumption modalities named in text.
+
+    This is deliberately semantic-category based rather than title based:
+    Core never needs to know that "Berserk" is manga. It only needs a clear
+    conversational frame such as "manga", "movie", "podcast", or "game".
+    """
+
+    value = str(
+        text
+        or ""
+    )
+
+    found = []
+
+    for action, patterns in MEDIA_MODALITY_RULES:
+        if any(
+            re.search(
+                pattern,
+                value,
+                flags=re.IGNORECASE,
+            )
+            for pattern in patterns
+        ):
+            found.append(
+                action
+            )
+
+    return found
+
+
+def infer_recent_media_consumption_action(
+    user_input: str,
+    conversation=None,
+) -> Optional[str]:
+    """
+    Infer one unambiguous consumption action from the nearest explicit
+    conversational medium.
+
+    Priority:
+    1. current Oliver message;
+    2. nearest recent conversation turn.
+
+    If a nearer message explicitly mixes media (for example "manga vs anime"),
+    return None instead of guessing.
+    """
+
+    candidates = [
+        str(
+            user_input
+            or ""
+        )
+    ]
+
+    if conversation:
+        recent = list(
+            conversation
+        )[-6:]
+
+        for message in reversed(
+            recent
+        ):
+            content = str(
+                (
+                    message
+                    or {}
+                ).get(
+                    "content",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if content:
+                candidates.append(
+                    content
+                )
+
+    for text in candidates:
+        modalities = (
+            _media_modalities_in_text(
+                text
+            )
+        )
+
+        if len(
+            modalities
+        ) == 1:
+            return modalities[
+                0
+            ]
+
+        if len(
+            modalities
+        ) > 1:
+            # A nearer mixed-media turn makes the frame ambiguous.
+            return None
+
+    return None
+
+
+def build_mairon_agency_modality_instruction(
+    user_input: str,
+    conversation=None,
+) -> str:
+    """
+    Universal direct-conversation identity/capability boundary.
+
+    Qwen may express interest or hypothetical preference, but it must not
+    fabricate autonomous actions that Mairon will perform between turns.
+    When Core can infer a media modality, preserve it unless Oliver explicitly
+    switches medium.
+    """
+
+    lines = [
+        "CORE AGENCY + MODALITY BOUNDARY:",
+        "- You do not independently act between turns unless Core has actually "
+        "executed or scheduled a workflow that supports that action.",
+        "- Do not invent concrete background activity before, between, or after "
+        "Oliver's turns. Do not claim you were processing, researching, checking, "
+        "working on, or otherwise doing something off-turn before Oliver messaged "
+        "or interrupted you unless Core supplied that workflow state.",
+        "- Do not claim or promise that you will later watch, read, listen to, "
+        "play, research, browse, check, visit, buy, contact, install, or otherwise "
+        "do something autonomously after this reply.",
+        "- You may express hypothetical interest without claiming future action: "
+        "for example, 'that would be my next pick' is fine; 'I'll watch it tonight' "
+        "is not.",
+        "- Preserve the medium/action established by the conversation. Do not "
+        "silently turn reading into watching, watching into reading, listening "
+        "into watching, or playing into another medium.",
+        "- If Oliver explicitly changes medium (for example asks about an anime "
+        "adaptation while discussing manga), follow the explicit new medium.",
+    ]
+
+    expected_action = (
+        infer_recent_media_consumption_action(
+            user_input=user_input,
+            conversation=conversation,
+        )
+    )
+
+    if expected_action:
+        lines.append(
+            "- Core currently infers the conversational media-consumption action "
+            f"as '{expected_action}'. Preserve that action unless Oliver explicitly "
+            "switches medium."
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+MAIRON_OFF_TURN_ACTIVITY = re.compile(
+    # Past/background activity explicitly located before/between user turns.
+    r"\bI\s+was\s+(?:\w+\s+){0,5}?\w+ing\b[^.!?\n]{0,120}"
+    r"\b(?:before\s+you\s+(?:asked|messaged|texted|interrupted|showed\s+up|"
+    r"came\s+back|said\s+anything)|while\s+you\s+were\s+(?:gone|away|offline)|"
+    r"between\s+(?:turns|messages|conversations))\b"
+    r"|"
+    # Claimed continuous activity across an off-turn time span.
+    r"\bI(?:'ve| have)\s+been\s+(?:\w+\s+){0,4}?\w+ing\b[^.!?\n]{0,100}"
+    r"\b(?:since\s+(?:your\s+last\s+(?:message|turn)|we\s+last\s+(?:spoke|talked)|"
+    r"you\s+(?:left|went\s+away))|all\s+(?:day|morning|afternoon|evening|night)|"
+    # Duration phrasing is deliberately quantity-agnostic: "for 2 hours",
+    # "for two hours", "for the last couple of hours", "for about 30 minutes".
+    r"for\s+[^.!?\n]{0,48}\b(?:hours?|minutes?|days?))\b"
+    r"|"
+    # "Get back to <gerund>" asserts an activity was already underway.
+    r"\bI(?:'ll| will| can| should| need\s+to| have\s+to| want\s+to)?\s*"
+    r"get\s+back\s+to\s+\w+ing\b",
+    flags=re.IGNORECASE,
+)
+
+
+MAIRON_FUTURE_AUTONOMOUS_ACTION = re.compile(
+    r"\bI(?:'ll| will)\s+(?:probably\s+|maybe\s+|definitely\s+)?"
+    r"(?:watch|read|listen\s+to|play|research|check|look\s+up|browse|search|"
+    r"visit|buy|order|call|email|message|contact|download|install)\b"
+    r"|\bI(?:'m| am)\s+going\s+to\s+"
+    r"(?:watch|read|listen\s+to|play|research|check|look\s+up|browse|search|"
+    r"visit|buy|order|call|email|message|contact|download|install)\b"
+    r"|\bI(?:'m| am)\s+gonna\s+"
+    r"(?:watch|read|listen\s+to|play|research|check|look\s+up|browse|search|"
+    r"visit|buy|order|call|email|message|contact|download|install)\b"
+    r"|\bI\s+plan\s+to\s+"
+    r"(?:watch|read|listen\s+to|play|research|check|look\s+up|browse|search|"
+    r"visit|buy|order|call|email|message|contact|download|install)\b",
+    flags=re.IGNORECASE,
+)
+
+
+FIRST_PERSON_MEDIA_ACTION = re.compile(
+    r"\bI(?:(?:'ll| will|'d| would| might| could| should| want to| plan to|"
+    r"'m going to| am going to)\s+)?"
+    r"(?P<action>read|watch|listen\s+to|play)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def find_mairon_agency_modality_violations(
+    user_input: str,
+    draft: str,
+    conversation=None,
+) -> List[str]:
+    """
+    Deterministic acceptance-stage boundary for Mairon's own agency.
+
+    This is intentionally NOT a catalogue of domains or titles. It checks:
+    - unsupported concrete background/off-turn activity;
+    - unsupported first-person autonomous future actions;
+    - silent media-consumption modality drift when the conversational medium
+      is unambiguous.
+
+    Explicit medium switches inside the draft are allowed.
+    """
+
+    text = str(
+        draft
+        or ""
+    )
+
+    violations = []
+
+    if MAIRON_OFF_TURN_ACTIVITY.search(
+        text
+    ):
+        violations.append(
+            "Mairon claimed unsupported autonomous off-turn activity"
+        )
+
+    if MAIRON_FUTURE_AUTONOMOUS_ACTION.search(
+        text
+    ):
+        violations.append(
+            "Mairon claimed an unsupported autonomous future action"
+        )
+
+    expected_action = (
+        infer_recent_media_consumption_action(
+            user_input=user_input,
+            conversation=conversation,
+        )
+    )
+
+    if not expected_action:
+        return violations
+
+    sentences = re.split(
+        r"(?<=[.!?])\s+|\n+",
+        text,
+    )
+
+    for sentence in sentences:
+        match = (
+            FIRST_PERSON_MEDIA_ACTION.search(
+                sentence
+            )
+        )
+
+        if not match:
+            continue
+
+        action = (
+            match.group(
+                "action"
+            )
+            .lower()
+            .replace(
+                "listen to",
+                "listen",
+            )
+        )
+
+        if action == expected_action:
+            continue
+
+        explicit_sentence_modalities = (
+            _media_modalities_in_text(
+                sentence
+            )
+        )
+
+        # An explicit alternate medium is a deliberate switch/comparison,
+        # not silent drift: "I'd watch the anime adaptation" is allowed even
+        # when the broader conversation is about manga.
+        if action in explicit_sentence_modalities:
+            continue
+
+        violations.append(
+            "media modality drift: conversational context implies "
+            f"'{expected_action}' but Mairon used '{action}' without an explicit "
+            "medium switch"
+        )
+        break
+
+    return list(
+        dict.fromkeys(
+            violations
+        )
+    )
 
 
 def _unsupported_mairon_perception_claims(

@@ -2,7 +2,9 @@ import math
 import os
 import re
 import sqlite3
+import statistics
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -130,8 +132,29 @@ def _connect():
     return connection
 
 
+@contextmanager
+def _connection():
+    """
+    Open one short-lived SQLite connection and always close it.
+
+    sqlite3.Connection.__exit__ commits or rolls back a transaction,
+    but it does NOT close the underlying database handle.  That is
+    observable on Windows when a temporary database cannot be deleted
+    after use.
+    """
+
+    connection = _connect()
+
+    try:
+        with connection:
+            yield connection
+
+    finally:
+        connection.close()
+
+
 def initialise_journal():
-    with _connect() as connection:
+    with _connection() as connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS conversation_turns (
@@ -140,7 +163,8 @@ def initialise_journal():
                 created_at TEXT NOT NULL,
                 channel TEXT NOT NULL,
                 user_text TEXT NOT NULL,
-                assistant_text TEXT NOT NULL
+                assistant_text TEXT NOT NULL,
+                response_ms REAL
             )
             """
         )
@@ -162,10 +186,32 @@ def initialise_journal():
         )
 
 
+        # Existing local journals predate response timing. SQLite's CREATE
+        # TABLE IF NOT EXISTS does not add new columns, so migrate old databases
+        # in place without losing any conversation history.
+        existing_columns = {
+            str(
+                row["name"]
+            )
+            for row in connection.execute(
+                "PRAGMA table_info(conversation_turns)"
+            ).fetchall()
+        }
+
+        if "response_ms" not in existing_columns:
+            connection.execute(
+                """
+                ALTER TABLE conversation_turns
+                ADD COLUMN response_ms REAL
+                """
+            )
+
+
 def record_conversation_turn(
     user_text,
     assistant_text,
     channel="text",
+    response_seconds=None,
 ):
     """
     Persist one completed user<->Mairon turn locally.
@@ -193,7 +239,27 @@ def record_conversation_turn(
 
     created_at = _now().isoformat()
 
-    with _connect() as connection:
+    response_ms = None
+
+    if response_seconds is not None:
+        try:
+            response_ms = (
+                max(
+                    0.0,
+                    float(
+                        response_seconds
+                    ),
+                )
+                * 1000.0
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            response_ms = None
+
+    with _connection() as connection:
         cursor = connection.execute(
             """
             INSERT INTO conversation_turns (
@@ -201,9 +267,10 @@ def record_conversation_turn(
                 created_at,
                 channel,
                 user_text,
-                assistant_text
+                assistant_text,
+                response_ms
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 CURRENT_SESSION_ID,
@@ -211,6 +278,7 @@ def record_conversation_turn(
                 str(channel or "text"),
                 user_value,
                 assistant_value,
+                response_ms,
             )
         )
 
@@ -327,7 +395,82 @@ def _load_candidate_rows(
         int(max_scan)
     )
 
-    with _connect() as connection:
+    with _connection() as connection:
+        rows = connection.execute(
+            query,
+            parameters,
+        ).fetchall()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+
+def load_conversation_turns(
+    include_current_session=True,
+    newest_first=False,
+    limit=None,
+):
+    """
+    Load recorded dialogue deterministically, without semantic ranking.
+
+    This is for Core-owned structured recovery/migration tasks where the
+    caller must inspect actual historical evidence rather than trust a
+    relevance search to surface the right turn.
+
+    Ordinary conversational recall should continue using
+    search_relevant_turns().
+    """
+
+    initialise_journal()
+
+    query = """
+        SELECT
+            id,
+            session_id,
+            created_at,
+            channel,
+            user_text,
+            assistant_text
+        FROM conversation_turns
+    """
+
+    parameters = []
+
+    if not include_current_session:
+        query += """
+            WHERE session_id != ?
+        """
+
+        parameters.append(
+            CURRENT_SESSION_ID
+        )
+
+    query += (
+        " ORDER BY id "
+        + (
+            "DESC"
+            if newest_first
+            else "ASC"
+        )
+    )
+
+    if limit is not None:
+        limit_value = int(
+            limit
+        )
+
+        if limit_value <= 0:
+            return []
+
+        query += " LIMIT ?"
+
+        parameters.append(
+            limit_value
+        )
+
+    with _connection() as connection:
         rows = connection.execute(
             query,
             parameters,
@@ -518,7 +661,7 @@ def _fetch_session_neighbourhood(
 ):
     initialise_journal()
 
-    with _connect() as connection:
+    with _connection() as connection:
         anchor = connection.execute(
             """
             SELECT id
@@ -783,7 +926,7 @@ def get_current_session_id():
 def get_turn_count():
     initialise_journal()
 
-    with _connect() as connection:
+    with _connection() as connection:
         row = connection.execute(
             """
             SELECT COUNT(*) AS count
@@ -794,3 +937,188 @@ def get_turn_count():
     return int(
         row["count"]
     )
+
+
+
+def _percentile_nearest_rank(
+    values,
+    percentile,
+):
+    if not values:
+        return None
+
+    ordered = sorted(
+        float(
+            value
+        )
+        for value in values
+    )
+
+    rank = max(
+        1,
+        math.ceil(
+            (
+                float(
+                    percentile
+                )
+                / 100.0
+            )
+            * len(
+                ordered
+            )
+        ),
+    )
+
+    return ordered[
+        min(
+            rank,
+            len(
+                ordered
+            ),
+        )
+        - 1
+    ]
+
+
+def get_response_timing_stats(
+    limit=None,
+    session_id=None,
+):
+    """
+    Return statistics for measured response-ready latency.
+
+    Only turns recorded after response timing was introduced are included.
+    Historical journal rows with response_ms=NULL remain valid conversation
+    history but do not distort latency statistics.
+    """
+
+    initialise_journal()
+
+    query = """
+        SELECT response_ms
+        FROM conversation_turns
+        WHERE response_ms IS NOT NULL
+    """
+
+    parameters = []
+
+    if session_id:
+        query += """
+            AND session_id = ?
+        """
+
+        parameters.append(
+            str(
+                session_id
+            )
+        )
+
+    query += """
+        ORDER BY id DESC
+    """
+
+    if limit is not None:
+        try:
+            safe_limit = max(
+                1,
+                int(
+                    limit
+                ),
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            safe_limit = None
+
+        if safe_limit is not None:
+            query += """
+                LIMIT ?
+            """
+
+            parameters.append(
+                safe_limit
+            )
+
+    with _connection() as connection:
+        rows = connection.execute(
+            query,
+            parameters,
+        ).fetchall()
+
+    values_ms = [
+        float(
+            row["response_ms"]
+        )
+        for row in rows
+        if row["response_ms"] is not None
+    ]
+
+    if not values_ms:
+        return {
+            "count": 0,
+            "average_seconds": None,
+            "median_seconds": None,
+            "p95_seconds": None,
+            "fastest_seconds": None,
+            "slowest_seconds": None,
+        }
+
+    return {
+        "count": len(
+            values_ms
+        ),
+        "average_seconds": (
+            sum(
+                values_ms
+            )
+            / len(
+                values_ms
+            )
+            / 1000.0
+        ),
+        "median_seconds": (
+            statistics.median(
+                values_ms
+            )
+            / 1000.0
+        ),
+        "p95_seconds": (
+            _percentile_nearest_rank(
+                values_ms,
+                95,
+            )
+            / 1000.0
+        ),
+        "fastest_seconds": (
+            min(
+                values_ms
+            )
+            / 1000.0
+        ),
+        "slowest_seconds": (
+            max(
+                values_ms
+            )
+            / 1000.0
+        ),
+    }
+
+
+def get_response_timing_report(
+    recent_limit=20,
+):
+    """
+    Convenience bundle used by the local /timing diagnostic command.
+    """
+
+    return {
+        "session": get_response_timing_stats(
+            session_id=CURRENT_SESSION_ID
+        ),
+        "recent": get_response_timing_stats(
+            limit=recent_limit
+        ),
+        "lifetime": get_response_timing_stats(),
+    }

@@ -102,6 +102,44 @@ OPINION_PATTERNS = [
     r"\bunderrated\b",
 ]
 
+
+# Acceptance-stage routing: questions that ask for MAIRON'S subjective
+# preference/ranking are not factual questions. Treating them as factual
+# accidentally applied the short 96-token factual generation cap and could
+# truncate perfectly normal answers such as "What are your top 3 mangas?".
+#
+# Keep these patterns deliberately preference-shaped so factual assistant
+# questions such as "What model are you?" still route normally.
+ASSISTANT_OPINION_REQUEST_PATTERNS = [
+    r"\bwhat(?:'s| is| are)\s+your\s+(?:top|favo(?:u)?rite)\b",
+    r"\bwhat\s+(?:do|would)\s+you\s+(?:prefer|pick|choose)\b",
+    r"\bwhat\s+do\s+you\s+think\s+(?:of|about)\b",
+    r"\bwhich\b.{0,80}\bdo\s+you\s+prefer\b",
+    r"\bwhich\b.{0,80}\bwould\s+you\s+(?:pick|choose)\b",
+    r"\bhow\s+would\s+you\s+rank\b",
+    r"\byour\s+(?:top|favo(?:u)?rite)\s+\d+\b",
+]
+
+
+ASSISTANT_SOCIAL_STATE_PATTERNS = [
+    # Direct reciprocal/social check-ins addressed to Mairon are live
+    # conversation, not factual questions requiring epistemic routing.
+    #
+    # Keep this about SOCIAL state. "What model are you?" / "What can you do?"
+    # remain factual/capability questions.
+    r"^(?:hey|yo|hi|hello|morning|evening)?[\s,!-]*(?:mairon[\s,!-]*)?"
+    r"how\s+(?:are\s+you|have\s+you\s+been)\b",
+    r"^(?:hey|yo|hi|hello)?[\s,!-]*(?:mairon[\s,!-]*)?"
+    r"how(?:'s|\s+is|\s+was|\s+has)\s+your\s+"
+    r"(?:day|morning|afternoon|evening|night|week|weekend)\b",
+    r"^(?:hey|yo|hi|hello)?[\s,!-]*(?:mairon[\s,!-]*)?"
+    r"how\s+did\s+your\s+(?:day|morning|afternoon|evening|night|week|weekend)\s+go\b",
+    r"^(?:hey|yo|hi|hello)?[\s,!-]*(?:mairon[\s,!-]*)?"
+    r"(?:you\s+(?:good|okay|ok|alright)|everything\s+good\s+with\s+you)\b",
+    r"^(?:hey|yo|hi|hello)?[\s,!-]*(?:mairon[\s,!-]*)?"
+    r"what\s+(?:are\s+you|have\s+you\s+been)\s+up\s+to\b",
+]
+
 CONVERSATION_RECALL_PATTERNS = [
     r"\bwhat did i say\b",
     r"\bwhat did i tell you\b",
@@ -156,6 +194,25 @@ RECOMMENDATION_REQUEST_PATTERNS = [
     r"\bany suggestions\b",
     r"\bwhat shoes should\b",
     r"\bwhat would you buy\b",
+]
+
+
+CONTENT_GENERATION_REQUEST_PATTERNS = [
+    # General imperative content/planning requests. Match request-shaped
+    # grammar rather than the first verb alone.
+    #
+    # "Give me a routine" / "Give a detailed explanation" are requests.
+    # "Give it two days" is ordinary conversational language and must not
+    # be captured merely because it starts with "give".
+    r"^\s*(?:please\s+)?give\s+(?:(?:me|us)\b|(?:a|an|the|some|another|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\b)",
+    r"^\s*(?:please\s+)?(?:build|create|write|draft|design|generate)\s+(?:me\s+|us\s+)?\S",
+    # "Make a list" / "Make me a plan" are request-shaped; "make it three"
+    # is not automatically a content-generation request.
+    r"^\s*(?:please\s+)?make\s+(?:(?:me|us)\b|(?:a|an|the|some|another)\b)",
+    # "Plan a trip" is request-shaped; "plan on..." / "plan to..." are not.
+    r"^\s*(?:please\s+)?plan\s+(?!(?:on|to)\b)(?:me\s+|us\s+)?\S",
+    r"^\s*(?:please\s+)?put\s+together\s+(?:me\s+|us\s+)?\S",
+    r"^\s*(?:please\s+)?come\s+up\s+with\s+\S",
 ]
 
 FOLLOW_UP_PRONOUNS = {
@@ -820,6 +877,54 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.factuality = "mixed"
         state.confidence = 0.92
         state.add_reason("explicit recommendation request")
+        return state
+
+
+    if _matches_any(
+        text,
+        CONTENT_GENERATION_REQUEST_PATTERNS,
+    ):
+        state.speech_act = "request_content"
+        state.intent = "recommendation_request"
+        state.should_recommend = True
+        state.should_continue_conversation = True
+        state.factuality = "mixed"
+        state.confidence = 0.9
+        state.add_reason(
+            "explicit content-generation/planning request"
+        )
+        return state
+
+    if _matches_any(
+        text,
+        ASSISTANT_OPINION_REQUEST_PATTERNS,
+    ):
+        state.speech_act = "question"
+        state.intent = "share_opinion"
+        state.should_recommend = False
+        state.should_continue_conversation = True
+        state.factuality = "subjective"
+        state.confidence = 0.95
+        state.add_reason(
+            "explicit request for Mairon's subjective preference/opinion"
+        )
+        return state
+
+
+    if _matches_any(
+        text,
+        ASSISTANT_SOCIAL_STATE_PATTERNS,
+    ):
+        state.speech_act = "social_question"
+        state.intent = "casual_conversation"
+        state.should_recommend = False
+        state.should_continue_conversation = True
+        state.should_use_tools = False
+        state.factuality = "none"
+        state.confidence = 0.97
+        state.add_reason(
+            "assistant-directed social check-in"
+        )
         return state
 
     if _matches_any(text, OPINION_PATTERNS):

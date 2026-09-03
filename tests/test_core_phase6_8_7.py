@@ -92,13 +92,21 @@ def run():
     )
 
     # --------------------------------------------------
-    # 3. Heavier reasoning/opinion lanes still retain model
-    #    defaults rather than globally disabling reasoning.
+    # 3. Acceptance cleanup 2 extends the no-thinking fast
+    #    path to lightweight share_opinion turns on Qwen3.5.
+    #    Recommendation/action lanes remain untouched.
     # --------------------------------------------------
+
+    assert (
+        build_direct_think_setting(
+            "share_opinion",
+            model_name="qwen3.5:9b",
+        )
+        is False
+    )
 
     for intent in (
         "recommendation_request",
-        "share_opinion",
         "action_request",
     ):
         assert (
