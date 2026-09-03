@@ -4,6 +4,7 @@ import glob
 import os
 import shutil
 import subprocess
+from urllib.parse import urlencode
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -219,6 +220,129 @@ def _launch_folder(
 
     return {
         "success": True,
+    }
+
+
+
+def open_chrome_search(
+    query: str,
+) -> dict:
+    """
+    Open an explicit Google search in Chrome.
+
+    Query text is URL-encoded as data and never becomes shell text.
+    """
+
+    if os.name != "nt":
+        return _windows_only_error()
+
+    value = str(
+        query
+        or ""
+    ).strip()
+
+    if (
+        not value
+        or len(
+            value
+        ) > 500
+    ):
+        return {
+            "success": False,
+            "message": "That search query is empty or too long.",
+        }
+
+    chrome = _find_chrome()
+
+    if not chrome:
+        return {
+            "success": False,
+            "message": (
+                "I couldn't find Chrome on the Windows desktop node."
+            ),
+        }
+
+    url = (
+        "https://www.google.com/search?"
+        + urlencode({
+            "q": value,
+        })
+    )
+
+    result = _launch_process([
+        chrome,
+        url,
+    ])
+
+    if result.get(
+        "success"
+    ) is not True:
+        return {
+            "success": False,
+            "message": (
+                result.get(
+                    "message"
+                )
+                or "I couldn't open that Chrome search."
+            ),
+        }
+
+    return {
+        "success": True,
+        "status": "search_opened",
+        "browser": "chrome",
+        "query": value,
+        "url": url,
+        "message": "Chrome search opened.",
+    }
+
+
+def launch_steam_game_appid(
+    appid: str,
+) -> dict:
+    """
+    Launch one locally resolved Steam AppID through Steam's URL protocol.
+
+    The AppID must already have been selected by Core from local Steam
+    manifests. Arbitrary URI text is never accepted here.
+    """
+
+    if os.name != "nt":
+        return _windows_only_error()
+
+    value = str(
+        appid
+        or ""
+    ).strip()
+
+    if not value.isdigit():
+        return {
+            "success": False,
+            "message": "Steam AppID must be numeric.",
+        }
+
+    result = _launch_uri(
+        f"steam://run/{value}"
+    )
+
+    if result.get(
+        "success"
+    ) is not True:
+        return {
+            "success": False,
+            "message": (
+                result.get(
+                    "message"
+                )
+                or "Steam rejected the game launch request."
+            ),
+        }
+
+    return {
+        "success": True,
+        "status": "steam_launch_requested",
+        "appid": value,
+        "message": "Steam game launch requested.",
     }
 
 

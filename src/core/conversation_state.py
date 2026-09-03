@@ -73,6 +73,11 @@ class ConversationState:
         default_factory=list
     )
 
+    # Keep the last Steam-game action separate from desktop-app referents.
+    # Until game close/control is implemented, this prevents "close it" from
+    # accidentally targeting an older desktop app after a game launch.
+    active_steam_game_title: Optional[str] = None
+
     def remember_subject(self, subject: Optional[str]) -> None:
         value = str(subject or "").strip()
 
@@ -149,6 +154,22 @@ class ConversationState:
                     target_id
                 )
 
+        elif turn.intent == "browser_search":
+            self.remember_desktop_target(
+                "chrome"
+            )
+
+        elif turn.intent == "launch_steam_game":
+            self.active_desktop_target = None
+
+            self.active_steam_game_title = str(
+                turn.entities.get(
+                    "steam_game_title",
+                    "",
+                )
+                or ""
+            ).strip() or None
+
     # --------------------------------------------------
     # Desktop-specific working referent
     # --------------------------------------------------
@@ -166,6 +187,7 @@ class ConversationState:
             return
 
         self.active_desktop_target = value
+        self.active_steam_game_title = None
 
         self.recent_desktop_targets = [
             item

@@ -4,7 +4,9 @@ from typing import Optional
 from core.turn_state import TurnState
 from core.email_intent import is_inbox_attention_request
 from core.desktop_catalog import (
+    extract_browser_search_request,
     extract_desktop_action_request,
+    extract_steam_game_launch_candidate,
 )
 
 
@@ -744,6 +746,50 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.add_reason("empty input")
         return state
 
+    browser_search = (
+        extract_browser_search_request(
+            raw
+        )
+    )
+
+    if browser_search:
+        query = str(
+            browser_search.get(
+                "query",
+                "",
+            )
+            or ""
+        ).strip()
+
+        state.speech_act = "request_action"
+        state.intent = "browser_search"
+        state.subject = query
+
+        state.entities[
+            "browser"
+        ] = "chrome"
+
+        state.entities[
+            "search_query"
+        ] = query
+
+        state.requested_action = "open_browser_search"
+        state.requires_private_data = False
+        state.requires_live_data = True
+        state.factuality = "action_result"
+        state.preferred_authority = "desktop"
+        state.should_use_tools = True
+        state.should_answer_directly = False
+        state.should_recommend = False
+        state.should_continue_conversation = False
+        state.confidence = 0.99
+
+        state.add_reason(
+            "explicit Chrome/Google search action"
+        )
+
+        return state
+
     desktop_action = (
         extract_desktop_action_request(
             raw,
@@ -820,6 +866,47 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
             state.add_reason(
                 "explicit action request for an approved desktop target"
             )
+
+        return state
+
+    steam_game_candidate = (
+        extract_steam_game_launch_candidate(
+            raw
+        )
+    )
+
+    if steam_game_candidate:
+        requested_title = str(
+            steam_game_candidate.get(
+                "title",
+                "",
+            )
+            or ""
+        ).strip()
+
+        state.speech_act = "request_action"
+        state.intent = "launch_steam_game"
+        state.subject = requested_title
+
+        state.entities[
+            "steam_game_title"
+        ] = requested_title
+
+        state.requested_action = "launch_steam_game"
+        state.requires_private_data = True
+        state.requires_live_data = True
+        state.factuality = "action_result"
+        state.preferred_authority = "desktop"
+        state.should_use_tools = True
+        state.should_answer_directly = False
+        state.should_recommend = False
+        state.should_continue_conversation = False
+        state.confidence = 0.92
+
+        state.add_reason(
+            "launch-like request for a possible installed Steam game; "
+            "Core must verify against local Steam manifests before execution"
+        )
 
         return state
 

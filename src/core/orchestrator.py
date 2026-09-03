@@ -27,6 +27,12 @@ from core.workflows.application_launch import (
 from core.workflows.application_control import (
     control_approved_application,
 )
+from core.workflows.browser_search import (
+    open_browser_search,
+)
+from core.workflows.steam_game_launch import (
+    launch_installed_steam_game,
+)
 from core.workflows.email_read import (
     read_selected_email,
 )
@@ -297,6 +303,72 @@ class MaironCore:
         direct_response = None
 
         # --------------------------------------------------
+        # Deterministic browser search workflow
+        # --------------------------------------------------
+
+        if turn.intent == "browser_search":
+            query = str(
+                turn.entities.get(
+                    "search_query",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            workflow_result = (
+                open_browser_search(
+                    query=query
+                )
+            )
+
+            contract = build_answer_contract(
+                turn=turn,
+                route=route,
+                evidence=(
+                    workflow_result.evidence
+                    if workflow_result
+                    else None
+                ),
+            )
+
+            if (
+                workflow_result
+                and workflow_result.answer_fact
+            ):
+                contract.required_claims.append(
+                    workflow_result.answer_fact
+                )
+
+            direct_response = (
+                workflow_result.answer_fact
+                if (
+                    workflow_result
+                    and workflow_result.success
+                    and workflow_result.answer_fact
+                )
+                else (
+                    workflow_result.error
+                    if (
+                        workflow_result
+                        and workflow_result.error
+                    )
+                    else "I couldn't open that Chrome search."
+                )
+            )
+
+            self.conversation_state.update_from_turn(
+                turn
+            )
+
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
+                workflow_result=workflow_result,
+                direct_response=direct_response,
+            )
+
+        # --------------------------------------------------
         # Deterministic approved desktop application launch
         # --------------------------------------------------
 
@@ -352,6 +424,72 @@ class MaironCore:
                         "I couldn't open that desktop target."
                     )
                 )
+
+            self.conversation_state.update_from_turn(
+                turn
+            )
+
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
+                workflow_result=workflow_result,
+                direct_response=direct_response,
+            )
+
+        # --------------------------------------------------
+        # Deterministic installed Steam game launch
+        # --------------------------------------------------
+
+        if turn.intent == "launch_steam_game":
+            requested_title = str(
+                turn.entities.get(
+                    "steam_game_title",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            workflow_result = (
+                launch_installed_steam_game(
+                    requested_title=requested_title
+                )
+            )
+
+            contract = build_answer_contract(
+                turn=turn,
+                route=route,
+                evidence=(
+                    workflow_result.evidence
+                    if workflow_result
+                    else None
+                ),
+            )
+
+            if (
+                workflow_result
+                and workflow_result.answer_fact
+            ):
+                contract.required_claims.append(
+                    workflow_result.answer_fact
+                )
+
+            direct_response = (
+                workflow_result.answer_fact
+                if (
+                    workflow_result
+                    and workflow_result.success
+                    and workflow_result.answer_fact
+                )
+                else (
+                    workflow_result.error
+                    if (
+                        workflow_result
+                        and workflow_result.error
+                    )
+                    else "I couldn't launch that Steam game."
+                )
+            )
 
             self.conversation_state.update_from_turn(
                 turn

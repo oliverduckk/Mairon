@@ -348,3 +348,179 @@ def extract_desktop_action_request(
         "display_name": target["display_name"],
         "inherited": inherited,
     }
+
+
+BROWSER_SEARCH_PATTERNS = (
+    re.compile(
+        r"^\s*(?:open|launch|start)\s+(?:google\s+)?chrome\s+and\s+"
+        r"(?:search|google|look\s+up)(?:\s+for)?\s+(?P<query>.+?)\s*[.!?]*$",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*search\s+google(?:\s+for)?\s+(?P<query>.+?)\s*[.!?]*$",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*google\s+(?P<query>.+?)\s*[.!?]*$",
+        flags=re.IGNORECASE,
+    ),
+)
+
+STEAM_GAME_LAUNCH_PATTERN = re.compile(
+    r"^\s*(?:open|launch|start|run|play)(?:\s+up)?\s+(?:the\s+)?"
+    r"(?P<title>.+?)\s*[.!?]*$",
+    flags=re.IGNORECASE,
+)
+
+STEAM_GAME_TRAILING_QUALIFIER = re.compile(
+    r"\s+(?:on|through|via)\s+steam\s*$",
+    flags=re.IGNORECASE,
+)
+
+STEAM_GAME_LEADING_QUALIFIER = re.compile(
+    r"^\s*(?:steam\s+game\s+|game\s+)",
+    flags=re.IGNORECASE,
+)
+
+
+def extract_browser_search_request(
+    text: str,
+) -> Optional[dict]:
+    """
+    Resolve an explicit Chrome/Google search action.
+
+    The query remains inert data. The desktop execution layer URL-encodes it;
+    it is never shell text.
+    """
+
+    raw = str(
+        text
+        or ""
+    ).strip()
+
+    if not raw:
+        return None
+
+    for pattern in BROWSER_SEARCH_PATTERNS:
+        match = pattern.match(
+            raw
+        )
+
+        if not match:
+            continue
+
+        query = str(
+            match.group(
+                "query"
+            )
+            or ""
+        ).strip()
+
+        if (
+            not query
+            or len(
+                query
+            ) > 500
+        ):
+            return None
+
+        return {
+            "browser": "chrome",
+            "query": query,
+        }
+
+    return None
+
+
+def extract_steam_game_launch_candidate(
+    text: str,
+) -> Optional[dict]:
+    """
+    Extract a possible installed Steam game title from a launch-like request.
+
+    This is only syntactic candidate extraction. Whether the title is actually
+    installed is decided later by Core from Steam's local manifests.
+    """
+
+    raw = str(
+        text
+        or ""
+    ).strip()
+
+    if not raw:
+        return None
+
+    match = STEAM_GAME_LAUNCH_PATTERN.match(
+        raw
+    )
+
+    if not match:
+        return None
+
+    title = str(
+        match.group(
+            "title"
+        )
+        or ""
+    ).strip()
+
+    title = STEAM_GAME_TRAILING_QUALIFIER.sub(
+        "",
+        title,
+    ).strip()
+
+    title = STEAM_GAME_LEADING_QUALIFIER.sub(
+        "",
+        title,
+    ).strip()
+
+    if (
+        not title
+        or len(
+            title
+        ) > 160
+    ):
+        return None
+
+    # Named desktop targets are handled by the desktop action parser instead.
+    if find_named_desktop_target(
+        title
+    ):
+        return None
+
+    lowered = title.lower()
+
+    # Do not hijack obvious future file/folder/browser operations.
+    if any(
+        marker in lowered
+        for marker in (
+            "http://",
+            "https://",
+            "\\\\",
+        )
+    ):
+        return None
+
+    if re.search(
+        r"\.(?:exe|pdf|docx?|xlsx?|pptx?|txt|py|jpg|jpeg|png|zip)\b",
+        lowered,
+    ):
+        return None
+
+    if re.search(
+        r"\b(?:file|folder|directory|website|webpage|settings|control panel|task manager)\b",
+        lowered,
+    ):
+        return None
+
+    # Compound workflows are earned separately; do not silently discard a
+    # second requested action.
+    if re.search(
+        r"\band\s+(?:search|open|close|play|type|send|write|go|navigate)\b",
+        lowered,
+    ):
+        return None
+
+    return {
+        "title": title,
+    }
