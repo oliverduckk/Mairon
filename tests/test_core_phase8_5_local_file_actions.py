@@ -312,17 +312,20 @@ def run():
 
             assert open_calls == before
 
-            # Multiple-result search must not replace the unique file referent.
+            # Multiple-result search invalidates the old singular referent.
             assert (
                 core.conversation_state
                 .active_local_file_path
-                == str(
-                    main_py.resolve()
-                )
+                is None
             )
 
+            assert len(
+                core.conversation_state
+                .active_local_file_candidates
+            ) == 2
+
             # --------------------------------------------------
-            # 6. Deictic open only inherits when file context is active.
+            # 6. Deictic open only inherits after a unique file is active.
             # --------------------------------------------------
 
             # Re-establish file-open context.

@@ -89,6 +89,10 @@ class ConversationState:
     # prose never becomes file authority.
     active_local_file_path: Optional[str] = None
     active_local_file_name: Optional[str] = None
+    active_local_file_candidates: List[Dict[str, Any]] = field(
+        default_factory=list
+    )
+    active_local_file_pending_action: Optional[str] = None
 
     # Keep the last Steam-game action separate from desktop-app referents.
     # Until game close/control is implemented, this prevents "close it" from
@@ -322,6 +326,76 @@ class ConversationState:
             ).strip()
             or None
         )
+
+        self.active_local_file_candidates = []
+        self.active_local_file_pending_action = None
+
+    def remember_local_file_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        pending_action: Optional[str] = None,
+    ) -> None:
+        cleaned = []
+
+        for candidate in list(
+            candidates
+            or []
+        )[:12]:
+            if not isinstance(
+                candidate,
+                dict,
+            ):
+                continue
+
+            path = str(
+                candidate.get(
+                    "path",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            name = str(
+                candidate.get(
+                    "name",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if not path:
+                continue
+
+            cleaned.append({
+                "path": path,
+                "name": name,
+            })
+
+        self.active_local_file_candidates = cleaned
+        self.active_local_file_path = None
+        self.active_local_file_name = None
+
+        action = str(
+            pending_action
+            or ""
+        ).strip().lower()
+
+        self.active_local_file_pending_action = (
+            action
+            if action in {
+                "open",
+                "find",
+            }
+            else None
+        )
+
+    def clear_local_file_referent(
+        self,
+    ) -> None:
+        self.active_local_file_path = None
+        self.active_local_file_name = None
+        self.active_local_file_candidates = []
+        self.active_local_file_pending_action = None
 
     # --------------------------------------------------
     # Gmail-specific working referents

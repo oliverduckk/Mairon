@@ -37,7 +37,9 @@ from core.workflows.steam_game_launch import (
 from core.workflows.file_actions import (
     find_local_file,
     open_local_file,
+    open_local_files,
     open_trusted_folder,
+    select_local_file,
 )
 from core.workflows.email_read import (
     read_selected_email,
@@ -315,6 +317,9 @@ class MaironCore:
         if turn.intent in {
             "find_local_file",
             "open_local_file",
+            "open_local_files",
+            "select_local_file",
+            "local_file_choice_required",
             "open_local_folder",
         }:
             query = str(
@@ -333,6 +338,24 @@ class MaironCore:
                 or ""
             ).strip() or None
 
+            resolved_paths = [
+                str(
+                    item
+                    or ""
+                ).strip()
+                for item in list(
+                    turn.entities.get(
+                        "local_file_paths",
+                        [],
+                    )
+                    or []
+                )
+                if str(
+                    item
+                    or ""
+                ).strip()
+            ]
+
             display_name = str(
                 turn.entities.get(
                     "local_file_name",
@@ -346,6 +369,69 @@ class MaironCore:
                     query=query,
                 )
 
+            elif turn.intent == "local_file_choice_required":
+                candidates = list(
+                    self.conversation_state
+                    .active_local_file_candidates
+                    or []
+                )
+
+                candidate_names = [
+                    str(
+                        item.get(
+                            "name",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+                    for item in candidates
+                    if str(
+                        item.get(
+                            "name",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+                ]
+
+                if candidate_names:
+                    if len(
+                        candidate_names
+                    ) == 2:
+                        response = (
+                            "I found two matching files: "
+                            f"{candidate_names[0]} and "
+                            f"{candidate_names[1]}. "
+                            "Tell me which one you want."
+                        )
+                    else:
+                        response = (
+                            f"I found {len(candidate_names)} matching files. "
+                            "Tell me which one you want."
+                        )
+                else:
+                    response = (
+                        "I don't have one unambiguous file selected yet."
+                    )
+
+                contract = build_answer_contract(
+                    turn=turn,
+                    route=route,
+                    evidence=None,
+                )
+
+                self.conversation_state.update_from_turn(
+                    turn
+                )
+
+                return CoreDecision(
+                    turn=turn,
+                    epistemic_route=route,
+                    answer_contract=contract,
+                    workflow_result=None,
+                    direct_response=response,
+                )
+
             elif turn.intent == "open_local_folder":
                 workflow_result = open_trusted_folder(
                     path=(
@@ -355,6 +441,23 @@ class MaironCore:
                     display_name=(
                         display_name
                         or "Folder"
+                    ),
+                )
+
+            elif turn.intent == "open_local_files":
+                workflow_result = open_local_files(
+                    resolved_paths=resolved_paths,
+                )
+
+            elif turn.intent == "select_local_file":
+                workflow_result = select_local_file(
+                    resolved_path=(
+                        resolved_path
+                        or ""
+                    ),
+                    display_name=(
+                        display_name
+                        or None
                     ),
                 )
 
@@ -397,6 +500,44 @@ class MaironCore:
                         "local_file_name"
                     ] = selected_name
 
+                matches = list(
+                    workflow_result.data.get(
+                        "matches",
+                        [],
+                    )
+                    or []
+                )
+
+                if (
+                    workflow_result.status
+                    == "multiple_matches"
+                ):
+                    pending_action = (
+                        "open"
+                        if turn.intent == "open_local_file"
+                        else "find"
+                    )
+
+                    self.conversation_state.remember_local_file_candidates(
+                        matches,
+                        pending_action=pending_action,
+                    )
+
+                elif (
+                    selected_path
+                    and turn.intent
+                    != "open_local_files"
+                ):
+                    self.conversation_state.remember_local_file(
+                        path=selected_path,
+                        name=selected_name,
+                    )
+
+                elif turn.intent == "open_local_files":
+                    # Opening an ambiguity set does not make the final item a
+                    # truthful singular referent.
+                    self.conversation_state.clear_local_file_referent()
+
             contract = build_answer_contract(
                 turn=turn,
                 route=route,
@@ -434,6 +575,12 @@ class MaironCore:
                 )
             )
 
+            # File referent truth is resolved above from workflow results,
+            # but generic conversational state still needs the turn itself.
+            #
+            # Ambiguous file results do not put local_file_path on the turn,
+            # so update_from_turn() cannot recreate a stale singular referent.
+            # Unique results do carry the verified path and safely reinforce it.
             self.conversation_state.update_from_turn(
                 turn
             )

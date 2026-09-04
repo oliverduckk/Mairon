@@ -963,6 +963,9 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.intent = {
             "find_file": "find_local_file",
             "open_file": "open_local_file",
+            "open_files": "open_local_files",
+            "select_file": "select_local_file",
+            "candidate_choice_required": "local_file_choice_required",
             "open_folder": "open_local_folder",
         }[
             action
@@ -994,6 +997,24 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
             or ""
         ).strip()
 
+        paths = [
+            str(
+                item
+                or ""
+            ).strip()
+            for item in list(
+                local_file_action.get(
+                    "paths",
+                    [],
+                )
+                or []
+            )
+            if str(
+                item
+                or ""
+            ).strip()
+        ]
+
         if query:
             state.entities[
                 "local_file_query"
@@ -1003,6 +1024,11 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
             state.entities[
                 "local_file_path"
             ] = path
+
+        if paths:
+            state.entities[
+                "local_file_paths"
+            ] = paths
 
         if local_file_action.get(
             "display_name"
@@ -1018,6 +1044,9 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.requested_action = {
             "find_file": "find_local_file",
             "open_file": "open_local_file",
+            "open_files": "open_local_files",
+            "select_file": "select_local_file",
+            "candidate_choice_required": "local_file_choice_required",
             "open_folder": "open_local_folder",
         }[
             action

@@ -320,6 +320,201 @@ def open_local_file(
     )
 
 
+def select_local_file(
+    resolved_path: str,
+    display_name: Optional[str] = None,
+) -> WorkflowResult:
+    path = Path(
+        str(
+            resolved_path
+            or ""
+        )
+    )
+
+    roots = get_approved_file_roots()
+
+    if (
+        not is_path_within_approved_roots(
+            path,
+            roots,
+        )
+        or not is_safe_openable_file(
+            path,
+            roots,
+        )
+    ):
+        return WorkflowResult(
+            success=False,
+            status="invalid_referent",
+            error=(
+                "That file is no longer an approved local file."
+            ),
+        )
+
+    name = (
+        str(
+            display_name
+            or ""
+        ).strip()
+        or path.name
+    )
+
+    return WorkflowResult(
+        success=True,
+        status="file_selected",
+        answer_fact=(
+            f"Selected {name}."
+        ),
+        data={
+            "selected_path": str(
+                path.resolve()
+            ),
+            "selected_name": name,
+        },
+    )
+
+
+def open_local_files(
+    resolved_paths,
+) -> WorkflowResult:
+    paths = [
+        str(
+            item
+            or ""
+        ).strip()
+        for item in list(
+            resolved_paths
+            or []
+        )
+        if str(
+            item
+            or ""
+        ).strip()
+    ]
+
+    if not paths:
+        return WorkflowResult(
+            success=False,
+            status="invalid_referent",
+            error=(
+                "There aren't any approved files selected to open."
+            ),
+        )
+
+    opened = []
+
+    for raw_path in paths:
+        path = Path(
+            raw_path
+        )
+
+        roots = get_approved_file_roots()
+
+        if (
+            not is_path_within_approved_roots(
+                path,
+                roots,
+            )
+            or not is_safe_openable_file(
+                path,
+                roots,
+            )
+        ):
+            return WorkflowResult(
+                success=False,
+                status="invalid_referent",
+                error=(
+                    "One of those files is no longer an approved local file."
+                ),
+            )
+
+        result = open_approved_local_path(
+            str(
+                path.resolve()
+            )
+        )
+
+        if result.get(
+            "success"
+        ) is not True:
+            return WorkflowResult(
+                success=False,
+                status=(
+                    result.get(
+                        "status"
+                    )
+                    or "open_failed"
+                ),
+                error=(
+                    result.get(
+                        "message"
+                    )
+                    or f"I couldn't open {path.name}."
+                ),
+                data={
+                    "opened": opened,
+                    "failed_path": str(
+                        path.resolve()
+                    ),
+                },
+            )
+
+        opened.append({
+            "path": str(
+                path.resolve()
+            ),
+            "name": path.name,
+        })
+
+    names = [
+        item[
+            "name"
+        ]
+        for item in opened
+    ]
+
+    if len(
+        names
+    ) == 1:
+        answer = (
+            f"{names[0]} is open."
+        )
+    elif len(
+        names
+    ) == 2:
+        answer = (
+            f"{names[0]} and {names[1]} are open."
+        )
+    else:
+        answer = (
+            f"Opened {len(names)} files."
+        )
+
+    return WorkflowResult(
+        success=True,
+        status="files_opened",
+        answer_fact=answer,
+        data={
+            "opened": opened,
+            "selected_path": (
+                opened[-1][
+                    "path"
+                ]
+                if opened
+                else None
+            ),
+            "selected_name": (
+                opened[-1][
+                    "name"
+                ]
+                if opened
+                else None
+            ),
+        },
+    )
+
+
+
 def open_trusted_folder(
     path: str,
     display_name: str,
