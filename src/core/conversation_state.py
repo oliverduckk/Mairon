@@ -83,6 +83,13 @@ class ConversationState:
         default_factory=list
     )
 
+    # Local-file working referent.
+    #
+    # Only a unique Core-verified approved path is stored here. Prior assistant
+    # prose never becomes file authority.
+    active_local_file_path: Optional[str] = None
+    active_local_file_name: Optional[str] = None
+
     # Keep the last Steam-game action separate from desktop-app referents.
     # Until game close/control is implemented, this prevents "close it" from
     # accidentally targeting an older desktop app after a game launch.
@@ -185,6 +192,33 @@ class ConversationState:
                     site_id
                 )
 
+        elif turn.intent in {
+            "find_local_file",
+            "open_local_file",
+            "open_local_folder",
+        }:
+            path = str(
+                turn.entities.get(
+                    "local_file_path",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            name = str(
+                turn.entities.get(
+                    "local_file_name",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if path:
+                self.remember_local_file(
+                    path=path,
+                    name=name,
+                )
+
         elif turn.intent == "launch_steam_game":
             self.active_desktop_target = None
 
@@ -261,6 +295,32 @@ class ConversationState:
 
         self.recent_browser_sites = (
             self.recent_browser_sites[:8]
+        )
+
+    # --------------------------------------------------
+    # Local-file working referent
+    # --------------------------------------------------
+
+    def remember_local_file(
+        self,
+        path: str,
+        name: Optional[str] = None,
+    ) -> None:
+        value = str(
+            path
+            or ""
+        ).strip()
+
+        if not value:
+            return
+
+        self.active_local_file_path = value
+        self.active_local_file_name = (
+            str(
+                name
+                or ""
+            ).strip()
+            or None
         )
 
     # --------------------------------------------------

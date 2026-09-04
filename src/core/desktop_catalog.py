@@ -368,55 +368,6 @@ STEAM_GAME_LEADING_QUALIFIER = re.compile(
 )
 
 
-def extract_browser_search_request(
-    text: str,
-) -> Optional[dict]:
-    """
-    Resolve an explicit Chrome/Google search action.
-
-    The query remains inert data. The desktop execution layer URL-encodes it;
-    it is never shell text.
-    """
-
-    raw = str(
-        text
-        or ""
-    ).strip()
-
-    if not raw:
-        return None
-
-    for pattern in BROWSER_SEARCH_PATTERNS:
-        match = pattern.match(
-            raw
-        )
-
-        if not match:
-            continue
-
-        query = str(
-            match.group(
-                "query"
-            )
-            or ""
-        ).strip()
-
-        if (
-            not query
-            or len(
-                query
-            ) > 500
-        ):
-            return None
-
-        return {
-            "browser": "chrome",
-            "query": query,
-        }
-
-    return None
-
-
 def extract_steam_game_launch_candidate(
     text: str,
 ) -> Optional[dict]:

@@ -34,6 +34,11 @@ from core.workflows.browser_search import (
 from core.workflows.steam_game_launch import (
     launch_installed_steam_game,
 )
+from core.workflows.file_actions import (
+    find_local_file,
+    open_local_file,
+    open_trusted_folder,
+)
 from core.workflows.email_read import (
     read_selected_email,
 )
@@ -302,6 +307,144 @@ class MaironCore:
 
         workflow_result = None
         direct_response = None
+
+        # --------------------------------------------------
+        # Deterministic approved local file/folder actions
+        # --------------------------------------------------
+
+        if turn.intent in {
+            "find_local_file",
+            "open_local_file",
+            "open_local_folder",
+        }:
+            query = str(
+                turn.entities.get(
+                    "local_file_query",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            resolved_path = str(
+                turn.entities.get(
+                    "local_file_path",
+                    "",
+                )
+                or ""
+            ).strip() or None
+
+            display_name = str(
+                turn.entities.get(
+                    "local_file_name",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if turn.intent == "find_local_file":
+                workflow_result = find_local_file(
+                    query=query,
+                )
+
+            elif turn.intent == "open_local_folder":
+                workflow_result = open_trusted_folder(
+                    path=(
+                        resolved_path
+                        or ""
+                    ),
+                    display_name=(
+                        display_name
+                        or "Folder"
+                    ),
+                )
+
+            else:
+                workflow_result = open_local_file(
+                    query=(
+                        query
+                        or None
+                    ),
+                    resolved_path=resolved_path,
+                )
+
+            if (
+                workflow_result
+                and workflow_result.data
+            ):
+                selected_path = str(
+                    workflow_result.data.get(
+                        "selected_path",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                selected_name = str(
+                    workflow_result.data.get(
+                        "selected_name",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                if selected_path:
+                    turn.entities[
+                        "local_file_path"
+                    ] = selected_path
+
+                if selected_name:
+                    turn.entities[
+                        "local_file_name"
+                    ] = selected_name
+
+            contract = build_answer_contract(
+                turn=turn,
+                route=route,
+                evidence=(
+                    workflow_result.evidence
+                    if workflow_result
+                    else None
+                ),
+            )
+
+            if (
+                workflow_result
+                and workflow_result.answer_fact
+            ):
+                contract.required_claims.append(
+                    workflow_result.answer_fact
+                )
+
+            direct_response = (
+                workflow_result.answer_fact
+                if (
+                    workflow_result
+                    and workflow_result.success
+                    and workflow_result.answer_fact
+                )
+                else (
+                    workflow_result.error
+                    if (
+                        workflow_result
+                        and workflow_result.error
+                    )
+                    else (
+                        "I couldn't complete that local file action."
+                    )
+                )
+            )
+
+            self.conversation_state.update_from_turn(
+                turn
+            )
+
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
+                workflow_result=workflow_result,
+                direct_response=direct_response,
+            )
 
         # --------------------------------------------------
         # Deterministic trusted browser navigation/search

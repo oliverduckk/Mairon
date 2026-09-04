@@ -10,6 +10,9 @@ from core.desktop_catalog import (
 from core.web_catalog import (
     extract_browser_action_request,
 )
+from core.file_catalog import (
+    extract_local_file_action_request,
+)
 
 
 THANKS_PATTERNS = [
@@ -929,6 +932,122 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         else:
             state.add_reason(
                 "explicit action request for an approved desktop target"
+            )
+
+        return state
+
+    local_file_action = (
+        extract_local_file_action_request(
+            raw,
+            conversation_state=(
+                conversation_state
+            ),
+        )
+    )
+
+    if local_file_action:
+        action = str(
+            local_file_action.get(
+                "action",
+                "",
+            )
+            or ""
+        ).strip().lower()
+
+        state.speech_act = (
+            "question"
+            if action == "find_file"
+            else "request_action"
+        )
+
+        state.intent = {
+            "find_file": "find_local_file",
+            "open_file": "open_local_file",
+            "open_folder": "open_local_folder",
+        }[
+            action
+        ]
+
+        state.subject = str(
+            local_file_action.get(
+                "display_name"
+            )
+            or local_file_action.get(
+                "query"
+            )
+            or "local file"
+        ).strip()
+
+        query = str(
+            local_file_action.get(
+                "query",
+                "",
+            )
+            or ""
+        ).strip()
+
+        path = str(
+            local_file_action.get(
+                "path",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if query:
+            state.entities[
+                "local_file_query"
+            ] = query
+
+        if path:
+            state.entities[
+                "local_file_path"
+            ] = path
+
+        if local_file_action.get(
+            "display_name"
+        ):
+            state.entities[
+                "local_file_name"
+            ] = str(
+                local_file_action[
+                    "display_name"
+                ]
+            )
+
+        state.requested_action = {
+            "find_file": "find_local_file",
+            "open_file": "open_local_file",
+            "open_folder": "open_local_folder",
+        }[
+            action
+        ]
+
+        state.requires_private_data = True
+        state.requires_live_data = True
+        state.factuality = "tool_verified"
+        state.preferred_authority = "desktop"
+        state.should_use_tools = True
+        state.should_answer_directly = False
+        state.should_recommend = False
+        state.should_continue_conversation = False
+        state.confidence = 0.98
+
+        if local_file_action.get(
+            "inherited"
+        ):
+            state.is_follow_up = True
+
+            state.resolved_referents[
+                "it"
+            ] = state.subject
+
+            state.add_reason(
+                "inherited active local-file referent from Core session state"
+            )
+        else:
+            state.add_reason(
+                "explicit approved local file/folder request"
             )
 
         return state
