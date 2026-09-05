@@ -97,6 +97,10 @@ class AnswerContractRuntime:
         default_factory=tuple
     )
 
+    verified_evidence_claims: Tuple[str, ...] = field(
+        default_factory=tuple
+    )
+
     forbidden_behaviours: Tuple[str, ...] = field(
         default_factory=tuple
     )
@@ -293,6 +297,31 @@ def runtime_from_answer_contract(
                 or []
             )
         ),
+        verified_evidence_claims=tuple(
+            str(
+                item.claim
+            )
+            for item in (
+                getattr(
+                    getattr(
+                        contract,
+                        "evidence",
+                        None,
+                    ),
+                    "evidence",
+                    [],
+                )
+                or []
+            )
+            if str(
+                getattr(
+                    item,
+                    "claim",
+                    "",
+                )
+                or ""
+            ).strip()
+        ),
         forbidden_behaviours=tuple(
             str(
                 item
@@ -443,6 +472,78 @@ def _parse_resolved_referents(
     return resolved
 
 
+def _parse_verified_evidence_claims(
+    contract_text: str,
+) -> Tuple[str, ...]:
+    """
+    Transitional parser for VERIFIED EVIDENCE.
+
+    This remains at the provider-ingress compatibility boundary beside the
+    other legacy parsers. Internal validators consume structured claims.
+    """
+
+    claims = []
+    current = []
+    in_section = False
+
+    for raw_line in str(
+        contract_text
+        or ""
+    ).splitlines():
+        line = raw_line.rstrip()
+
+        stripped = line.strip()
+
+        if stripped == "VERIFIED EVIDENCE:":
+            in_section = True
+            continue
+
+        if not in_section:
+            continue
+
+        if (
+            stripped
+            and stripped.endswith(":")
+            and stripped.upper() == stripped
+        ):
+            break
+
+        if stripped.startswith("- "):
+            if current:
+                claims.append(
+                    "\n".join(
+                        current
+                    ).strip()
+                )
+                current = []
+
+            current.append(
+                stripped[
+                    2:
+                ]
+            )
+
+        elif current:
+            current.append(
+                stripped
+            )
+
+    if current:
+        claims.append(
+            "\n".join(
+                current
+            ).strip()
+        )
+
+    return tuple(
+        claim
+        for claim in claims
+        if claim
+        and claim.lower() != "none"
+    )
+
+
+
 def runtime_from_legacy_text(
     contract_text: Optional[str],
 ) -> Optional[
@@ -526,6 +627,11 @@ def runtime_from_legacy_text(
             )
         ),
         model_instruction=text,
+        verified_evidence_claims=(
+            _parse_verified_evidence_claims(
+                text
+            )
+        ),
         resolved_referents=(
             _parse_resolved_referents(
                 text

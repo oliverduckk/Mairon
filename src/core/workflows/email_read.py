@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, Optional
 
 from core.evidence import (
@@ -38,6 +39,134 @@ def _email_value(
             return value
 
     return None
+
+
+def _compact_verified_body_for_generation(
+    body: str,
+    char_budget: int = 4000,
+) -> str:
+    """
+    Build a compact, source-faithful Gmail body view for model generation.
+
+    The authoritative raw body is retained separately in Evidence.data and the
+    WorkflowResult. This helper only reduces transport/marketing noise in the
+    text supplied to the personality model.
+    """
+
+    raw = str(
+        body
+        or ""
+    )
+
+    lines = []
+
+    for raw_line in raw.splitlines():
+        line = str(
+            raw_line
+            or ""
+        ).strip()
+
+        if not line:
+            continue
+
+        # Standalone tracking/navigation URLs add tokens but little useful text.
+        if re.fullmatch(
+            r"\(?\s*https?://\S+\s*\)?",
+            line,
+            flags=re.IGNORECASE,
+        ):
+            continue
+
+        # Decorative newsletter separators.
+        if re.fullmatch(
+            r"[*=_#~\-]{5,}",
+            line,
+        ):
+            continue
+
+        # Keep visible anchor text while removing parenthesised URLs.
+        line = re.sub(
+            r"\s*\(\s*https?://[^)]+\)",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        # Remove remaining bare URLs.
+        line = re.sub(
+            r"https?://\S+",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        line = re.sub(
+            r"\s+",
+            " ",
+            line,
+        ).strip()
+
+        if not line:
+            continue
+
+        # Consecutive duplicate marketing/template lines add no evidence.
+        if (
+            lines
+            and line == lines[
+                -1
+            ]
+        ):
+            continue
+
+        lines.append(
+            line
+        )
+
+    compact = []
+    used = 0
+
+    for line in lines:
+        addition = len(
+            line
+        ) + (
+            1
+            if compact
+            else 0
+        )
+
+        if (
+            compact
+            and used + addition > char_budget
+        ):
+            break
+
+        compact.append(
+            line
+        )
+
+        used += addition
+
+    result = "\n".join(
+        compact
+    ).strip()
+
+    if not result:
+        # Never replace verified source text with invented content.
+        result = raw.strip()[
+            :char_budget
+        ]
+
+    if len(
+        compact
+    ) < len(
+        lines
+    ):
+        result += (
+            "\n[Verified email body compacted for generation.]"
+        )
+
+    return result
+
 
 
 def read_selected_email(
@@ -177,8 +306,15 @@ def read_selected_email(
         success=True,
     )
 
-    # AnswerContract renders Evidence.claim to the model. The verified body
-    # therefore belongs in the claim rather than only in Evidence.data.
+    compact_body = (
+        _compact_verified_body_for_generation(
+            body
+        )
+    )
+
+    # AnswerContract renders Evidence.claim to the model. Supply a compact,
+    # source-faithful generation view there. Evidence.data and WorkflowResult
+    # still retain the complete authoritative Gmail body.
     evidence.add(
         Evidence(
             claim=(
@@ -187,7 +323,7 @@ def read_selected_email(
                 f"Subject: {subject}\n"
                 f"Date: {date}\n"
                 "Body:\n"
-                f"{body}"
+                f"{compact_body}"
             ),
             provenance="gmail",
             confidence="verified",

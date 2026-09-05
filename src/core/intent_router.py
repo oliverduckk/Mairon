@@ -5,6 +5,7 @@ from core.turn_state import TurnState
 from core.email_intent import is_inbox_attention_request
 from core.desktop_catalog import (
     extract_desktop_action_request,
+    extract_steam_game_close_candidate,
     extract_steam_game_launch_candidate,
 )
 from core.web_catalog import (
@@ -12,6 +13,9 @@ from core.web_catalog import (
 )
 from core.file_catalog import (
     extract_local_file_action_request,
+)
+from core.steam_library import (
+    resolve_steam_candidate_confirmation,
 )
 
 
@@ -64,9 +68,13 @@ EMAIL_READ_PATTERNS = [
     r"\b(?:email|message)\b[^?]{0,100}\b(?:actually\s+)?"
     r"(?:say|says|said|contain|contains|include|includes)\b",
 
-    # Explicit read/summarise actions.
+    # Explicit read/summarise/open actions.
     r"\b(?:read|summari[sz]e|explain)\b[^?]{0,120}\b(?:email|message)\b",
     r"\b(?:read|summari[sz]e|explain)\s+(?:it|that|this)\b",
+
+    # Opening/showing a named or latest email is semantically a Gmail read.
+    # This must be recognised before generic desktop/Steam launch fallbacks.
+    r"\b(?:open|show|view)\b[^?]{0,120}\b(?:email|message)\b",
 ]
 
 
@@ -81,21 +89,27 @@ def _extract_email_read_target(
       "What did that PayPal email say?" -> PayPal
       "What does the email from Qantas say?" -> Qantas
       "Summarise the email about my application." -> my application
+      "Open the latest email from Prosple." -> Prosple
 
     Bare "that email" deliberately returns None and is resolved only from
     unambiguous active Gmail state.
     """
 
+    # Specific relational syntax must be evaluated before generic
+    # "<descriptor> email" syntax. Otherwise "the latest email from Prosple"
+    # would incorrectly resolve the target as "latest".
     patterns = [
-        r"\b(?:that|this|the)\s+(.{1,100}?)\s+(?:email|message)\b",
         r"\b(?:email|message)\s+from\s+(.+?)(?="
         r"\s+(?:today|yesterday|this|last|past|previous)\b|"
         r"\s+(?:say|says|said|contain|contains|include|includes|mean)\b|"
         r"[?.!,]|$)",
+
         r"\b(?:email|message)\s+about\s+(.+?)(?="
         r"\s+(?:today|yesterday|this|last|past|previous)\b|"
         r"\s+(?:say|says|said|contain|contains|include|includes|mean)\b|"
         r"[?.!,]|$)",
+
+        r"\b(?:that|this|the)\s+(.{1,100}?)\s+(?:email|message)\b",
     ]
 
     stop_values = {
@@ -106,6 +120,15 @@ def _extract_email_read_target(
         "a",
         "my",
         "your",
+
+        # Selection/recency words describe which message to choose; they are
+        # not themselves a sender/topic search target.
+        "latest",
+        "newest",
+        "recent",
+        "most recent",
+        "last",
+        "previous",
     }
 
     for pattern in patterns:
@@ -135,6 +158,86 @@ def _extract_email_read_target(
             return value
 
     return None
+
+def _extract_email_selector(
+    text: str,
+) -> Optional[str]:
+    raw = str(
+        text
+        or ""
+    ).strip().lower()
+
+    if re.search(
+        r"\b(?:latest|newest|most\s+recent)\b",
+        raw,
+        flags=re.IGNORECASE,
+    ):
+        return "latest"
+
+    mappings = [
+        (
+            r"\b(?:first|1st)\b",
+            "first",
+        ),
+        (
+            r"\b(?:second|2nd)\b",
+            "second",
+        ),
+        (
+            r"\b(?:third|3rd)\b",
+            "third",
+        ),
+        (
+            r"\b(?:fourth|4th)\b",
+            "fourth",
+        ),
+    ]
+
+    for pattern, value in mappings:
+        if re.search(
+            pattern,
+            raw,
+            flags=re.IGNORECASE,
+        ):
+            return value
+
+    return None
+
+
+def _is_email_candidate_selection_followup(
+    text: str,
+    conversation_state,
+) -> bool:
+    if conversation_state is None:
+        return False
+
+    if getattr(
+        conversation_state,
+        "active_intent",
+        None,
+    ) not in {
+        "email_search",
+        "email_read",
+    }:
+        return False
+
+    selector = _extract_email_selector(
+        text
+    )
+
+    if not selector:
+        return False
+
+    return bool(
+        re.match(
+            r"^\s*(?:the\s+)?"
+            r"(?:latest|newest|most\s+recent|first|1st|second|2nd|third|3rd|fourth|4th)"
+            r"(?:\s+(?:one|email|message))?\s*[?.!]*\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
 
 
 def _recent_email_context_for_target(
@@ -751,6 +854,91 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.add_reason("empty input")
         return state
 
+    if conversation_state is not None:
+        pending_steam_candidates = list(
+            getattr(
+                conversation_state,
+                "active_steam_game_candidates",
+                [],
+            )
+            or []
+        )
+
+        pending_alias = str(
+            getattr(
+                conversation_state,
+                "active_steam_game_alias_query",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if (
+            pending_alias
+            and pending_steam_candidates
+        ):
+            selected_game = (
+                resolve_steam_candidate_confirmation(
+                    user_text=raw,
+                    candidates=pending_steam_candidates,
+                )
+            )
+
+            if selected_game is not None:
+                appid = str(
+                    selected_game.get(
+                        "appid",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                game_name = str(
+                    selected_game.get(
+                        "name",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                state.speech_act = "request_action"
+                state.intent = "confirm_steam_game_alias"
+                state.subject = game_name
+
+                state.entities[
+                    "steam_game_alias"
+                ] = pending_alias
+
+                state.entities[
+                    "steam_game_appid"
+                ] = appid
+
+                state.entities[
+                    "steam_game_name"
+                ] = game_name
+
+                state.requested_action = (
+                    "confirm_and_launch_steam_game_alias"
+                )
+
+                state.requires_private_data = True
+                state.requires_live_data = True
+                state.factuality = "action_result"
+                state.preferred_authority = "desktop"
+                state.should_use_tools = True
+                state.should_answer_directly = False
+                state.should_recommend = False
+                state.should_continue_conversation = False
+                state.confidence = 0.99
+
+                state.add_reason(
+                    "user deterministically resolved a pending Steam-game "
+                    "ambiguity; Core may learn the original shorthand only "
+                    "after successful verified launch"
+                )
+
+                return state
+
     browser_action = (
         extract_browser_action_request(
             raw,
@@ -936,8 +1124,35 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
 
         return state
 
+    # --------------------------------------------------
+    # Cross-domain precedence guard
+    # --------------------------------------------------
+    #
+    # Local-file syntax is intentionally broad ("find X", "open X").
+    # Explicit Gmail-shaped utterances must be reserved for Gmail before
+    # the generic file parser gets a chance to claim them.
+    explicit_gmail_shape = bool(
+        _matches_any(
+            text,
+            EMAIL_REQUEST_PATTERNS,
+        )
+        or _matches_any(
+            text,
+            EMAIL_LOOKUP_PATTERNS,
+        )
+        or _matches_any(
+            text,
+            EMAIL_READ_PATTERNS,
+        )
+        or is_inbox_attention_request(
+            text
+        )
+    )
+
     local_file_action = (
-        extract_local_file_action_request(
+        None
+        if explicit_gmail_shape
+        else extract_local_file_action_request(
             raw,
             conversation_state=(
                 conversation_state
@@ -1081,15 +1296,15 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
 
         return state
 
-    steam_game_candidate = (
-        extract_steam_game_launch_candidate(
+    steam_game_close_candidate = (
+        extract_steam_game_close_candidate(
             raw
         )
     )
 
-    if steam_game_candidate:
+    if steam_game_close_candidate:
         requested_title = str(
-            steam_game_candidate.get(
+            steam_game_close_candidate.get(
                 "title",
                 "",
             )
@@ -1097,14 +1312,14 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         ).strip()
 
         state.speech_act = "request_action"
-        state.intent = "launch_steam_game"
+        state.intent = "close_steam_game"
         state.subject = requested_title
 
         state.entities[
             "steam_game_title"
         ] = requested_title
 
-        state.requested_action = "launch_steam_game"
+        state.requested_action = "close_steam_game"
         state.requires_private_data = True
         state.requires_live_data = True
         state.factuality = "action_result"
@@ -1113,11 +1328,12 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.should_answer_directly = False
         state.should_recommend = False
         state.should_continue_conversation = False
-        state.confidence = 0.92
+        state.confidence = 0.94
 
         state.add_reason(
-            "launch-like request for a possible installed Steam game; "
-            "Core must verify against local Steam manifests before execution"
+            "close-like request for a possible installed Steam game; "
+            "Core must verify the installed title and owns whether safe "
+            "game-close semantics are supported"
         )
 
         return state
@@ -1167,6 +1383,93 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.add_reason(
             "explicit inbox attention/triage request"
         )
+        return state
+
+    email_candidate_selection_followup = (
+        _is_email_candidate_selection_followup(
+            raw,
+            conversation_state,
+        )
+    )
+
+    if email_candidate_selection_followup:
+        selector = _extract_email_selector(
+            raw
+        )
+
+        resolved = (
+            conversation_state
+            .resolve_email_message_selection(
+                selector=selector,
+                target=None,
+                allow_bare=True,
+            )
+        )
+
+        state.speech_act = "question"
+        state.intent = "email_read"
+        state.requested_action = "read_email"
+        state.requires_private_data = True
+        state.requires_live_data = True
+        state.factuality = "tool_verified"
+        state.preferred_authority = "gmail"
+        state.should_use_tools = True
+        state.should_answer_directly = False
+        state.should_recommend = False
+        state.should_continue_conversation = False
+        state.is_follow_up = True
+        state.confidence = 0.99
+
+        if resolved:
+            message_id = str(
+                resolved.get(
+                    "message_id",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            search_text = str(
+                resolved.get(
+                    "search_text",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if message_id:
+                state.entities[
+                    "message_id"
+                ] = message_id
+
+            if search_text:
+                state.entities[
+                    "search_text"
+                ] = search_text
+
+            state.entities[
+                "email_selector"
+            ] = selector
+
+            state.subject = (
+                f"{selector} email"
+            )
+
+            state.add_reason(
+                "resolved Gmail candidate selector against verified active "
+                "message IDs"
+            )
+
+        else:
+            state.entities[
+                "email_selector"
+            ] = selector
+
+            state.add_reason(
+                "email candidate selector could not be resolved from active "
+                "verified Gmail state"
+            )
+
         return state
 
     # --------------------------------------------------
@@ -1268,6 +1571,15 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
             explicit_email_read_target
         )
 
+        email_selector = _extract_email_selector(
+            raw
+        )
+
+        if email_selector:
+            state.entities[
+                "email_selector"
+            ] = email_selector
+
         prior_context = (
             _recent_email_context_for_target(
                 conversation_state,
@@ -1350,6 +1662,30 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
                         messages
                     )
                 )
+
+                if email_selector:
+                    selected = (
+                        conversation_state
+                        .resolve_email_message_selection(
+                            selector=email_selector,
+                            target=search_text or target,
+                            allow_bare=False,
+                        )
+                    )
+
+                    if selected:
+                        selected_id = str(
+                            selected.get(
+                                "message_id",
+                                "",
+                            )
+                            or ""
+                        ).strip()
+
+                        if selected_id:
+                            state.entities[
+                                "message_id"
+                            ] = selected_id
 
             state.add_reason(
                 "resolved email-read request from verified Gmail referent state"
@@ -1543,6 +1879,54 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.add_reason(
             "user appears to be correcting or challenging a previous Mairon claim"
         )
+        return state
+
+    # --------------------------------------------------
+    # Generic installed Steam-game launch fallback
+    # --------------------------------------------------
+    #
+    # Deliberately AFTER Gmail-specific routing. "open X" is broad syntax;
+    # domain-specific requests such as "open the latest email from Prosple"
+    # must be claimed by their authoritative subsystem first.
+    steam_game_candidate = (
+        extract_steam_game_launch_candidate(
+            raw
+        )
+    )
+
+    if steam_game_candidate:
+        requested_title = str(
+            steam_game_candidate.get(
+                "title",
+                "",
+            )
+            or ""
+        ).strip()
+
+        state.speech_act = "request_action"
+        state.intent = "launch_steam_game"
+        state.subject = requested_title
+
+        state.entities[
+            "steam_game_title"
+        ] = requested_title
+
+        state.requested_action = "launch_steam_game"
+        state.requires_private_data = True
+        state.requires_live_data = True
+        state.factuality = "action_result"
+        state.preferred_authority = "desktop"
+        state.should_use_tools = True
+        state.should_answer_directly = False
+        state.should_recommend = False
+        state.should_continue_conversation = False
+        state.confidence = 0.92
+
+        state.add_reason(
+            "launch-like request for a possible installed Steam game; "
+            "Core must verify against local Steam manifests before execution"
+        )
+
         return state
 
     if _matches_any(text, THANKS_PATTERNS):

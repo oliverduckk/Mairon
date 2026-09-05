@@ -351,6 +351,14 @@ def extract_desktop_action_request(
 
 
 
+STEAM_GAME_CLOSE_PATTERN = re.compile(
+    r"^\s*(?:(?:i\s+want\s+you\s+to|please)\s+)?"
+    r"(?:close|quit|exit|shut\s+down|shutdown)\s+"
+    r"(?P<title>.+?)\s*[.!?]*$",
+    flags=re.IGNORECASE,
+)
+
+
 STEAM_GAME_LAUNCH_PATTERN = re.compile(
     r"^\s*(?:open|launch|start|run|play)(?:\s+up)?\s+(?:the\s+)?"
     r"(?P<title>.+?)\s*[.!?]*$",
@@ -366,6 +374,92 @@ STEAM_GAME_LEADING_QUALIFIER = re.compile(
     r"^\s*(?:steam\s+game\s+|game\s+)",
     flags=re.IGNORECASE,
 )
+
+
+def extract_steam_game_close_candidate(
+    text: str,
+) -> Optional[dict]:
+    """
+    Extract a possible installed Steam game title from a close-like request.
+
+    This function never decides that a game is installed and never chooses a
+    process to terminate. Core must verify the title from Steam manifests and
+    separately decide whether safe close semantics exist.
+    """
+
+    raw = str(
+        text
+        or ""
+    ).strip()
+
+    if not raw:
+        return None
+
+    match = STEAM_GAME_CLOSE_PATTERN.match(
+        raw
+    )
+
+    if not match:
+        return None
+
+    title = str(
+        match.group(
+            "title"
+        )
+        or ""
+    ).strip()
+
+    title = STEAM_GAME_TRAILING_QUALIFIER.sub(
+        "",
+        title,
+    ).strip()
+
+    title = STEAM_GAME_LEADING_QUALIFIER.sub(
+        "",
+        title,
+    ).strip()
+
+    if (
+        not title
+        or len(
+            title
+        ) > 160
+    ):
+        return None
+
+    # Named desktop applications keep their existing lifecycle semantics.
+    if find_named_desktop_target(
+        title
+    ):
+        return None
+
+    lowered = title.lower()
+
+    if any(
+        marker in lowered
+        for marker in (
+            "http://",
+            "https://",
+            "\\\\",
+        )
+    ):
+        return None
+
+    if re.search(
+        r"\.(?:exe|pdf|docx?|xlsx?|pptx?|txt|py|jpg|jpeg|png|zip|mp4|mkv)\b",
+        lowered,
+    ):
+        return None
+
+    if re.search(
+        r"\b(?:file|folder|directory|website|webpage|settings|control panel|task manager)\b",
+        lowered,
+    ):
+        return None
+
+    return {
+        "title": title,
+    }
 
 
 def extract_steam_game_launch_candidate(

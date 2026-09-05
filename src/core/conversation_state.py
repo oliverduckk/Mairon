@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
 from core.turn_state import TurnState
@@ -98,6 +99,10 @@ class ConversationState:
     # Until game close/control is implemented, this prevents "close it" from
     # accidentally targeting an older desktop app after a game launch.
     active_steam_game_title: Optional[str] = None
+    active_steam_game_alias_query: Optional[str] = None
+    active_steam_game_candidates: List[Dict[str, Any]] = field(
+        default_factory=list
+    )
 
     def remember_subject(self, subject: Optional[str]) -> None:
         value = str(subject or "").strip()
@@ -234,6 +239,177 @@ class ConversationState:
                 or ""
             ).strip() or None
 
+    def resolve_email_message_selection(
+        self,
+        selector: str,
+        target: Optional[str] = None,
+        allow_bare: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve a positional/recency selector against verified Gmail candidates.
+
+        Authority is the stored Gmail result set and message_id values. Prior
+        assistant prose is never parsed back into selection authority.
+        """
+
+        context = self.find_email_referent(
+            target=target,
+            require_message=True,
+            allow_bare=allow_bare,
+        )
+
+        if not context:
+            return None
+
+        messages = list(
+            context.get(
+                "messages",
+                [],
+            )
+            or []
+        )
+
+        if not messages:
+            return None
+
+        selector_value = str(
+            selector
+            or ""
+        ).strip().lower()
+
+        selector_value = " ".join(
+            selector_value.split()
+        )
+
+        selected = None
+
+        if selector_value in {
+            "latest",
+            "newest",
+            "most recent",
+            "recent",
+        }:
+            dated = []
+
+            for index, message in enumerate(
+                messages
+            ):
+                raw_date = str(
+                    message.get(
+                        "date",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                parsed = None
+
+                if raw_date:
+                    try:
+                        parsed = parsedate_to_datetime(
+                            raw_date
+                        )
+                    except Exception:
+                        parsed = None
+
+                dated.append(
+                    (
+                        parsed,
+                        -index,
+                        message,
+                    )
+                )
+
+            valid = [
+                item
+                for item in dated
+                if item[
+                    0
+                ] is not None
+            ]
+
+            if valid:
+                valid.sort(
+                    key=lambda item: (
+                        item[
+                            0
+                        ],
+                        item[
+                            1
+                        ],
+                    ),
+                    reverse=True,
+                )
+
+                selected = valid[
+                    0
+                ][
+                    2
+                ]
+
+            else:
+                # Gmail search results are already returned newest-first.
+                selected = messages[
+                    0
+                ]
+
+        else:
+            ordinal_mapping = {
+                "first": 0,
+                "1st": 0,
+                "one": 0,
+                "second": 1,
+                "2nd": 1,
+                "two": 1,
+                "third": 2,
+                "3rd": 2,
+                "three": 2,
+                "fourth": 3,
+                "4th": 3,
+                "four": 3,
+            }
+
+            index = ordinal_mapping.get(
+                selector_value
+            )
+
+            if (
+                index is not None
+                and 0 <= index < len(
+                    messages
+                )
+            ):
+                selected = messages[
+                    index
+                ]
+
+        if not selected:
+            return None
+
+        result = dict(
+            selected
+        )
+
+        result[
+            "search_text"
+        ] = context.get(
+            "search_text"
+        )
+
+        result[
+            "time_scope"
+        ] = context.get(
+            "time_scope"
+        )
+
+        result[
+            "days"
+        ] = context.get(
+            "days"
+        )
+
+        return result
+
     # --------------------------------------------------
     # Desktop-specific working referent
     # --------------------------------------------------
@@ -267,6 +443,71 @@ class ConversationState:
         self.recent_desktop_targets = (
             self.recent_desktop_targets[:8]
         )
+
+    # --------------------------------------------------
+    # Steam-game ambiguity working state
+    # --------------------------------------------------
+
+    def remember_steam_game_candidates(
+        self,
+        alias_query: str,
+        candidates: List[Dict[str, Any]],
+    ) -> None:
+        query = str(
+            alias_query
+            or ""
+        ).strip()
+
+        cleaned = []
+
+        for candidate in list(
+            candidates
+            or []
+        )[:3]:
+            if not isinstance(
+                candidate,
+                dict,
+            ):
+                continue
+
+            appid = str(
+                candidate.get(
+                    "appid",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            name = str(
+                candidate.get(
+                    "name",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if (
+                not appid.isdigit()
+                or not name
+            ):
+                continue
+
+            cleaned.append({
+                "appid": appid,
+                "name": name,
+            })
+
+        self.active_steam_game_alias_query = (
+            query
+            or None
+        )
+        self.active_steam_game_candidates = cleaned
+
+    def clear_steam_game_candidates(
+        self,
+    ) -> None:
+        self.active_steam_game_alias_query = None
+        self.active_steam_game_candidates = []
 
     # --------------------------------------------------
     # Browser-specific working referent

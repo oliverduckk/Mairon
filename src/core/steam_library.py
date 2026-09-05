@@ -625,6 +625,461 @@ def _title_similarity(
     return ratio
 
 
+def derive_game_title_acronym(
+    value: str,
+) -> str:
+    """
+    Derive a conservative shorthand from an installed Steam title.
+
+    Examples:
+      Counter-Strike 2 -> cs2
+      Grand Theft Auto V -> gtav
+      AdVenture Capitalist -> ac
+
+    The alias is derived from the verified installed title; it is never a
+    hard-coded game-name mapping.
+    """
+
+    normalised = normalise_game_title(
+        value
+    )
+
+    tokens = [
+        token
+        for token in normalised.split()
+        if token
+    ]
+
+    if len(
+        tokens
+    ) < 2:
+        return ""
+
+    parts = []
+
+    for token in tokens:
+        if token.isdigit():
+            parts.append(
+                token
+            )
+        else:
+            parts.append(
+                token[
+                    0
+                ]
+            )
+
+    return "".join(
+        parts
+    ).lower()
+
+
+def derive_game_title_aliases(
+    value: str,
+) -> List[str]:
+    """
+    Derive conservative shorthand aliases from a verified installed title.
+
+    Example:
+      Counter-Strike 2 -> ["cs2", "cs"]
+      Left 4 Dead 2    -> ["l4d2", "l4d"]
+
+    Numeric-suffix removal is allowed only as a secondary alias and Core still
+    requires that alias to resolve uniquely among installed games.
+    """
+
+    primary = derive_game_title_acronym(
+        value
+    )
+
+    if not primary:
+        return []
+
+    aliases = [
+        primary
+    ]
+
+    if re.search(
+        r"\d+$",
+        primary,
+    ):
+        without_suffix = re.sub(
+            r"\d+$",
+            "",
+            primary,
+        )
+
+        if (
+            len(
+                without_suffix
+            ) >= 2
+            and without_suffix
+            not in aliases
+        ):
+            aliases.append(
+                without_suffix
+            )
+
+    return aliases
+
+
+
+def _resolve_unique_acronym_match(
+    query: str,
+    installed: List[dict],
+) -> Optional[dict]:
+    query_norm = normalise_game_title(
+        query
+    ).replace(
+        " ",
+        "",
+    )
+
+    if (
+        len(
+            query_norm
+        ) < 2
+        or len(
+            query_norm
+        ) > 12
+    ):
+        return None
+
+    matches = []
+
+    for game in installed:
+        aliases = derive_game_title_aliases(
+            str(
+                game.get(
+                    "name"
+                )
+                or ""
+            )
+        )
+
+        if query_norm in aliases:
+            matches.append(
+                game
+            )
+
+    if len(
+        matches
+    ) == 1:
+        return {
+            "status": "matched",
+            "match": matches[
+                0
+            ],
+            "score": 1.0,
+            "match_type": "derived_acronym",
+            "candidates": matches,
+        }
+
+    if len(
+        matches
+    ) > 1:
+        return {
+            "status": "ambiguous",
+            "match": None,
+            "score": 1.0,
+            "match_type": "derived_acronym",
+            "candidates": matches[
+                :3
+            ],
+        }
+
+    return None
+
+
+
+def _selection_ordinal(
+    value: str,
+) -> Optional[int]:
+    text = normalise_game_title(
+        value
+    )
+
+    mapping = {
+        "first": 0,
+        "1st": 0,
+        "second": 1,
+        "2nd": 1,
+        "third": 2,
+        "3rd": 2,
+    }
+
+    for token, index in mapping.items():
+        if re.search(
+            rf"\b{re.escape(token)}\b",
+            text,
+        ):
+            return index
+
+    numeric = re.search(
+        r"\b(?:number|option)?\s*([1-3])\b",
+        text,
+    )
+
+    if numeric:
+        return int(
+            numeric.group(
+                1
+            )
+        ) - 1
+
+    return None
+
+
+def resolve_steam_candidate_confirmation(
+    user_text: str,
+    candidates: List[dict],
+) -> Optional[dict]:
+    """
+    Resolve a user's clarification against only the verified ambiguity set.
+
+    This is deterministic Core state resolution; the language model does not
+    choose which installed game the user meant.
+    """
+
+    raw = str(
+        user_text
+        or ""
+    ).strip()
+
+    candidate_list = [
+        candidate
+        for candidate in list(
+            candidates
+            or []
+        )
+        if isinstance(
+            candidate,
+            dict,
+        )
+        and str(
+            candidate.get(
+                "appid",
+                "",
+            )
+            or ""
+        ).strip().isdigit()
+        and str(
+            candidate.get(
+                "name",
+                "",
+            )
+            or ""
+        ).strip()
+    ]
+
+    if (
+        not raw
+        or not candidate_list
+    ):
+        return None
+
+    # A fresh unrelated explicit launch remains a new command unless its target
+    # actually resolves to one of the pending candidates.
+    cleaned = re.sub(
+        r"^\s*(?:i\s+mean|i\s+meant|it's|its|the\s+game\s+is)\s+",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    cleaned = re.sub(
+        r"^\s*(?:open|launch|start|play)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    ordinal = _selection_ordinal(
+        cleaned
+    )
+
+    if (
+        ordinal is not None
+        and 0 <= ordinal < len(
+            candidate_list
+        )
+    ):
+        return candidate_list[
+            ordinal
+        ]
+
+    query_norm = normalise_game_title(
+        cleaned
+    )
+
+    # Remove selector filler while retaining meaningful title words.
+    query_tokens = [
+        token
+        for token in query_norm.split()
+        if token
+        not in {
+            "the",
+            "one",
+            "game",
+            "please",
+            "yeah",
+            "yep",
+            "that",
+            "this",
+        }
+    ]
+
+    if not query_tokens:
+        return None
+
+    query_compact = " ".join(
+        query_tokens
+    )
+
+    exact = [
+        candidate
+        for candidate in candidate_list
+        if normalise_game_title(
+            str(
+                candidate.get(
+                    "name",
+                    "",
+                )
+                or ""
+            )
+        )
+        == query_compact
+    ]
+
+    if len(
+        exact
+    ) == 1:
+        return exact[
+            0
+        ]
+
+    token_subset = []
+
+    query_set = set(
+        query_tokens
+    )
+
+    for candidate in candidate_list:
+        name_norm = normalise_game_title(
+            str(
+                candidate.get(
+                    "name",
+                    "",
+                )
+                or ""
+            )
+        )
+
+        name_tokens = set(
+            name_norm.split()
+        )
+
+        if (
+            query_set
+            and query_set.issubset(
+                name_tokens
+            )
+        ):
+            token_subset.append(
+                candidate
+            )
+
+    if len(
+        token_subset
+    ) == 1:
+        return token_subset[
+            0
+        ]
+
+    substring = [
+        candidate
+        for candidate in candidate_list
+        if query_compact
+        in normalise_game_title(
+            str(
+                candidate.get(
+                    "name",
+                    "",
+                )
+                or ""
+            )
+        )
+    ]
+
+    if len(
+        substring
+    ) == 1:
+        return substring[
+            0
+        ]
+
+    scored = []
+
+    for candidate in candidate_list:
+        name = str(
+            candidate.get(
+                "name",
+                "",
+            )
+            or ""
+        )
+
+        score = _title_similarity(
+            query_compact,
+            name,
+        )
+
+        scored.append(
+            (
+                score,
+                candidate,
+            )
+        )
+
+    scored.sort(
+        key=lambda item: item[
+            0
+        ],
+        reverse=True,
+    )
+
+    if not scored:
+        return None
+
+    best_score, best = scored[
+        0
+    ]
+
+    second_score = (
+        scored[
+            1
+        ][
+            0
+        ]
+        if len(
+            scored
+        ) > 1
+        else 0.0
+    )
+
+    if (
+        best_score >= 0.82
+        and (
+            best_score
+            - second_score
+        ) >= 0.08
+    ):
+        return best
+
+    return None
+
+
+
 def resolve_installed_steam_game(
     requested_title: str,
     games: Optional[List[dict]] = None,
@@ -673,8 +1128,19 @@ def resolve_installed_steam_game(
                 0
             ],
             "score": 1.0,
+            "match_type": "exact",
             "candidates": exact,
         }
+
+    acronym_resolution = (
+        _resolve_unique_acronym_match(
+            query=query,
+            installed=installed,
+        )
+    )
+
+    if acronym_resolution is not None:
+        return acronym_resolution
 
     scored = []
 

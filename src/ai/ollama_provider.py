@@ -6655,6 +6655,448 @@ def find_forbidden_recommendation_violations(
     return []
 
 
+def _email_read_verified_evidence_text(
+    core_answer_contract,
+):
+    runtime = coerce_answer_contract_runtime(
+        core_answer_contract
+    )
+
+    if runtime is None:
+        return ""
+
+    return "\n".join(
+        str(
+            claim
+            or ""
+        )
+        for claim in (
+            runtime.verified_evidence_claims
+            or ()
+        )
+        if str(
+            claim
+            or ""
+        ).strip()
+    ).strip()
+
+
+def find_email_read_contract_violations(
+    response_text,
+    core_answer_contract,
+):
+    """
+    Extra fail-closed checks for verified Gmail body reads.
+
+    General recommendation detection intentionally stays conservative across
+    all domains. Email reads are narrower: unless Core explicitly authorised
+    an action assessment, Mairon is reporting source content, not coaching
+    Oliver on what he personally should do next.
+    """
+
+    if not core_answer_contract:
+        return []
+
+    if (
+        str(
+            _core_contract_value(
+                core_answer_contract,
+                "Intent",
+            )
+            or ""
+        ).strip().lower()
+        != "email_read"
+    ):
+        return []
+
+    recommendations_allowed = (
+        str(
+            _core_contract_value(
+                core_answer_contract,
+                "Recommendations allowed",
+            )
+            or ""
+        ).strip().lower()
+        == "true"
+    )
+
+    if recommendations_allowed:
+        return []
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        str(
+            response_text
+            or ""
+        ).strip(),
+    )
+
+    if not text:
+        return []
+
+    lowered = text.lower()
+
+    # These constructions are common ways a model smuggles advice into an
+    # otherwise factual email summary. Source-attributed wording remains okay.
+    advisory_patterns = (
+        r"\bdon['’]t\s+forget\b",
+        r"\bgo\s+ahead\b",
+        r"\byou\s+could\b",
+        r"\byou\s+can\b",
+        r"\byou\s+might\b",
+        r"\byou\s+may\s+want\s+to\b",
+        r"\bif\s+you\s+want\s+to\b",
+        r"\bwait\s+for\b",
+        r"\binstead\s+of\b",
+        r"\bbetter\s+off\b",
+        r"\bno\s+need\s+to\b",
+        r"\btry\s+to\b",
+    )
+
+    source_markers = (
+        "the email says",
+        "the email said",
+        "the message says",
+        "the message said",
+        "it says",
+        "it said",
+        "the sender says",
+        "the sender said",
+        "asks you to",
+        "asked you to",
+        "tells you to",
+        "told you to",
+        "requires you to",
+        "required you to",
+        "instructs you to",
+        "instructed you to",
+    )
+
+    for pattern in advisory_patterns:
+        for match in re.finditer(
+            pattern,
+            lowered,
+            flags=re.IGNORECASE,
+        ):
+            prefix = lowered[
+                max(
+                    0,
+                    match.start()
+                    - 90,
+                ):
+                match.start()
+            ]
+
+            if not any(
+                marker in prefix
+                for marker in source_markers
+            ):
+                return [
+                    "email_read contract forbids Mairon-authored advice"
+                ]
+
+    # Unsupported editorial characterisations of a sender are not factual
+    # summaries. Permit them only if the exact wording actually exists in the
+    # verified message evidence.
+    evidence = (
+        _email_read_verified_evidence_text(
+            core_answer_contract
+        ).lower()
+    )
+
+    editorial_terms = (
+        "spamming",
+        "spammed",
+        "nagging",
+        "nagged",
+        "pestering",
+        "pestered",
+        "bothering",
+        "bothered",
+    )
+
+    for term in editorial_terms:
+        if (
+            term in lowered
+            and term not in evidence
+        ):
+            return [
+                "email_read contract forbids unsupported sender editorialising"
+            ]
+
+    return []
+
+
+def should_skip_email_read_generation(
+    core_answer_contract,
+):
+    """
+    Skip personality generation for clearly long/template-heavy email reads.
+
+    The goal is not to classify the email semantically. Core simply detects
+    when the verified evidence is large or structurally newsletter-like enough
+    that a deterministic extractive rendering is preferable to waiting on the
+    local model.
+    """
+
+    if not core_answer_contract:
+        return False
+
+    if (
+        str(
+            _core_contract_value(
+                core_answer_contract,
+                "Intent",
+            )
+            or ""
+        ).strip().lower()
+        != "email_read"
+    ):
+        return False
+
+    evidence = _email_read_verified_evidence_text(
+        core_answer_contract
+    )
+
+    if not evidence:
+        return False
+
+    lowered = evidence.lower()
+
+    # Large verified bodies are poor candidates for conversational generation
+    # on the local 9B model.
+    if len(
+        evidence
+    ) >= 2200:
+        return True
+
+    newsletter_markers = (
+        "unsubscribe",
+        "view in browser",
+        "applications close",
+        "job recommendations",
+        "these employers are hiring",
+        "utm_",
+        "graduate jobs",
+        "salary",
+        "/ year",
+    )
+
+    marker_hits = sum(
+        1
+        for marker in newsletter_markers
+        if marker in lowered
+    )
+
+    return marker_hits >= 2
+
+
+
+def build_email_read_verified_fallback(
+    core_answer_contract,
+):
+    """
+    Deterministic last-resort rendering of the exact verified Gmail message.
+
+    The fallback is extractive, compact, and source-faithful. It strips
+    transport noise such as tracking URLs and decorative separator lines but
+    never invents or interprets content.
+    """
+
+    evidence = _email_read_verified_evidence_text(
+        core_answer_contract
+    )
+
+    if not evidence:
+        return (
+            "I read the selected email, but I couldn't produce a safe summary "
+            "from the verified contents."
+        )
+
+    marker = "Verified Gmail message contents:"
+
+    cleaned = re.sub(
+        r"\s+\[gmail;\s*verified\]\s*$",
+        "",
+        evidence,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    if marker.lower() in cleaned.lower():
+        marker_index = cleaned.lower().find(
+            marker.lower()
+        )
+
+        cleaned = cleaned[
+            marker_index
+            + len(
+                marker
+            ):
+        ].lstrip()
+
+    lines = cleaned.splitlines()
+
+    header_lines = []
+    body_lines = []
+    in_body = False
+
+    for raw_line in lines:
+        line = str(
+            raw_line
+            or ""
+        ).strip()
+
+        if not in_body:
+            if line.lower() == "body:":
+                in_body = True
+                continue
+
+            if (
+                line.lower().startswith(
+                    "from:"
+                )
+                or line.lower().startswith(
+                    "subject:"
+                )
+                or line.lower().startswith(
+                    "date:"
+                )
+            ):
+                header_lines.append(
+                    line
+                )
+
+            continue
+
+        if not line:
+            continue
+
+        # Drop standalone URLs and parenthesised tracking URLs.
+        if re.fullmatch(
+            r"\(?\s*https?://\S+\s*\)?",
+            line,
+            flags=re.IGNORECASE,
+        ):
+            continue
+
+        # Drop decorative marketing separators.
+        if re.fullmatch(
+            r"[*=_#~\-.]{5,}",
+            line,
+        ):
+            continue
+
+        # Remove inline parenthesised URLs while preserving visible text.
+        line = re.sub(
+            r"\s*\(\s*https?://[^)]+\)",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        # Remove bare inline URLs.
+        line = re.sub(
+            r"https?://\S+",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        if not line:
+            continue
+
+        # Collapse repeated whitespace introduced by URL removal.
+        line = re.sub(
+            r"\s+",
+            " ",
+            line,
+        ).strip()
+
+        if (
+            body_lines
+            and line == body_lines[
+                -1
+            ]
+        ):
+            continue
+
+        body_lines.append(
+            line
+        )
+
+    # Preserve useful source content while avoiding multi-thousand-character
+    # dumps from newsletters/marketing emails.
+    body_preview = []
+    char_budget = 1600
+    used = 0
+
+    for line in body_lines:
+        addition = len(
+            line
+        ) + (
+            1
+            if body_preview
+            else 0
+        )
+
+        if (
+            body_preview
+            and used + addition > char_budget
+        ):
+            break
+
+        body_preview.append(
+            line
+        )
+
+        used += addition
+
+        if len(
+            body_preview
+        ) >= 18:
+            break
+
+    rendered_parts = []
+
+    if header_lines:
+        rendered_parts.append(
+            "\n".join(
+                header_lines
+            )
+        )
+
+    if body_preview:
+        rendered_parts.append(
+            "Body:\n"
+            + "\n".join(
+                body_preview
+            )
+        )
+
+    rendered = "\n\n".join(
+        rendered_parts
+    ).strip()
+
+    if not rendered:
+        return (
+            "I read the selected email, but Gmail didn't provide usable "
+            "message text for a safe fallback."
+        )
+
+    if len(
+        body_preview
+    ) < len(
+        body_lines
+    ):
+        rendered += (
+            "\n\n[Email body preview truncated.]"
+        )
+
+    return rendered
+
+
+
 def find_core_answer_contract_violations(
     response_text,
     core_answer_contract,
@@ -7448,9 +7890,69 @@ def handle_direct_conversation(
         f"[AI] Active Ollama model: {active_local_model}"
     )
 
+    if (
+        core_intent == "email_read"
+        and should_skip_email_read_generation(
+            core_answer_contract
+        )
+    ):
+        final_response_text = (
+            build_email_read_verified_fallback(
+                core_answer_contract
+            )
+        )
+
+        print(
+            "[Gmail] Skipped local personality generation for a "
+            "long/template-heavy email; Core used the verified "
+            "extractive rendering."
+        )
+
+        # The adaptive path exits before the ordinary accepted-response
+        # commit block below, so it must perform that same state transition
+        # explicitly. Otherwise the provider would either return an
+        # uninitialised working_conversation or silently lose this turn from
+        # live conversation continuity.
+        working_conversation = list(
+            conversation
+        )
+
+        working_conversation.append({
+            "role": "system",
+            "content": get_runtime_context()
+        })
+
+        working_conversation.append({
+            "role": "user",
+            "content": user_input
+        })
+
+        working_conversation.append({
+            "role": "assistant",
+            "content": final_response_text
+        })
+
+        record_accepted_relationship_response(
+            response_text=final_response_text,
+            relationship_context=relationship_context,
+        )
+
+        return (
+            final_response_text,
+            working_conversation,
+            None,
+            None,
+        )
+
+    personality_draft_limit = (
+        1
+        if core_intent == "email_read"
+        else MAX_PERSONALITY_DRAFTS
+    )
+
     for attempt in range(
         1,
-        MAX_PERSONALITY_DRAFTS + 1
+        personality_draft_limit + 1
     ):
         attempt_messages = list(
             base_messages
@@ -8100,6 +8602,13 @@ def handle_direct_conversation(
         )
 
         violations.extend(
+            find_email_read_contract_violations(
+                response_text=draft_text,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
+        violations.extend(
             find_core_micro_act_relevance_violations(
                 response_text=draft_text,
                 user_input=user_input,
@@ -8275,6 +8784,18 @@ def handle_direct_conversation(
                 print(
                     "[Grounding] Restricted drafts remained invalid; "
                     "Core used a fail-closed response."
+                )
+
+            elif core_intent == "email_read":
+                final_response_text = (
+                    build_email_read_verified_fallback(
+                        core_answer_contract
+                    )
+                )
+
+                print(
+                    "[Gmail] Email-read drafts remained invalid; Core used "
+                    "the verified extractive fallback."
                 )
 
             else:

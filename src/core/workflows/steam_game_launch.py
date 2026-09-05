@@ -9,6 +9,10 @@ from core.steam_library import (
 from core.workflow_result import (
     WorkflowResult,
 )
+from core.steam_alias_store import (
+    delete_steam_game_alias,
+    get_steam_game_alias,
+)
 from tools.desktop_tools import (
     launch_steam_game_appid,
 )
@@ -45,12 +49,60 @@ def launch_installed_steam_game(
             },
         )
 
-    resolution = (
-        resolve_installed_steam_game(
-            requested_title=title,
-            games=installed,
-        )
+    alias_entry = get_steam_game_alias(
+        title
     )
+
+    resolution = None
+
+    if alias_entry is not None:
+        alias_appid = str(
+            alias_entry.get(
+                "appid",
+                "",
+            )
+            or ""
+        ).strip()
+
+        alias_matches = [
+            game
+            for game in installed
+            if str(
+                game.get(
+                    "appid",
+                    "",
+                )
+                or ""
+            ).strip()
+            == alias_appid
+        ]
+
+        if len(
+            alias_matches
+        ) == 1:
+            resolution = {
+                "status": "matched",
+                "match": alias_matches[
+                    0
+                ],
+                "score": 1.0,
+                "match_type": "learned_alias",
+                "candidates": alias_matches,
+            }
+
+        else:
+            # Stale aliases never override current verified Steam metadata.
+            delete_steam_game_alias(
+                title
+            )
+
+    if resolution is None:
+        resolution = (
+            resolve_installed_steam_game(
+                requested_title=title,
+                games=installed,
+            )
+        )
 
     status = str(
         resolution.get(

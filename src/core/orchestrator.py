@@ -34,6 +34,13 @@ from core.workflows.browser_search import (
 from core.workflows.steam_game_launch import (
     launch_installed_steam_game,
 )
+from core.steam_library import (
+    discover_installed_steam_games,
+    resolve_installed_steam_game,
+)
+from core.steam_alias_store import (
+    set_steam_game_alias,
+)
 from core.workflows.file_actions import (
     find_local_file,
     open_local_file,
@@ -745,6 +752,233 @@ class MaironCore:
             )
 
         # --------------------------------------------------
+        # Deterministic installed Steam game close semantics
+        # --------------------------------------------------
+
+        if turn.intent == "close_steam_game":
+            requested_title = str(
+                turn.entities.get(
+                    "steam_game_title",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            installed = (
+                discover_installed_steam_games()
+            )
+
+            resolution = (
+                resolve_installed_steam_game(
+                    requested_title=requested_title,
+                    games=installed,
+                )
+            )
+
+            status = str(
+                resolution.get(
+                    "status",
+                    "",
+                )
+                or ""
+            )
+
+            if status == "matched":
+                match = resolution.get(
+                    "match"
+                ) or {}
+
+                game_name = str(
+                    match.get(
+                        "name",
+                        requested_title,
+                    )
+                    or requested_title
+                ).strip()
+
+                direct_response = (
+                    f"I can launch {game_name}, but I don't have a "
+                    "safe verified way to close Steam games yet."
+                )
+
+            elif status == "ambiguous":
+                candidates = [
+                    str(
+                        item.get(
+                            "name",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+                    for item in list(
+                        resolution.get(
+                            "candidates",
+                            [],
+                        )
+                        or []
+                    )
+                    if str(
+                        item.get(
+                            "name",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+                ]
+
+                if candidates:
+                    direct_response = (
+                        "I found multiple installed Steam games that could "
+                        f'match "{requested_title}": '
+                        + ", ".join(
+                            candidates[:3]
+                        )
+                        + ". Be a bit more specific."
+                    )
+                else:
+                    direct_response = (
+                        "That Steam-game close request is ambiguous."
+                    )
+
+            else:
+                direct_response = (
+                    "I couldn't find an installed Steam game matching "
+                    f'"{requested_title}".'
+                )
+
+            contract = build_answer_contract(
+                turn=turn,
+                route=route,
+                evidence=None,
+            )
+
+            self.conversation_state.update_from_turn(
+                turn
+            )
+
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
+                workflow_result=None,
+                direct_response=direct_response,
+            )
+
+        # --------------------------------------------------
+        # Deterministic Steam ambiguity confirmation + learned alias
+        # --------------------------------------------------
+
+        if turn.intent == "confirm_steam_game_alias":
+            alias_query = str(
+                turn.entities.get(
+                    "steam_game_alias",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            expected_appid = str(
+                turn.entities.get(
+                    "steam_game_appid",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            game_name = str(
+                turn.entities.get(
+                    "steam_game_name",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            workflow_result = (
+                launch_installed_steam_game(
+                    requested_title=game_name
+                )
+            )
+
+            if (
+                workflow_result
+                and workflow_result.success
+            ):
+                launched_appid = str(
+                    workflow_result.data.get(
+                        "appid",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                launched_name = str(
+                    workflow_result.data.get(
+                        "game_name",
+                        game_name,
+                    )
+                    or game_name
+                ).strip()
+
+                if (
+                    launched_appid
+                    and launched_appid == expected_appid
+                ):
+                    set_steam_game_alias(
+                        alias=alias_query,
+                        appid=launched_appid,
+                        game_name=launched_name,
+                    )
+
+                    self.conversation_state.clear_steam_game_candidates()
+
+                    direct_response = (
+                        workflow_result.answer_fact
+                        + f' I\'ll remember "{alias_query}" as '
+                        + f"{launched_name}."
+                    )
+
+                else:
+                    direct_response = (
+                        "The confirmed Steam game no longer matched the "
+                        "verified installed AppID, so I didn't learn that alias."
+                    )
+
+            else:
+                direct_response = (
+                    workflow_result.error
+                    if (
+                        workflow_result
+                        and workflow_result.error
+                    )
+                    else (
+                        "I couldn't launch the confirmed Steam game, so I "
+                        "didn't learn that alias."
+                    )
+                )
+
+            contract = build_answer_contract(
+                turn=turn,
+                route=route,
+                evidence=(
+                    workflow_result.evidence
+                    if workflow_result
+                    else None
+                ),
+            )
+
+            self.conversation_state.update_from_turn(
+                turn
+            )
+
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
+                workflow_result=workflow_result,
+                direct_response=direct_response,
+            )
+
+        # --------------------------------------------------
         # Deterministic installed Steam game launch
         # --------------------------------------------------
 
@@ -801,6 +1035,36 @@ class MaironCore:
             self.conversation_state.update_from_turn(
                 turn
             )
+
+            if (
+                workflow_result
+                and workflow_result.status
+                == "ambiguous_game"
+            ):
+                resolution = (
+                    workflow_result.data.get(
+                        "resolution",
+                        {},
+                    )
+                    or {}
+                )
+
+                self.conversation_state.remember_steam_game_candidates(
+                    alias_query=requested_title,
+                    candidates=list(
+                        resolution.get(
+                            "candidates",
+                            [],
+                        )
+                        or []
+                    ),
+                )
+
+            elif (
+                workflow_result
+                and workflow_result.success
+            ):
+                self.conversation_state.clear_steam_game_candidates()
 
             return CoreDecision(
                 turn=turn,
@@ -1106,13 +1370,31 @@ class MaironCore:
                         ),
                     )
 
-                resolved = (
-                    self.conversation_state
-                    .resolve_single_email_message(
-                        target=search_text,
-                        allow_bare=False,
+                email_selector = str(
+                    turn.entities.get(
+                        "email_selector",
+                        "",
                     )
-                )
+                    or ""
+                ).strip().lower()
+
+                if email_selector:
+                    resolved = (
+                        self.conversation_state
+                        .resolve_email_message_selection(
+                            selector=email_selector,
+                            target=search_text,
+                            allow_bare=False,
+                        )
+                    )
+                else:
+                    resolved = (
+                        self.conversation_state
+                        .resolve_single_email_message(
+                            target=search_text,
+                            allow_bare=False,
+                        )
+                    )
 
                 if resolved:
                     message_id = str(
