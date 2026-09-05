@@ -351,3 +351,43 @@ def open_trusted_browser_site_via_agent(
         },
         **kwargs,
     )
+
+def search_approved_local_files_via_agent(
+    query: str,
+    **kwargs,
+) -> Dict[str, Any]:
+    # A cold local-file search may need to build the approved-root index
+    # before answering. Keep the generic Desktop Agent timeout short for
+    # interactive actions, but give filesystem discovery a larger bounded
+    # window so first-use indexing does not fail spuriously.
+    kwargs.setdefault(
+        "timeout",
+        15.0,
+    )
+
+    return call_desktop_agent(
+        action="search_approved_local_files",
+        args={
+            "query": str(
+                query
+                or ""
+            ).strip(),
+        },
+        **kwargs,
+    )
+
+
+def open_approved_local_path_via_agent(
+    path: str,
+    **kwargs,
+) -> Dict[str, Any]:
+    return call_desktop_agent(
+        action="open_approved_local_path",
+        args={
+            "path": str(
+                path
+                or ""
+            ).strip(),
+        },
+        **kwargs,
+    )

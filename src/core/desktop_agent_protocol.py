@@ -19,6 +19,8 @@ ALLOWED_ACTIONS = {
     "close_application",
     "focus_application",
     "open_trusted_browser_site",
+    "search_approved_local_files",
+    "open_approved_local_path",
 }
 
 
@@ -229,6 +231,78 @@ def validate_request(
             raise ValueError(
                 "ping does not accept arguments."
             )
+
+    elif action == "search_approved_local_files":
+        allowed_keys = {
+            "query",
+        }
+
+        unknown = set(
+            args.keys()
+        ) - allowed_keys
+
+        if unknown:
+            raise ValueError(
+                "search_approved_local_files received unsupported arguments."
+            )
+
+        query = str(
+            args.get(
+                "query",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if (
+            not query
+            or len(
+                query
+            ) > 240
+        ):
+            raise ValueError(
+                "search_approved_local_files requires a valid query."
+            )
+
+        args = {
+            "query": query,
+        }
+
+    elif action == "open_approved_local_path":
+        allowed_keys = {
+            "path",
+        }
+
+        unknown = set(
+            args.keys()
+        ) - allowed_keys
+
+        if unknown:
+            raise ValueError(
+                "open_approved_local_path received unsupported arguments."
+            )
+
+        path = str(
+            args.get(
+                "path",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if (
+            not path
+            or len(
+                path
+            ) > 4096
+        ):
+            raise ValueError(
+                "open_approved_local_path requires a valid path."
+            )
+
+        args = {
+            "path": path,
+        }
 
     elif action == "open_trusted_browser_site":
         allowed_keys = {

@@ -1,6 +1,10 @@
 from pathlib import Path
 from typing import Optional
 
+from core.desktop_agent_client import (
+    open_approved_local_path_via_agent,
+    search_approved_local_files_via_agent,
+)
 from core.evidence import (
     Evidence,
     EvidenceBundle,
@@ -9,14 +13,33 @@ from core.file_catalog import (
     get_approved_file_roots,
     is_path_within_approved_roots,
     is_safe_openable_file,
-    search_local_files,
 )
 from core.workflow_result import (
     WorkflowResult,
 )
-from tools.file_tools import (
-    open_approved_local_path,
-)
+
+
+class DesktopAgentFileSearchError(
+    RuntimeError
+):
+    def __init__(
+        self,
+        status: str,
+        message: str,
+    ):
+        super().__init__(
+            message
+        )
+
+        self.status = str(
+            status
+            or "file_search_failed"
+        )
+
+        self.message = str(
+            message
+            or "Local file search failed."
+        )
 
 
 def _relative_display_path(
@@ -46,10 +69,250 @@ def _relative_display_path(
                     relative
                 )
             )
+
         except Exception:
             continue
 
     return path.name
+
+
+def _verify_agent_file_match(
+    match,
+) -> Optional[dict]:
+    if not isinstance(
+        match,
+        dict,
+    ):
+        return None
+
+    raw_path = str(
+        match.get(
+            "path",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if not raw_path:
+        return None
+
+    path = Path(
+        raw_path
+    )
+
+    roots = get_approved_file_roots()
+
+    if (
+        not is_path_within_approved_roots(
+            path,
+            roots,
+        )
+        or not is_safe_openable_file(
+            path,
+            roots,
+        )
+    ):
+        return None
+
+    resolved = path.resolve()
+
+    verified = dict(
+        match
+    )
+
+    verified[
+        "path"
+    ] = str(
+        resolved
+    )
+
+    verified[
+        "name"
+    ] = (
+        str(
+            match.get(
+                "name",
+                "",
+            )
+            or ""
+        ).strip()
+        or resolved.name
+    )
+
+    verified[
+        "extension"
+    ] = (
+        str(
+            match.get(
+                "extension",
+                "",
+            )
+            or ""
+        ).strip().lower()
+        or resolved.suffix.lower()
+    )
+
+    return verified
+
+
+def search_local_files(
+    query: str,
+):
+    """
+    Compatibility-shaped Core wrapper around the Desktop Agent file search.
+
+    The Agent performs Windows filesystem discovery. Core then independently
+    re-validates every returned candidate against the approved roots and safe
+    file policy before any candidate can enter conversation state.
+
+    Existing deterministic tests may monkeypatch this function with the
+    lower-level local catalogue search; production does not silently fall back.
+    """
+
+    query_value = str(
+        query
+        or ""
+    ).strip()
+
+    result = (
+        search_approved_local_files_via_agent(
+            query=query_value,
+        )
+    )
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+        raise DesktopAgentFileSearchError(
+            status="unexpected_agent_result",
+            message=(
+                "The Windows Desktop Agent returned an unexpected local "
+                "file-search result."
+            ),
+        )
+
+    if result.get(
+        "success"
+    ) is not True:
+        status = str(
+            result.get(
+                "status",
+                "",
+            )
+            or "file_search_failed"
+        ).strip()
+
+        if status == "agent_unavailable":
+            message = (
+                "The Windows Desktop Agent isn't running, so I can't "
+                "search your local files right now."
+            )
+
+        else:
+            message = (
+                result.get(
+                    "message"
+                )
+                or "I couldn't search the approved local file roots."
+            )
+
+        raise DesktopAgentFileSearchError(
+            status=(
+                "desktop_agent_unavailable"
+                if status == "agent_unavailable"
+                else status
+            ),
+            message=message,
+        )
+
+    raw_matches = result.get(
+        "matches",
+        [],
+    )
+
+    if not isinstance(
+        raw_matches,
+        list,
+    ):
+        raise DesktopAgentFileSearchError(
+            status="invalid_agent_search_result",
+            message=(
+                "The Windows Desktop Agent returned invalid file candidates."
+            ),
+        )
+
+    verified = []
+
+    for match in raw_matches:
+        candidate = _verify_agent_file_match(
+            match
+        )
+
+        if candidate is not None:
+            verified.append(
+                candidate
+            )
+
+    return verified
+
+
+def open_approved_local_path(
+    path: str,
+):
+    """
+    Compatibility-shaped execution wrapper used by the workflows.
+
+    Production routes through the Desktop Agent. Existing deterministic tests
+    can monkeypatch this name without touching the transport layer.
+    """
+
+    return open_approved_local_path_via_agent(
+        path=path,
+    )
+
+
+def _agent_confirmed_exact_path(
+    result,
+    expected_path: str,
+) -> bool:
+    if not isinstance(
+        result,
+        dict,
+    ):
+        return False
+
+    actual = str(
+        result.get(
+            "path",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if not actual:
+        return False
+
+    try:
+        actual_resolved = str(
+            Path(
+                actual
+            ).resolve()
+        )
+
+        expected_resolved = str(
+            Path(
+                expected_path
+            ).resolve()
+        )
+
+    except Exception:
+        return False
+
+    return (
+        actual_resolved.lower()
+        == expected_resolved.lower()
+    )
 
 
 def find_local_file(
@@ -60,9 +323,21 @@ def find_local_file(
         or ""
     ).strip()
 
-    matches = search_local_files(
-        query
-    )
+    try:
+        matches = search_local_files(
+            query
+        )
+
+    except DesktopAgentFileSearchError as exc:
+        return WorkflowResult(
+            success=False,
+            status=exc.status,
+            error=exc.message,
+            data={
+                "query": query,
+                "matches": [],
+            },
+        )
 
     if not matches:
         return WorkflowResult(
@@ -97,10 +372,11 @@ def find_local_file(
         evidence.add(
             Evidence(
                 claim=(
-                    f'Core found one approved local file matching "{query}": '
-                    f'{match["name"]}.'
+                    "The Windows Desktop Agent found one local file matching "
+                    f'"{query}", and Core independently verified it is an '
+                    f'approved file: {match["name"]}.'
                 ),
-                provenance="local_filesystem",
+                provenance="desktop_agent",
                 confidence="verified",
                 source_name=match[
                     "name"
@@ -136,7 +412,9 @@ def find_local_file(
     ]
 
     for index, match in enumerate(
-        matches[:5],
+        matches[
+            :5
+        ],
         start=1,
     ):
         lines.append(
@@ -172,8 +450,8 @@ def open_local_file(
     """
     Resolve and open one approved local file.
 
-    A direct resolved_path is accepted only for Core-owned session referents and
-    is still revalidated at both workflow and execution boundaries.
+    Core owns the selected referent and validates it before execution.
+    The Windows Desktop Agent validates it again before touching Windows.
     """
 
     selected = None
@@ -247,24 +525,16 @@ def open_local_file(
         ]
     )
 
-    if tool_result.get(
-        "success"
-    ) is not True:
+    if not isinstance(
+        tool_result,
+        dict,
+    ):
         return WorkflowResult(
             success=False,
-            status=(
-                tool_result.get(
-                    "status"
-                )
-                or "open_failed"
-            ),
+            status="unexpected_agent_result",
             error=(
-                tool_result.get(
-                    "message"
-                )
-                or (
-                    f'I couldn\'t open {selected["name"]}.'
-                )
+                "The Windows Desktop Agent returned an unexpected local "
+                "file-open result."
             ),
             data={
                 "selected_path": selected[
@@ -273,7 +543,81 @@ def open_local_file(
                 "selected_name": selected[
                     "name"
                 ],
-                "tool_result": tool_result,
+                "raw_result": str(
+                    tool_result
+                ),
+            },
+        )
+
+    if tool_result.get(
+        "success"
+    ) is not True:
+        result_status = str(
+            tool_result.get(
+                "status",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if result_status == "agent_unavailable":
+            status = "desktop_agent_unavailable"
+            error = (
+                "The Windows Desktop Agent isn't running, so I can't "
+                f'open {selected["name"]} right now.'
+            )
+
+        else:
+            status = (
+                result_status
+                or "open_failed"
+            )
+
+            error = (
+                tool_result.get(
+                    "message"
+                )
+                or (
+                    f'I couldn\'t open {selected["name"]}.'
+                )
+            )
+
+        return WorkflowResult(
+            success=False,
+            status=status,
+            error=error,
+            data={
+                "selected_path": selected[
+                    "path"
+                ],
+                "selected_name": selected[
+                    "name"
+                ],
+                "agent_result": tool_result,
+            },
+        )
+
+    if not _agent_confirmed_exact_path(
+        tool_result,
+        selected[
+            "path"
+        ],
+    ):
+        return WorkflowResult(
+            success=False,
+            status="file_open_confirmation_mismatch",
+            error=(
+                "The Windows Desktop Agent did not confirm the exact "
+                "Core-approved file path, so I won't claim that file opened."
+            ),
+            data={
+                "selected_path": selected[
+                    "path"
+                ],
+                "selected_name": selected[
+                    "name"
+                ],
+                "agent_result": tool_result,
             },
         )
 
@@ -285,10 +629,10 @@ def open_local_file(
     evidence.add(
         Evidence(
             claim=(
-                f'Core verified and opened approved local file '
-                f'{selected["name"]}.'
+                "Core verified the selected approved file and the Windows "
+                f'Desktop Agent confirmed opening {selected["name"]}.'
             ),
-            provenance="local_filesystem",
+            provenance="desktop_agent",
             confidence="verified",
             source_name=selected[
                 "name"
@@ -315,7 +659,7 @@ def open_local_file(
             "selected_name": selected[
                 "name"
             ],
-            "tool_result": tool_result,
+            "agent_result": tool_result,
         },
     )
 
@@ -428,41 +772,92 @@ def open_local_files(
                 ),
             )
 
-        result = open_approved_local_path(
-            str(
-                path.resolve()
-            )
+        resolved_path = str(
+            path.resolve()
         )
+
+        result = open_approved_local_path(
+            resolved_path
+        )
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+            return WorkflowResult(
+                success=False,
+                status="unexpected_agent_result",
+                error=(
+                    "The Windows Desktop Agent returned an unexpected "
+                    "multi-file open result."
+                ),
+                data={
+                    "opened": opened,
+                    "failed_path": resolved_path,
+                },
+            )
 
         if result.get(
             "success"
         ) is not True:
+            result_status = str(
+                result.get(
+                    "status",
+                    "",
+                )
+                or ""
+            ).strip()
+
             return WorkflowResult(
                 success=False,
                 status=(
-                    result.get(
-                        "status"
+                    "desktop_agent_unavailable"
+                    if result_status == "agent_unavailable"
+                    else (
+                        result_status
+                        or "open_failed"
                     )
-                    or "open_failed"
                 ),
                 error=(
-                    result.get(
-                        "message"
+                    (
+                        "The Windows Desktop Agent isn't running, so I "
+                        "can't open those local files right now."
                     )
-                    or f"I couldn't open {path.name}."
+                    if result_status == "agent_unavailable"
+                    else (
+                        result.get(
+                            "message"
+                        )
+                        or f"I couldn't open {path.name}."
+                    )
                 ),
                 data={
                     "opened": opened,
-                    "failed_path": str(
-                        path.resolve()
-                    ),
+                    "failed_path": resolved_path,
+                    "agent_result": result,
+                },
+            )
+
+        if not _agent_confirmed_exact_path(
+            result,
+            resolved_path,
+        ):
+            return WorkflowResult(
+                success=False,
+                status="file_open_confirmation_mismatch",
+                error=(
+                    "The Windows Desktop Agent did not confirm the exact "
+                    "Core-approved file path."
+                ),
+                data={
+                    "opened": opened,
+                    "failed_path": resolved_path,
+                    "agent_result": result,
                 },
             )
 
         opened.append({
-            "path": str(
-                path.resolve()
-            ),
+            "path": resolved_path,
             "name": path.name,
         })
 
@@ -479,12 +874,14 @@ def open_local_files(
         answer = (
             f"{names[0]} is open."
         )
+
     elif len(
         names
     ) == 2:
         answer = (
             f"{names[0]} and {names[1]} are open."
         )
+
     else:
         answer = (
             f"Opened {len(names)} files."
@@ -497,14 +894,18 @@ def open_local_files(
         data={
             "opened": opened,
             "selected_path": (
-                opened[-1][
+                opened[
+                    -1
+                ][
                     "path"
                 ]
                 if opened
                 else None
             ),
             "selected_name": (
-                opened[-1][
+                opened[
+                    -1
+                ][
                     "name"
                 ]
                 if opened
@@ -514,34 +915,112 @@ def open_local_files(
     )
 
 
-
 def open_trusted_folder(
     path: str,
     display_name: str,
 ) -> WorkflowResult:
-    tool_result = open_approved_local_path(
+    raw_path = str(
         path
+        or ""
+    ).strip()
+
+    candidate = Path(
+        raw_path
     )
+
+    roots = get_approved_file_roots()
+
+    if (
+        not is_path_within_approved_roots(
+            candidate,
+            roots,
+        )
+        or not candidate.is_dir()
+    ):
+        return WorkflowResult(
+            success=False,
+            status="invalid_referent",
+            error=(
+                "That folder is no longer an approved local folder."
+            ),
+        )
+
+    resolved_path = str(
+        candidate.resolve()
+    )
+
+    tool_result = open_approved_local_path(
+        resolved_path
+    )
+
+    if not isinstance(
+        tool_result,
+        dict,
+    ):
+        return WorkflowResult(
+            success=False,
+            status="unexpected_agent_result",
+            error=(
+                "The Windows Desktop Agent returned an unexpected folder-open "
+                "result."
+            ),
+        )
 
     if tool_result.get(
         "success"
     ) is not True:
+        result_status = str(
+            tool_result.get(
+                "status",
+                "",
+            )
+            or ""
+        ).strip()
+
         return WorkflowResult(
             success=False,
             status=(
-                tool_result.get(
-                    "status"
+                "desktop_agent_unavailable"
+                if result_status == "agent_unavailable"
+                else (
+                    result_status
+                    or "open_failed"
                 )
-                or "open_failed"
             ),
             error=(
-                tool_result.get(
-                    "message"
+                (
+                    "The Windows Desktop Agent isn't running, so I can't "
+                    f"open {display_name} right now."
                 )
-                or (
-                    f"I couldn't open {display_name}."
+                if result_status == "agent_unavailable"
+                else (
+                    tool_result.get(
+                        "message"
+                    )
+                    or (
+                        f"I couldn't open {display_name}."
+                    )
                 )
             ),
+            data={
+                "agent_result": tool_result,
+            },
+        )
+
+    if not _agent_confirmed_exact_path(
+        tool_result,
+        resolved_path,
+    ):
+        return WorkflowResult(
+            success=False,
+            status="file_open_confirmation_mismatch",
+            error=(
+                "The Windows Desktop Agent did not confirm the exact "
+                "Core-approved folder path."
+            ),
+            data={
+                "agent_result": tool_result,
+            },
         )
 
     return WorkflowResult(
@@ -551,12 +1030,9 @@ def open_trusted_folder(
             f"{display_name} is open."
         ),
         data={
-            "selected_path": str(
-                Path(
-                    path
-                ).resolve()
-            ),
+            "selected_path": resolved_path,
             "selected_name": display_name,
             "kind": "folder",
+            "agent_result": tool_result,
         },
     )

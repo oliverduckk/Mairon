@@ -113,6 +113,40 @@ def execute_approved_agent_action(
             ),
         )
 
+    if action == "search_approved_local_files":
+        from core.file_catalog import (
+            search_local_files,
+        )
+
+        matches = search_local_files(
+            args[
+                "query"
+            ]
+        )
+
+        return {
+            "success": True,
+            "status": "search_completed",
+            "query": args[
+                "query"
+            ],
+            "count": len(
+                matches
+            ),
+            "matches": matches,
+        }
+
+    if action == "open_approved_local_path":
+        from tools.file_tools import (
+            open_approved_local_path,
+        )
+
+        return open_approved_local_path(
+            args[
+                "path"
+            ]
+        )
+
     return {
         "success": False,
         "status": "unsupported_action",
@@ -171,9 +205,20 @@ class DesktopAgentRequestHandler(
 
         self.end_headers()
 
-        self.wfile.write(
-            raw
-        )
+        try:
+            self.wfile.write(
+                raw
+            )
+
+        except (
+            BrokenPipeError,
+            ConnectionAbortedError,
+            ConnectionResetError,
+        ):
+            # The Core/client may have timed out or been interrupted after the
+            # Agent completed a longer-running action such as a cold file-index
+            # scan. That is a normal transport disconnect, not an Agent crash.
+            return
 
     def _request_id_from_untrusted_body(
         self,
@@ -516,7 +561,8 @@ def main():
     print(
         "Approved actions: ping, launch_application, "
         "close_application, focus_application, "
-        "open_trusted_browser_site"
+        "open_trusted_browser_site, search_approved_local_files, "
+        "open_approved_local_path"
     )
 
     try:

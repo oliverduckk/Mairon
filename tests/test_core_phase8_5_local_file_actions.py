@@ -42,6 +42,10 @@ def run():
         file_workflow.open_approved_local_path
     )
 
+    original_workflow_search = (
+        file_workflow.search_local_files
+    )
+
     original_catalog_roots = (
         file_catalog.get_approved_file_roots
     )
@@ -51,6 +55,12 @@ def run():
     )
 
     try:
+        file_workflow.search_local_files = (
+            lambda query: file_catalog.search_local_files(
+                query
+            )
+        )
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(
                 temp_dir
@@ -382,6 +392,10 @@ def run():
             assert "taskkill" not in source
 
     finally:
+        file_workflow.search_local_files = (
+            original_workflow_search
+        )
+
         file_workflow.open_approved_local_path = (
             original_open
         )

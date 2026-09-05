@@ -34,7 +34,17 @@ def run():
         file_workflow.open_approved_local_path
     )
 
+    original_workflow_search = (
+        file_workflow.search_local_files
+    )
+
     try:
+        file_workflow.search_local_files = (
+            lambda query: file_catalog.search_local_files(
+                query
+            )
+        )
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(
                 temp_dir
@@ -395,6 +405,10 @@ def run():
 
         file_workflow.get_approved_file_roots = (
             original_workflow_roots
+        )
+
+        file_workflow.search_local_files = (
+            original_workflow_search
         )
 
         file_workflow.open_approved_local_path = (
