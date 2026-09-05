@@ -5,3 +5,5 @@ __pycache__/
 
 # Local Mairon runtime data
 data/
+# Local editor settings
+.vscode/
