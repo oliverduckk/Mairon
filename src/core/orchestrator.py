@@ -32,10 +32,10 @@ from core.workflows.browser_search import (
     open_browser_search,
 )
 from core.workflows.steam_game_launch import (
+    discover_installed_steam_games,
     launch_installed_steam_game,
 )
 from core.steam_library import (
-    discover_installed_steam_games,
     resolve_installed_steam_game,
 )
 from core.steam_alias_store import (
@@ -371,6 +371,14 @@ class MaironCore:
                 or ""
             ).strip()
 
+            folder_id = str(
+                turn.entities.get(
+                    "local_folder_id",
+                    "",
+                )
+                or ""
+            ).strip().lower()
+
             if turn.intent == "find_local_file":
                 workflow_result = find_local_file(
                     query=query,
@@ -441,10 +449,7 @@ class MaironCore:
 
             elif turn.intent == "open_local_folder":
                 workflow_result = open_trusted_folder(
-                    path=(
-                        resolved_path
-                        or ""
-                    ),
+                    folder_id=folder_id,
                     display_name=(
                         display_name
                         or "Folder"

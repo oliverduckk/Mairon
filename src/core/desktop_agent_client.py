@@ -391,3 +391,50 @@ def open_approved_local_path_via_agent(
         },
         **kwargs,
     )
+
+def list_installed_steam_games_via_agent(
+    **kwargs,
+) -> Dict[str, Any]:
+    # Steam manifest discovery is normally quick, but it is filesystem-backed
+    # and may be slower on first access or across multiple library volumes.
+    kwargs.setdefault(
+        "timeout",
+        10.0,
+    )
+
+    return call_desktop_agent(
+        action="list_installed_steam_games",
+        args={},
+        **kwargs,
+    )
+
+
+def launch_steam_game_appid_via_agent(
+    appid: str,
+    **kwargs,
+) -> Dict[str, Any]:
+    return call_desktop_agent(
+        action="launch_steam_game_appid",
+        args={
+            "appid": str(
+                appid
+                or ""
+            ).strip(),
+        },
+        **kwargs,
+    )
+
+def open_trusted_folder_via_agent(
+    folder_id: str,
+    **kwargs,
+) -> Dict[str, Any]:
+    return call_desktop_agent(
+        action="open_trusted_folder",
+        args={
+            "folder_id": str(
+                folder_id
+                or ""
+            ).strip().lower(),
+        },
+        **kwargs,
+    )

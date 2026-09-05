@@ -3,6 +3,7 @@ from typing import Optional
 
 from core.desktop_agent_client import (
     open_approved_local_path_via_agent,
+    open_trusted_folder_via_agent,
     search_approved_local_files_via_agent,
 )
 from core.evidence import (
@@ -916,110 +917,118 @@ def open_local_files(
 
 
 def open_trusted_folder(
-    path: str,
+    folder_id: str,
     display_name: str,
 ) -> WorkflowResult:
-    raw_path = str(
-        path
-        or ""
-    ).strip()
+    """
+    Open one semantic trusted-folder identity through the Windows Desktop Agent.
 
-    candidate = Path(
-        raw_path
+    Core never resolves or sends the Windows Known Folder path.
+    """
+
+    folder_value = str(
+        folder_id
+        or ""
+    ).strip().lower()
+
+    display_value = (
+        str(
+            display_name
+            or ""
+        ).strip()
+        or "Folder"
     )
 
-    roots = get_approved_file_roots()
-
-    if (
-        not is_path_within_approved_roots(
-            candidate,
-            roots,
-        )
-        or not candidate.is_dir()
-    ):
+    if folder_value not in {
+        "desktop",
+        "documents",
+        "pictures",
+        "screenshots",
+    }:
         return WorkflowResult(
             success=False,
-            status="invalid_referent",
+            status="invalid_trusted_folder",
             error=(
-                "That folder is no longer an approved local folder."
+                "That folder is not an approved trusted-folder identity."
             ),
         )
 
-    resolved_path = str(
-        candidate.resolve()
-    )
-
-    tool_result = open_approved_local_path(
-        resolved_path
+    result = open_trusted_folder_via_agent(
+        folder_id=folder_value,
     )
 
     if not isinstance(
-        tool_result,
+        result,
         dict,
     ):
         return WorkflowResult(
             success=False,
             status="unexpected_agent_result",
             error=(
-                "The Windows Desktop Agent returned an unexpected folder-open "
-                "result."
+                "The Windows Desktop Agent returned an unexpected trusted "
+                "folder result."
             ),
         )
 
-    if tool_result.get(
+    if result.get(
         "success"
     ) is not True:
         result_status = str(
-            tool_result.get(
+            result.get(
                 "status",
                 "",
             )
             or ""
         ).strip()
 
+        if result_status == "agent_unavailable":
+            status = "desktop_agent_unavailable"
+            error = (
+                "The Windows Desktop Agent isn't running, so I can't "
+                f"open {display_value} right now."
+            )
+
+        else:
+            status = (
+                result_status
+                or "folder_open_failed"
+            )
+            error = (
+                result.get(
+                    "message"
+                )
+                or f"I couldn't open {display_value}."
+            )
+
         return WorkflowResult(
             success=False,
-            status=(
-                "desktop_agent_unavailable"
-                if result_status == "agent_unavailable"
-                else (
-                    result_status
-                    or "open_failed"
-                )
-            ),
-            error=(
-                (
-                    "The Windows Desktop Agent isn't running, so I can't "
-                    f"open {display_name} right now."
-                )
-                if result_status == "agent_unavailable"
-                else (
-                    tool_result.get(
-                        "message"
-                    )
-                    or (
-                        f"I couldn't open {display_name}."
-                    )
-                )
-            ),
+            status=status,
+            error=error,
             data={
-                "agent_result": tool_result,
+                "folder_id": folder_value,
+                "agent_result": result,
             },
         )
 
-    if not _agent_confirmed_exact_path(
-        tool_result,
-        resolved_path,
-    ):
+    confirmed_folder_id = str(
+        result.get(
+            "folder_id",
+            "",
+        )
+        or ""
+    ).strip().lower()
+
+    if confirmed_folder_id != folder_value:
         return WorkflowResult(
             success=False,
-            status="file_open_confirmation_mismatch",
+            status="trusted_folder_confirmation_mismatch",
             error=(
                 "The Windows Desktop Agent did not confirm the exact "
-                "Core-approved folder path."
+                "Core-selected trusted folder."
             ),
             data={
-                "agent_result": tool_result,
+                "folder_id": folder_value,
+                "agent_result": result,
             },
         )
 
@@ -1027,12 +1036,12 @@ def open_trusted_folder(
         success=True,
         status="folder_opened",
         answer_fact=(
-            f"{display_name} is open."
+            f"{display_value} is open."
         ),
         data={
-            "selected_path": resolved_path,
-            "selected_name": display_name,
+            "folder_id": folder_value,
+            "selected_name": display_value,
             "kind": "folder",
-            "agent_result": tool_result,
+            "agent_result": result,
         },
     )

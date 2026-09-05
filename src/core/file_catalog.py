@@ -538,18 +538,21 @@ def get_approved_file_roots() -> List[Path]:
 def resolve_trusted_folder_alias(
     text: str,
 ) -> Optional[dict]:
+    """
+    Resolve only the semantic trusted-folder identity.
+
+    Core must not resolve the actual Windows Known Folder path. The Windows
+    Desktop Agent owns that platform-specific lookup and validates the folder
+    again immediately before execution.
+    """
+
     value = _normalise_text(
         text
     )
 
-    paths = get_trusted_folder_paths()
-
     for folder_id, aliases in (
         TRUSTED_FOLDER_ALIASES.items()
     ):
-        if folder_id not in paths:
-            continue
-
         for alias in aliases:
             if value == _normalise_text(
                 alias
@@ -560,11 +563,6 @@ def resolve_trusted_folder_alias(
                         "Screenshots"
                         if folder_id == "screenshots"
                         else folder_id.title()
-                    ),
-                    "path": str(
-                        paths[
-                            folder_id
-                        ]
                     ),
                 }
 
@@ -1915,8 +1913,8 @@ def extract_local_file_action_request(
                 "display_name": folder[
                     "display_name"
                 ],
-                "path": folder[
-                    "path"
+                "folder_id": folder[
+                    "folder_id"
                 ],
                 "inherited": False,
             }

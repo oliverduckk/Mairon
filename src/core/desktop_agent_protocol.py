@@ -21,6 +21,9 @@ ALLOWED_ACTIONS = {
     "open_trusted_browser_site",
     "search_approved_local_files",
     "open_approved_local_path",
+    "list_installed_steam_games",
+    "launch_steam_game_appid",
+    "open_trusted_folder",
 }
 
 
@@ -231,6 +234,85 @@ def validate_request(
             raise ValueError(
                 "ping does not accept arguments."
             )
+
+    elif action == "open_trusted_folder":
+        allowed_keys = {
+            "folder_id",
+        }
+
+        unknown = set(
+            args.keys()
+        ) - allowed_keys
+
+        if unknown:
+            raise ValueError(
+                "open_trusted_folder received unsupported arguments."
+            )
+
+        folder_id = str(
+            args.get(
+                "folder_id",
+                "",
+            )
+            or ""
+        ).strip().lower()
+
+        if folder_id not in {
+            "desktop",
+            "documents",
+            "pictures",
+            "screenshots",
+        }:
+            raise ValueError(
+                "open_trusted_folder requires an approved folder_id."
+            )
+
+        args = {
+            "folder_id": folder_id,
+        }
+
+    elif action == "list_installed_steam_games":
+        if args:
+            raise ValueError(
+                "list_installed_steam_games does not accept arguments."
+            )
+
+    elif action == "launch_steam_game_appid":
+        allowed_keys = {
+            "appid",
+        }
+
+        unknown = set(
+            args.keys()
+        ) - allowed_keys
+
+        if unknown:
+            raise ValueError(
+                "launch_steam_game_appid received unsupported arguments."
+            )
+
+        appid = str(
+            args.get(
+                "appid",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if (
+            not appid
+            or not appid.isdigit()
+            or len(
+                appid
+            ) > 20
+        ):
+            raise ValueError(
+                "launch_steam_game_appid requires a numeric AppID."
+            )
+
+        args = {
+            "appid": appid,
+        }
 
     elif action == "search_approved_local_files":
         allowed_keys = {

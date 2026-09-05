@@ -1269,6 +1269,19 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
                 "local_file_path"
             ] = path
 
+        folder_id = str(
+            local_file_action.get(
+                "folder_id",
+                "",
+            )
+            or ""
+        ).strip().lower()
+
+        if folder_id:
+            state.entities[
+                "local_folder_id"
+            ] = folder_id
+
         if paths:
             state.entities[
                 "local_file_paths"
@@ -1340,6 +1353,33 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
             or ""
         ).strip()
 
+        inherited_steam_referent = False
+
+        if (
+            requested_title.lower()
+            in {
+                "it",
+                "that",
+                "this",
+                "the game",
+                "that game",
+                "this game",
+            }
+            and conversation_state is not None
+        ):
+            active_steam_game = str(
+                getattr(
+                    conversation_state,
+                    "active_steam_game_title",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if active_steam_game:
+                requested_title = active_steam_game
+                inherited_steam_referent = True
+
         state.speech_act = "request_action"
         state.intent = "close_steam_game"
         state.subject = requested_title
@@ -1357,13 +1397,26 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.should_answer_directly = False
         state.should_recommend = False
         state.should_continue_conversation = False
-        state.confidence = 0.94
+        state.confidence = 0.98 if inherited_steam_referent else 0.94
 
-        state.add_reason(
-            "close-like request for a possible installed Steam game; "
-            "Core must verify the installed title and owns whether safe "
-            "game-close semantics are supported"
-        )
+        if inherited_steam_referent:
+            state.is_follow_up = True
+
+            state.resolved_referents[
+                "it"
+            ] = requested_title
+
+            state.add_reason(
+                "resolved deictic Steam-game close request against the "
+                "Core-owned active Steam-game referent"
+            )
+
+        else:
+            state.add_reason(
+                "close-like request for a possible installed Steam game; "
+                "Core must verify the installed title and owns whether safe "
+                "game-close semantics are supported"
+            )
 
         return state
 

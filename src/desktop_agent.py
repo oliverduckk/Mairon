@@ -147,6 +147,87 @@ def execute_approved_agent_action(
             ]
         )
 
+    if action == "open_trusted_folder":
+        from core.file_catalog import (
+            get_trusted_folder_paths,
+        )
+
+        from tools.file_tools import (
+            open_approved_local_path,
+        )
+
+        folder_id = args[
+            "folder_id"
+        ]
+
+        folder_path = (
+            get_trusted_folder_paths()
+            .get(
+                folder_id
+            )
+        )
+
+        if folder_path is None:
+            return {
+                "success": False,
+                "status": "trusted_folder_unavailable",
+                "folder_id": folder_id,
+                "message": (
+                    "That approved Windows folder is not available."
+                ),
+            }
+
+        result = open_approved_local_path(
+            str(
+                folder_path
+            )
+        )
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+            return {
+                "success": False,
+                "status": "invalid_folder_open_result",
+                "folder_id": folder_id,
+                "message": (
+                    "The trusted-folder open layer returned an invalid result."
+                ),
+            }
+
+        return {
+            **result,
+            "folder_id": folder_id,
+        }
+
+    if action == "list_installed_steam_games":
+        from core.steam_library import (
+            discover_installed_steam_games,
+        )
+
+        games = discover_installed_steam_games()
+
+        return {
+            "success": True,
+            "status": "steam_library_listed",
+            "count": len(
+                games
+            ),
+            "games": games,
+        }
+
+    if action == "launch_steam_game_appid":
+        from tools.desktop_tools import (
+            launch_steam_game_appid,
+        )
+
+        return launch_steam_game_appid(
+            args[
+                "appid"
+            ]
+        )
+
     return {
         "success": False,
         "status": "unsupported_action",
@@ -562,7 +643,8 @@ def main():
         "Approved actions: ping, launch_application, "
         "close_application, focus_application, "
         "open_trusted_browser_site, search_approved_local_files, "
-        "open_approved_local_path"
+        "open_approved_local_path, open_trusted_folder, "
+        "list_installed_steam_games, launch_steam_game_appid"
     )
 
     try:

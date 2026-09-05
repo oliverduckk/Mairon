@@ -93,7 +93,10 @@ def run():
 
                 return {
                     "success": True,
-                    "status": "launch_requested",
+                    "status": "steam_launch_requested",
+                    "appid": str(
+                        appid
+                    ),
                 }
 
             steam_workflow.launch_steam_game_appid = (
