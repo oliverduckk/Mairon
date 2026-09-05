@@ -295,3 +295,34 @@ def launch_application_via_agent(
         },
         **kwargs,
     )
+
+def close_application_via_agent(
+    app_name: str,
+    **kwargs,
+) -> Dict[str, Any]:
+    return call_desktop_agent(
+        action="close_application",
+        args={
+            "app_name": str(
+                app_name
+                or ""
+            ).strip().lower(),
+        },
+        **kwargs,
+    )
+
+
+def focus_application_via_agent(
+    app_name: str,
+    **kwargs,
+) -> Dict[str, Any]:
+    return call_desktop_agent(
+        action="focus_application",
+        args={
+            "app_name": str(
+                app_name
+                or ""
+            ).strip().lower(),
+        },
+        **kwargs,
+    )

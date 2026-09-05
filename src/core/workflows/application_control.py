@@ -1,3 +1,7 @@
+from core.desktop_agent_client import (
+    close_application_via_agent,
+    focus_application_via_agent,
+)
 from core.desktop_catalog import (
     desktop_display_name,
     get_desktop_target,
@@ -9,10 +13,26 @@ from core.evidence import (
 from core.workflow_result import (
     WorkflowResult,
 )
-from tools.desktop_tools import (
-    close_application,
-    focus_application,
-)
+
+
+def _agent_unavailable_error(
+    app_name: str,
+    action: str,
+) -> str:
+    display_name = desktop_display_name(
+        app_name
+    )
+
+    if action == "close":
+        return (
+            "The Windows Desktop Agent isn't running, so I can't "
+            f"close {display_name} right now."
+        )
+
+    return (
+        "The Windows Desktop Agent isn't running, so I can't "
+        f"bring {display_name} to the front right now."
+    )
 
 
 def control_approved_application(
@@ -20,10 +40,13 @@ def control_approved_application(
     action: str,
 ) -> WorkflowResult:
     """
-    Perform one bounded Core-owned desktop window action.
+    Perform one bounded Core-owned desktop window action through the
+    authenticated Windows Desktop Agent.
 
-    Close semantics come from Core's allowlisted desktop catalogue.
+    Core owns target identity, referent resolution, and action authority.
+    The Desktop Agent owns the actual Windows execution.
 
+    Close semantics still come from Core's allowlisted desktop catalogue.
     Most targets use graceful WM_CLOSE. Known tray-backed exceptions may use
     an approved full-process quit that terminates only their fixed allowlisted
     process image names.
@@ -55,13 +78,15 @@ def control_approved_application(
         )
 
     if action == "close":
-        result = close_application(
+        result = close_application_via_agent(
             app_name
         )
+
     elif action == "focus":
-        result = focus_application(
+        result = focus_application_via_agent(
             app_name
         )
+
     else:
         return WorkflowResult(
             success=False,
@@ -79,35 +104,64 @@ def control_approved_application(
     ):
         return WorkflowResult(
             success=False,
-            status="unexpected_tool_result",
+            status="unexpected_agent_result",
             error=(
-                "The desktop control layer returned an unexpected result."
+                "The Windows Desktop Agent returned an unexpected result."
             ),
             data={
                 "app_name": app_name,
                 "action": action,
-                "raw_result": str(result),
+                "raw_result": str(
+                    result
+                ),
             },
         )
 
-    if result.get("success") is not True:
-        return WorkflowResult(
-            success=False,
-            status=(
-                result.get("status")
+    if result.get(
+        "success"
+    ) is not True:
+        result_status = str(
+            result.get(
+                "status",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if result_status == "agent_unavailable":
+            workflow_status = (
+                "desktop_agent_unavailable"
+            )
+
+            error = _agent_unavailable_error(
+                app_name=app_name,
+                action=action,
+            )
+
+        else:
+            workflow_status = (
+                result_status
                 or f"{action}_failed"
-            ),
-            error=(
-                result.get("message")
+            )
+
+            error = (
+                result.get(
+                    "message"
+                )
                 or (
                     f"I couldn't {action} "
                     f"{desktop_display_name(app_name)}."
                 )
-            ),
+            )
+
+        return WorkflowResult(
+            success=False,
+            status=workflow_status,
+            error=error,
             data={
                 "app_name": app_name,
                 "action": action,
-                "tool_result": result,
+                "agent_result": result,
             },
         )
 
@@ -128,10 +182,12 @@ def control_approved_application(
             answer_fact = (
                 f"{display_name}'s closed."
             )
+
         else:
             answer_fact = (
                 f"{display_name} window's closed."
             )
+
     else:
         answer_fact = (
             f"{display_name}'s in front."
@@ -145,10 +201,10 @@ def control_approved_application(
     evidence.add(
         Evidence(
             claim=(
-                "The local desktop control layer successfully performed "
+                "The Windows Desktop Agent successfully performed "
                 f"{action} for {display_name}."
             ),
-            provenance="desktop_tool",
+            provenance="desktop_agent",
             confidence="verified",
             source_name=f"{action}_application",
             data={
@@ -170,6 +226,6 @@ def control_approved_application(
         data={
             "app_name": app_name,
             "action": action,
-            "tool_result": result,
+            "agent_result": result,
         },
     )

@@ -112,6 +112,10 @@ def run():
         desktop_tools._target_pids
     )
 
+    original_target_window_pids = (
+        desktop_tools._target_window_pids
+    )
+
     original_windows = (
         desktop_tools._top_level_windows_for_pids
     )
@@ -159,6 +163,7 @@ def run():
         def fake_windows(
             pids,
             visible_only=True,
+            target_id="",
         ):
             window_calls.append(
                 (
@@ -166,6 +171,7 @@ def run():
                         pids
                     ),
                     visible_only,
+                    target_id,
                 )
             )
 
@@ -215,6 +221,10 @@ def run():
             original_target_pids
         )
 
+        desktop_tools._target_window_pids = (
+            original_target_window_pids
+        )
+
         desktop_tools._top_level_windows_for_pids = (
             original_windows
         )
@@ -233,6 +243,10 @@ def run():
 
     original_target_pids = (
         desktop_tools._target_pids
+    )
+
+    original_target_window_pids = (
+        desktop_tools._target_window_pids
     )
 
     original_windows = (
@@ -278,8 +292,14 @@ def run():
             }
         )
 
+        desktop_tools._target_window_pids = (
+            lambda target_id: {
+                303
+            }
+        )
+
         desktop_tools._top_level_windows_for_pids = (
-            lambda pids, visible_only=True: [
+            lambda pids, visible_only=True, target_id="": [
                 7001
             ]
         )
@@ -317,6 +337,10 @@ def run():
             original_target_pids
         )
 
+        desktop_tools._target_window_pids = (
+            original_target_window_pids
+        )
+
         desktop_tools._top_level_windows_for_pids = (
             original_windows
         )
@@ -329,12 +353,12 @@ def run():
     # 5. Workflow language reflects full quit vs window close.
     # --------------------------------------------------
 
-    original_close = (
-        control_module.close_application
+    original_close_via_agent = (
+        control_module.close_application_via_agent
     )
 
     try:
-        control_module.close_application = (
+        control_module.close_application_via_agent = (
             lambda app_name: {
                 "success": True,
                 "status": "terminated",
@@ -356,8 +380,8 @@ def run():
         )
 
     finally:
-        control_module.close_application = (
-            original_close
+        control_module.close_application_via_agent = (
+            original_close_via_agent
         )
 
     # --------------------------------------------------

@@ -16,6 +16,8 @@ TOKEN_HEADER = "X-Mairon-Agent-Token"
 ALLOWED_ACTIONS = {
     "ping",
     "launch_application",
+    "close_application",
+    "focus_application",
 }
 
 
@@ -227,7 +229,11 @@ def validate_request(
                 "ping does not accept arguments."
             )
 
-    elif action == "launch_application":
+    elif action in {
+        "launch_application",
+        "close_application",
+        "focus_application",
+    }:
         allowed_keys = {
             "app_name",
         }
@@ -238,7 +244,7 @@ def validate_request(
 
         if unknown:
             raise ValueError(
-                "launch_application received unsupported arguments."
+                f"{action} received unsupported arguments."
             )
 
         app_name = str(
@@ -256,7 +262,7 @@ def validate_request(
             ) > 80
         ):
             raise ValueError(
-                "launch_application requires a valid app_name."
+                f"{action} requires a valid app_name."
             )
 
         args = {

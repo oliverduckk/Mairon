@@ -24,6 +24,10 @@ def run():
         desktop_tools._target_pids
     )
 
+    original_target_window_pids = (
+        desktop_tools._target_window_pids
+    )
+
     original_windows = (
         desktop_tools
         ._top_level_windows_for_pids
@@ -60,12 +64,25 @@ def run():
             else set()
         )
 
+        desktop_tools._target_window_pids = (
+            lambda target_id: {
+                111,
+                222,
+            }
+            if target_id == "discord"
+            else set()
+        )
+
         def fake_windows(
             pids,
             visible_only=True,
+            target_id="",
         ):
             window_queries.append(
-                visible_only
+                (
+                    visible_only,
+                    target_id,
+                )
             )
 
             if visible_only:
@@ -138,13 +155,23 @@ def run():
         assert launch_calls == []
 
         assert window_queries == [
-            True,
-            False,
+            (
+                True,
+                "discord",
+            ),
+            (
+                False,
+                "discord",
+            ),
         ]
 
     finally:
         desktop_tools._target_pids = (
             original_target_pids
+        )
+
+        desktop_tools._target_window_pids = (
+            original_target_window_pids
         )
 
         desktop_tools._top_level_windows_for_pids = (

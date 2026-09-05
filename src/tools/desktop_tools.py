@@ -511,15 +511,12 @@ def launch_application(
             )
 
     elif target_id == "steam":
-        executable = _find_steam()
-        if executable:
-            result = _launch_process(
-                [executable]
-            )
-        else:
-            result = _launch_uri(
-                "steam://open/main"
-            )
+        # Fixed Core-owned URI: explicitly request the modern main Steam
+        # client UI. This avoids surfacing steam.exe's tiny VGUI bootstrap
+        # window when the client is already resident.
+        result = _launch_uri(
+            "steam://open/main"
+        )
 
     elif target_id == "vscode":
         executable = _find_vscode()
@@ -640,23 +637,20 @@ def _tasklist_pid_map() -> Dict[int, str]:
     return process_map
 
 
-def _target_pids(
-    target_id: str,
+def _pids_for_process_names(
+    process_names,
 ) -> Set[int]:
-    target = get_desktop_target(
-        target_id
-    )
-
-    if target is None:
-        return set()
-
     names = {
-        str(value).strip().lower()
-        for value in target.get(
-            "process_names",
-            (),
+        str(
+            value
+        ).strip().lower()
+        for value in (
+            process_names
+            or ()
         )
-        if str(value).strip()
+        if str(
+            value
+        ).strip()
     }
 
     if not names:
@@ -671,9 +665,197 @@ def _target_pids(
     }
 
 
+def _target_pids(
+    target_id: str,
+) -> Set[int]:
+    """
+    Return lifecycle/process identity PIDs for one allowlisted target.
+
+    These remain intentionally separate from UI-window ownership. Steam is
+    the motivating example: steam.exe is the client identity while the modern
+    main client window is owned by steamwebhelper.exe.
+    """
+
+    target = get_desktop_target(
+        target_id
+    )
+
+    if target is None:
+        return set()
+
+    return _pids_for_process_names(
+        target.get(
+            "process_names",
+            (),
+        )
+    )
+
+
+def _target_window_pids(
+    target_id: str,
+) -> Set[int]:
+    """
+    Return only processes approved to own user-facing windows for a target.
+
+    Targets without an explicit window_process_names field preserve the
+    historical process_names behavior.
+    """
+
+    target = get_desktop_target(
+        target_id
+    )
+
+    if target is None:
+        return set()
+
+    names = target.get(
+        "window_process_names",
+        target.get(
+            "process_names",
+            (),
+        ),
+    )
+
+    return _pids_for_process_names(
+        names
+    )
+
+
+def _get_window_text(
+    hwnd: int,
+) -> str:
+    if os.name != "nt":
+        return ""
+
+    user32 = ctypes.windll.user32
+
+    length = int(
+        user32.GetWindowTextLengthW(
+            hwnd
+        )
+        or 0
+    )
+
+    if length <= 0:
+        return ""
+
+    buffer = ctypes.create_unicode_buffer(
+        length + 1
+    )
+
+    user32.GetWindowTextW(
+        hwnd,
+        buffer,
+        length + 1,
+    )
+
+    return str(
+        buffer.value
+        or ""
+    )
+
+
+def _get_window_class_name(
+    hwnd: int,
+) -> str:
+    if os.name != "nt":
+        return ""
+
+    user32 = ctypes.windll.user32
+
+    buffer = ctypes.create_unicode_buffer(
+        256
+    )
+
+    result = user32.GetClassNameW(
+        hwnd,
+        buffer,
+        256,
+    )
+
+    if not result:
+        return ""
+
+    return str(
+        buffer.value
+        or ""
+    )
+
+
+def _window_matches_target(
+    target_id: str,
+    hwnd: int,
+) -> bool:
+    """
+    Apply optional Core-owned UI signatures to an already allowlisted HWND.
+
+    This is intentionally exact/conservative. A target without extra window
+    metadata keeps the historical "human-facing title required" rule.
+    """
+
+    title = _get_window_text(
+        hwnd
+    ).strip()
+
+    if not title:
+        return False
+
+    target = get_desktop_target(
+        target_id
+    )
+
+    if target is None:
+        return False
+
+    allowed_titles = {
+        str(
+            value
+        ).strip().lower()
+        for value in target.get(
+            "window_titles",
+            (),
+        )
+        if str(
+            value
+        ).strip()
+    }
+
+    if (
+        allowed_titles
+        and title.lower() not in allowed_titles
+    ):
+        return False
+
+    allowed_classes = {
+        str(
+            value
+        ).strip().lower()
+        for value in target.get(
+            "window_class_names",
+            (),
+        )
+        if str(
+            value
+        ).strip()
+    }
+
+    if allowed_classes:
+        class_name = (
+            _get_window_class_name(
+                hwnd
+            ).strip().lower()
+        )
+
+        if class_name not in allowed_classes:
+            return False
+
+    return True
+
+
 def _top_level_windows_for_pids(
     pids: Set[int],
     visible_only: bool = True,
+    target_id: str = "",
 ) -> List[int]:
     """
     Find titled top-level windows owned by the allowlisted process set.
@@ -725,19 +907,27 @@ def _top_level_windows_for_pids(
         ) not in pids:
             return True
 
-        # Avoid Electron helper/message windows. The actual app window retains
-        # a human-facing title even when hidden in the tray.
-        length = user32.GetWindowTextLengthW(
+        hwnd_value = int(
             hwnd
         )
 
-        if length <= 0:
-            return True
+        if target_id:
+            if not _window_matches_target(
+                target_id,
+                hwnd_value,
+            ):
+                return True
+
+        else:
+            # Historical fallback for callers without target-specific window
+            # metadata: only human-facing titled windows are candidates.
+            if not _get_window_text(
+                hwnd_value
+            ).strip():
+                return True
 
         windows.append(
-            int(
-                hwnd
-            )
+            hwnd_value
         )
 
         return True
@@ -750,15 +940,214 @@ def _top_level_windows_for_pids(
     return windows
 
 
+def _foreground_window_handle() -> int:
+    """
+    Return the current foreground HWND using pointer-sized ctypes handling.
+    """
+
+    if os.name != "nt":
+        return 0
+
+    user32 = ctypes.windll.user32
+
+    get_foreground_window = (
+        user32.GetForegroundWindow
+    )
+
+    get_foreground_window.restype = (
+        ctypes.c_void_p
+    )
+
+    return int(
+        get_foreground_window()
+        or 0
+    )
+
+
+def _window_thread_id(
+    hwnd: int,
+) -> int:
+    if (
+        os.name != "nt"
+        or not hwnd
+    ):
+        return 0
+
+    user32 = ctypes.windll.user32
+
+    return int(
+        user32.GetWindowThreadProcessId(
+            ctypes.c_void_p(
+                int(
+                    hwnd
+                )
+            ),
+            None,
+        )
+        or 0
+    )
+
+
+def _is_foreground_window(
+    hwnd: int,
+) -> bool:
+    return (
+        bool(
+            hwnd
+        )
+        and _foreground_window_handle()
+        == int(
+            hwnd
+        )
+    )
+
+
+def _try_attached_thread_foreground(
+    hwnd: int,
+) -> bool:
+    """
+    Make one bounded foreground attempt using Windows thread-input attachment.
+
+    Windows deliberately restricts focus stealing. When a direct
+    SetForegroundWindow call is refused, temporarily attaching this agent
+    thread to the foreground/target GUI threads gives Windows a legitimate
+    shared input context for a second activation attempt.
+
+    No user input is synthesized and no arbitrary process/thread identifiers
+    come from user text. The HWND was already discovered from an allowlisted
+    application's verified process set.
+    """
+
+    if os.name != "nt":
+        return False
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    foreground_hwnd = (
+        _foreground_window_handle()
+    )
+
+    current_thread_id = int(
+        kernel32.GetCurrentThreadId()
+        or 0
+    )
+
+    foreground_thread_id = (
+        _window_thread_id(
+            foreground_hwnd
+        )
+    )
+
+    target_thread_id = (
+        _window_thread_id(
+            hwnd
+        )
+    )
+
+    attached_pairs = []
+
+    def attach(
+        first: int,
+        second: int,
+    ) -> None:
+        if (
+            not first
+            or not second
+            or first == second
+        ):
+            return
+
+        if user32.AttachThreadInput(
+            first,
+            second,
+            True,
+        ):
+            attached_pairs.append(
+                (
+                    first,
+                    second,
+                )
+            )
+
+    try:
+        attach(
+            current_thread_id,
+            foreground_thread_id,
+        )
+
+        attach(
+            current_thread_id,
+            target_thread_id,
+        )
+
+        try:
+            user32.BringWindowToTop(
+                hwnd
+            )
+        except Exception:
+            pass
+
+        try:
+            user32.SetActiveWindow(
+                hwnd
+            )
+        except Exception:
+            pass
+
+        try:
+            user32.SetFocus(
+                hwnd
+            )
+        except Exception:
+            pass
+
+        user32.SetForegroundWindow(
+            hwnd
+        )
+
+        # Foreground state may settle immediately after the Win32 call rather
+        # than before it returns. Keep verification short so desktop actions
+        # remain effectively instant.
+        for _ in range(
+            5
+        ):
+            if _is_foreground_window(
+                hwnd
+            ):
+                return True
+
+            time.sleep(
+                0.02
+            )
+
+        return False
+
+    finally:
+        for first, second in reversed(
+            attached_pairs
+        ):
+            try:
+                user32.AttachThreadInput(
+                    first,
+                    second,
+                    False,
+                )
+            except Exception:
+                pass
+
+
 def _show_and_focus_window(
     hwnd: int,
 ) -> dict:
     """
-    Make an existing top-level window visible and attempt to foreground it.
+    Make an existing top-level window visible and attempt verified foreground
+    activation.
 
-    SetForegroundWindow can legally be refused by Windows focus-stealing rules.
-    Visibility is therefore the hard success condition for `open`; foreground
-    status is reported separately.
+    Visibility remains sufficient for generic `open`, because restoring an
+    already-running app is useful even when Windows refuses focus stealing.
+    Explicit `focus_application`, however, requires the separate verified
+    `focused` result.
     """
 
     user32 = ctypes.windll.user32
@@ -786,11 +1175,20 @@ def _show_and_focus_window(
     except Exception:
         pass
 
-    focused = bool(
-        user32.SetForegroundWindow(
-            hwnd
-        )
+    user32.SetForegroundWindow(
+        hwnd
     )
+
+    focused = _is_foreground_window(
+        hwnd
+    )
+
+    if not focused:
+        focused = (
+            _try_attached_thread_foreground(
+                hwnd
+            )
+        )
 
     visible = bool(
         user32.IsWindowVisible(
@@ -806,35 +1204,49 @@ def _show_and_focus_window(
 
 def _activate_existing_application(
     target_id: str,
+    require_focus: bool = False,
 ) -> dict:
     """
-    Ensure an already-running allowlisted app has a visible usable window.
+    Ensure an already-running allowlisted app has a usable window.
 
-    Visible windows are preferred. If the app is tray-backed, hidden titled
-    windows are considered next.
+    Generic `open` accepts a restored visible window even if Windows refuses
+    foreground focus. Explicit focus operations set require_focus=True and
+    succeed only after verified foreground activation.
     """
 
-    pids = _target_pids(
+    lifecycle_pids = _target_pids(
         target_id
     )
 
-    if not pids:
+    if not lifecycle_pids:
         return {
             "success": False,
             "status": "not_running",
         }
 
+    window_pids = _target_window_pids(
+        target_id
+    )
+
+    if not window_pids:
+        return {
+            "success": False,
+            "status": "no_app_window",
+        }
+
     visible_windows = (
         _top_level_windows_for_pids(
-            pids,
+            window_pids,
             visible_only=True,
+            target_id=target_id,
         )
     )
 
     all_windows = (
         _top_level_windows_for_pids(
-            pids,
+            window_pids,
             visible_only=False,
+            target_id=target_id,
         )
     )
 
@@ -854,30 +1266,56 @@ def _activate_existing_application(
             "status": "no_app_window",
         }
 
+    saw_visible_window = False
+
     for hwnd in candidates:
         result = _show_and_focus_window(
             hwnd
         )
 
-        if result.get(
-            "visible"
+        visible = bool(
+            result.get(
+                "visible"
+            )
+        )
+
+        focused = bool(
+            result.get(
+                "focused"
+            )
+        )
+
+        if visible:
+            saw_visible_window = True
+
+        if focused:
+            return {
+                "success": True,
+                "status": "focused",
+                "window_handle": hwnd,
+                "focused": True,
+            }
+
+        if (
+            visible
+            and not require_focus
         ):
             return {
                 "success": True,
-                "status": (
-                    "focused"
-                    if result.get(
-                        "focused"
-                    )
-                    else "shown"
-                ),
+                "status": "shown",
                 "window_handle": hwnd,
-                "focused": bool(
-                    result.get(
-                        "focused"
-                    )
-                ),
+                "focused": False,
             }
+
+    if (
+        require_focus
+        and saw_visible_window
+    ):
+        return {
+            "success": False,
+            "status": "foreground_denied",
+            "focused": False,
+        }
 
     return {
         "success": False,
@@ -1121,11 +1559,11 @@ def close_application(
             ),
         }
 
-    pids = _target_pids(
+    lifecycle_pids = _target_pids(
         target_id
     )
 
-    if not pids:
+    if not lifecycle_pids:
         return {
             "success": False,
             "status": "not_running",
@@ -1135,8 +1573,13 @@ def close_application(
             ),
         }
 
+    window_pids = _target_window_pids(
+        target_id
+    )
+
     windows = _top_level_windows_for_pids(
-        pids
+        window_pids,
+        target_id=target_id,
     )
 
     if not windows:
@@ -1222,7 +1665,8 @@ def focus_application(
 
     activation = (
         _activate_existing_application(
-            target_id
+            target_id,
+            require_focus=True,
         )
     )
 
@@ -1266,6 +1710,13 @@ def focus_application(
         message = (
             f"I found {desktop_display_name(target_id)} running, "
             "but not a usable app window to bring forward."
+        )
+
+    elif status == "foreground_denied":
+        message = (
+            f"I found {desktop_display_name(target_id)} and restored its "
+            "window, but Windows didn't allow it to become the foreground "
+            "window."
         )
 
     else:

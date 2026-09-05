@@ -77,6 +77,28 @@ def execute_approved_agent_action(
             ],
         )
 
+    if action == "close_application":
+        from tools.desktop_tools import (
+            close_application,
+        )
+
+        return close_application(
+            app_name=args[
+                "app_name"
+            ],
+        )
+
+    if action == "focus_application":
+        from tools.desktop_tools import (
+            focus_application,
+        )
+
+        return focus_application(
+            app_name=args[
+                "app_name"
+            ],
+        )
+
     return {
         "success": False,
         "status": "unsupported_action",
@@ -478,7 +500,8 @@ def main():
     )
 
     print(
-        "Approved actions: ping, launch_application"
+        "Approved actions: ping, launch_application, "
+        "close_application, focus_application"
     )
 
     try:

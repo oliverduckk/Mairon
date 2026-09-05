@@ -182,12 +182,12 @@ def run():
         # 5. Deictic close resolves from Core desktop referent state.
         # --------------------------------------------------
 
-        original_close = (
-            control_module.close_application
+        original_close_via_agent = (
+            control_module.close_application_via_agent
         )
 
-        original_focus = (
-            control_module.focus_application
+        original_focus_via_agent = (
+            control_module.focus_application_via_agent
         )
 
         close_calls = []
@@ -220,11 +220,11 @@ def run():
                     "target_id": app_name,
                 }
 
-            control_module.close_application = (
+            control_module.close_application_via_agent = (
                 fake_close
             )
 
-            control_module.focus_application = (
+            control_module.focus_application_via_agent = (
                 fake_focus
             )
 
@@ -312,12 +312,12 @@ def run():
             ]
 
         finally:
-            control_module.close_application = (
-                original_close
+            control_module.close_application_via_agent = (
+                original_close_via_agent
             )
 
-            control_module.focus_application = (
-                original_focus
+            control_module.focus_application_via_agent = (
+                original_focus_via_agent
             )
 
     finally:

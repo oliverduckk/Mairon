@@ -67,7 +67,23 @@ DESKTOP_TARGETS: Dict[str, dict] = {
         "display_name": "Steam",
         "aliases": ("steam",),
         "kind": "application",
+
+        # steam.exe is the stable lifecycle/client identity, but the modern
+        # main Steam UI is owned by steamwebhelper.exe.
         "process_names": ("steam.exe",),
+        "window_process_names": (
+            "steamwebhelper.exe",
+        ),
+
+        # Do not mistake VGUI/bootstrap/helper/menu windows for the client.
+        # Verified against the live Windows Steam client in Phase 9.3.2.
+        "window_class_names": (
+            "SDL_app",
+        ),
+        "window_titles": (
+            "Steam",
+        ),
+
         "supports_close": True,
         "supports_focus": True,
         "close_behavior": "graceful_window",
