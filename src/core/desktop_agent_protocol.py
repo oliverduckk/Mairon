@@ -18,6 +18,7 @@ ALLOWED_ACTIONS = {
     "launch_application",
     "close_application",
     "focus_application",
+    "open_trusted_browser_site",
 }
 
 
@@ -228,6 +229,64 @@ def validate_request(
             raise ValueError(
                 "ping does not accept arguments."
             )
+
+    elif action == "open_trusted_browser_site":
+        allowed_keys = {
+            "site_id",
+            "query",
+        }
+
+        unknown = set(
+            args.keys()
+        ) - allowed_keys
+
+        if unknown:
+            raise ValueError(
+                "open_trusted_browser_site received unsupported arguments."
+            )
+
+        site_id = str(
+            args.get(
+                "site_id",
+                "",
+            )
+            or ""
+        ).strip().lower()
+
+        if (
+            not site_id
+            or len(
+                site_id
+            ) > 64
+        ):
+            raise ValueError(
+                "open_trusted_browser_site requires a valid site_id."
+            )
+
+        query = args.get(
+            "query"
+        )
+
+        if query is not None:
+            query = str(
+                query
+                or ""
+            ).strip()
+
+            if (
+                not query
+                or len(
+                    query
+                ) > 500
+            ):
+                raise ValueError(
+                    "open_trusted_browser_site query is empty or too long."
+                )
+
+        args = {
+            "site_id": site_id,
+            "query": query,
+        }
 
     elif action in {
         "launch_application",

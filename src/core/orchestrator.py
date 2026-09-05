@@ -601,6 +601,49 @@ class MaironCore:
             )
 
         # --------------------------------------------------
+        # Conservative trusted-browser context close
+        # --------------------------------------------------
+
+        if turn.intent == "browser_context_close_unsupported":
+            site_name = str(
+                turn.entities.get(
+                    "browser_site_name",
+                    "",
+                )
+                or "that browser tab"
+            ).strip()
+
+            direct_response = (
+                f"I can't safely close just that {site_name} browser "
+                "context yet without risking your other Chrome tabs, "
+                "so I left Chrome alone."
+            )
+
+            contract = build_answer_contract(
+                turn=turn,
+                route=route,
+            )
+
+            contract.required_claims.append(
+                direct_response
+            )
+
+            contract.allow_new_factual_claims = False
+            contract.allow_follow_up_question = False
+
+            self.conversation_state.update_from_turn(
+                turn
+            )
+
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
+                workflow_result=None,
+                direct_response=direct_response,
+            )
+
+        # --------------------------------------------------
         # Deterministic trusted browser navigation/search
         # --------------------------------------------------
 

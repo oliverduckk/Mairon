@@ -372,6 +372,45 @@ def _build_search_request(
     }
 
 
+
+ACTIVE_BROWSER_CONTEXT_CLOSE = re.compile(
+    r"^\s*(?:close|quit|exit)\s+"
+    r"(?:it|that|this|the\s+tab|that\s+tab|this\s+tab|the\s+page|"
+    r"that\s+page|this\s+page)\s*[.!?]*$",
+    flags=re.IGNORECASE,
+)
+
+EXPLICIT_SITE_CLOSE = re.compile(
+    r"^\s*(?:close|quit|exit)\s+(?:the\s+)?(?P<site>.+?)\s*[.!?]*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _build_browser_context_close_request(
+    site_id: str,
+    inherited: bool,
+) -> Optional[dict]:
+    site_id = str(
+        site_id
+        or ""
+    ).strip().lower()
+
+    if site_id not in TRUSTED_SITES:
+        return None
+
+    return {
+        "action": "close_context",
+        "site_id": site_id,
+        "display_name": trusted_site_display_name(
+            site_id
+        ),
+        "query": None,
+        "inherited": bool(
+            inherited
+        ),
+    }
+
+
 def extract_browser_action_request(
     text: str,
     conversation_state=None,
@@ -393,6 +432,45 @@ def extract_browser_action_request(
 
     if not raw:
         return None
+
+    # A deictic close while Core has an active trusted browser site refers to
+    # that browser context, not to the entire Chrome application. Until Mairon
+    # owns a verified tab/window identity, this is handled conservatively and
+    # never degrades into close_application("chrome").
+    match = ACTIVE_BROWSER_CONTEXT_CLOSE.match(
+        raw
+    )
+
+    if match:
+        site_id = _active_browser_site(
+            conversation_state
+        )
+
+        if site_id:
+            return _build_browser_context_close_request(
+                site_id=site_id,
+                inherited=True,
+            )
+
+    # Explicit trusted-site close requests are also browser-context requests.
+    # "close Chrome" is intentionally NOT caught here because Chrome is not a
+    # trusted-site alias; it remains an explicit desktop-application action.
+    match = EXPLICIT_SITE_CLOSE.match(
+        raw
+    )
+
+    if match:
+        site_id = resolve_site_alias(
+            match.group(
+                "site"
+            )
+        )
+
+        if site_id:
+            return _build_browser_context_close_request(
+                site_id=site_id,
+                inherited=False,
+            )
 
     match = COMPOUND_CHROME_SEARCH.match(
         raw

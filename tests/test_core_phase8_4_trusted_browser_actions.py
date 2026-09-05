@@ -221,14 +221,14 @@ def run():
 
     core = MaironCore()
 
-    original_open = (
-        browser_workflow.open_chrome_trusted_site
+    original_open_via_agent = (
+        browser_workflow.open_trusted_browser_site_via_agent
     )
 
     calls = []
 
     try:
-        def fake_open(
+        def fake_open_via_agent(
             site_id,
             query=None,
         ):
@@ -254,8 +254,8 @@ def run():
                 ),
             }
 
-        browser_workflow.open_chrome_trusted_site = (
-            fake_open
+        browser_workflow.open_trusted_browser_site_via_agent = (
+            fake_open_via_agent
         )
 
         first = core.prepare_turn(
@@ -315,8 +315,8 @@ def run():
         ]
 
     finally:
-        browser_workflow.open_chrome_trusted_site = (
-            original_open
+        browser_workflow.open_trusted_browser_site_via_agent = (
+            original_open_via_agent
         )
 
     # --------------------------------------------------
@@ -335,7 +335,7 @@ def run():
     )
 
     # --------------------------------------------------
-    # 6. Browser actions keep Chrome as desktop referent.
+    # 6. Browser context never degrades into generic Chrome close.
     # --------------------------------------------------
 
     close_candidate = classify_turn(
@@ -347,13 +347,21 @@ def run():
 
     assert (
         close_candidate.intent
-        == "close_application"
+        == "browser_context_close_unsupported"
     )
 
     assert (
         close_candidate.entities[
-            "app_name"
+            "browser_site"
         ]
+        == "youtube"
+    )
+
+    # Chrome remains the underlying desktop referent for explicit focus/close
+    # commands, but deictic browser-close semantics are handled first.
+    assert (
+        core.conversation_state
+        .active_desktop_target
         == "chrome"
     )
 

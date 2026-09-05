@@ -985,11 +985,17 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         )
 
         state.speech_act = "request_action"
-        state.intent = (
-            "browser_search"
-            if browser_mode == "search"
-            else "browser_open"
-        )
+
+        if browser_mode == "search":
+            state.intent = "browser_search"
+
+        elif browser_mode == "close_context":
+            state.intent = (
+                "browser_context_close_unsupported"
+            )
+
+        else:
+            state.intent = "browser_open"
 
         state.subject = (
             query
@@ -1014,18 +1020,35 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
                 "search_query"
             ] = query
 
-        state.requested_action = (
-            "open_browser_search"
-            if browser_mode == "search"
-            else "open_browser_site"
-        )
+        if browser_mode == "search":
+            state.requested_action = (
+                "open_browser_search"
+            )
+
+        elif browser_mode == "close_context":
+            state.requested_action = None
+
+        else:
+            state.requested_action = (
+                "open_browser_site"
+            )
 
         state.requires_private_data = False
-        state.requires_live_data = True
-        state.factuality = "action_result"
+        state.requires_live_data = (
+            browser_mode != "close_context"
+        )
+        state.factuality = (
+            "capability_boundary"
+            if browser_mode == "close_context"
+            else "action_result"
+        )
         state.preferred_authority = "desktop"
-        state.should_use_tools = True
-        state.should_answer_directly = False
+        state.should_use_tools = (
+            browser_mode != "close_context"
+        )
+        state.should_answer_directly = (
+            browser_mode == "close_context"
+        )
         state.should_recommend = False
         state.should_continue_conversation = False
         state.confidence = 0.99
@@ -1038,6 +1061,12 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
             state.add_reason(
                 "inherited active trusted browser site from Core browser state"
             )
+
+        elif browser_mode == "close_context":
+            state.add_reason(
+                "explicit trusted browser-context close request"
+            )
+
         else:
             state.add_reason(
                 "explicit trusted browser site/search action"

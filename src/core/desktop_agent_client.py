@@ -326,3 +326,28 @@ def focus_application_via_agent(
         },
         **kwargs,
     )
+
+def open_trusted_browser_site_via_agent(
+    site_id: str,
+    query: Optional[str] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    query_value = None
+
+    if query is not None:
+        query_value = str(
+            query
+            or ""
+        ).strip()
+
+    return call_desktop_agent(
+        action="open_trusted_browser_site",
+        args={
+            "site_id": str(
+                site_id
+                or ""
+            ).strip().lower(),
+            "query": query_value,
+        },
+        **kwargs,
+    )

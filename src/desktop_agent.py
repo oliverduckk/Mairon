@@ -99,6 +99,20 @@ def execute_approved_agent_action(
             ],
         )
 
+    if action == "open_trusted_browser_site":
+        from tools.desktop_tools import (
+            open_chrome_trusted_site,
+        )
+
+        return open_chrome_trusted_site(
+            site_id=args[
+                "site_id"
+            ],
+            query=args.get(
+                "query"
+            ),
+        )
+
     return {
         "success": False,
         "status": "unsupported_action",
@@ -501,7 +515,8 @@ def main():
 
     print(
         "Approved actions: ping, launch_application, "
-        "close_application, focus_application"
+        "close_application, focus_application, "
+        "open_trusted_browser_site"
     )
 
     try:
