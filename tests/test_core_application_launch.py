@@ -1,5 +1,4 @@
 import sys
-import types
 from pathlib import Path
 
 
@@ -16,70 +15,7 @@ if str(SRC_DIR) not in sys.path:
     )
 
 
-# --------------------------------------------------
-# Fake tool registry.
-#
-# This test does not open real applications.
-# --------------------------------------------------
-
-fake_registry = types.ModuleType(
-    "tools.tool_registry"
-)
-
-tool_calls = []
-
-
-def fake_execute_tool(
-    tool_name,
-    arguments=None,
-):
-    arguments = arguments or {}
-
-    tool_calls.append(
-        (
-            tool_name,
-            dict(
-                arguments
-            ),
-        )
-    )
-
-    if (
-        tool_name
-        == "launch_application"
-        and arguments.get(
-            "app_name"
-        )
-        in {
-            "calculator",
-            "notepad",
-        }
-    ):
-        return {
-            "success": True,
-            "message": (
-                "Application launched."
-            ),
-        }
-
-    return {
-        "success": False,
-        "message": (
-            "Unexpected tool call."
-        ),
-    }
-
-
-fake_registry.execute_tool = (
-    fake_execute_tool
-)
-
-import tools
-
-sys.modules[
-    "tools.tool_registry"
-] = fake_registry
-
+import core.workflows.application_launch as application_launch
 
 from core.intent_router import (
     classify_turn,
@@ -118,106 +54,155 @@ def run():
 
     # --------------------------------------------------
     # Full Core path must launch without Qwen.
+    #
+    # Phase 9.2 architecture:
+    # Core -> application workflow -> Desktop Agent client.
+    #
+    # This regression deliberately mocks the agent boundary rather
+    # than the obsolete in-process tool_registry execution path.
     # --------------------------------------------------
 
-    tool_calls.clear()
+    agent_calls = []
 
-    core = MaironCore()
-
-    decision = core.prepare_turn(
-        exact
+    original_launch_via_agent = (
+        application_launch
+        .launch_application_via_agent
     )
 
-    assert decision.direct_response == (
-        "Calculator's open."
-    )
+    def fake_launch_application_via_agent(
+        app_name,
+    ):
+        app_name = str(
+            app_name
+            or ""
+        ).strip().lower()
 
-    assert tool_calls == [
-        (
-            "launch_application",
-            {
-                "app_name": "calculator",
-            },
+        agent_calls.append(
+            app_name
         )
-    ]
 
-    # --------------------------------------------------
-    # Natural phrasing coverage.
-    # --------------------------------------------------
-
-    cases = [
-        (
-            "Open calculator",
+        if app_name in {
             "calculator",
-        ),
-        (
-            "Open the calculator",
-            "calculator",
-        ),
-        (
-            "Could you open the calculator?",
-            "calculator",
-        ),
-        (
-            "Can you please open up the calculator?",
-            "calculator",
-        ),
-        (
-            "Launch calculator",
-            "calculator",
-        ),
-        (
-            "Please start the calculator",
-            "calculator",
-        ),
-        (
-            "Can you open Notepad?",
             "notepad",
-        ),
-        (
-            "Please launch the notepad",
-            "notepad",
-        ),
-        (
-            "Open up Notepad",
-            "notepad",
-        ),
-    ]
+        }:
+            return {
+                "success": True,
+                "status": "launch_requested",
+                "target_id": app_name,
+                "message": (
+                    f"{app_name.title()} launch requested."
+                ),
+            }
 
-    for message, expected_app in cases:
-        candidate = classify_turn(
-            message
+        return {
+            "success": False,
+            "status": "launch_failed",
+            "message": (
+                "Unexpected Desktop Agent launch request."
+            ),
+        }
+
+    try:
+        application_launch.launch_application_via_agent = (
+            fake_launch_application_via_agent
         )
 
-        assert (
-            candidate.intent
-            == "launch_application"
-        ), (
-            message,
-            candidate.to_dict(),
+        core = MaironCore()
+
+        decision = core.prepare_turn(
+            exact
         )
 
-        assert (
-            candidate.entities[
-                "app_name"
-            ]
-            == expected_app
-        ), (
-            message,
-            candidate.to_dict(),
+        assert decision.direct_response == (
+            "Calculator's open."
         )
 
-    # --------------------------------------------------
-    # Random "open" wording must not be hijacked.
-    # --------------------------------------------------
+        assert agent_calls == [
+            "calculator"
+        ]
 
-    unrelated = classify_turn(
-        "Can you explain open source software?"
-    )
+        # --------------------------------------------------
+        # Natural phrasing coverage.
+        # --------------------------------------------------
 
-    assert unrelated.intent != (
-        "launch_application"
-    )
+        cases = [
+            (
+                "Open calculator",
+                "calculator",
+            ),
+            (
+                "Open the calculator",
+                "calculator",
+            ),
+            (
+                "Could you open the calculator?",
+                "calculator",
+            ),
+            (
+                "Can you please open up the calculator?",
+                "calculator",
+            ),
+            (
+                "Launch calculator",
+                "calculator",
+            ),
+            (
+                "Please start the calculator",
+                "calculator",
+            ),
+            (
+                "Can you open Notepad?",
+                "notepad",
+            ),
+            (
+                "Please launch the notepad",
+                "notepad",
+            ),
+            (
+                "Open up Notepad",
+                "notepad",
+            ),
+        ]
+
+        for message, expected_app in cases:
+            candidate = classify_turn(
+                message
+            )
+
+            assert (
+                candidate.intent
+                == "launch_application"
+            ), (
+                message,
+                candidate.to_dict(),
+            )
+
+            assert (
+                candidate.entities[
+                    "app_name"
+                ]
+                == expected_app
+            ), (
+                message,
+                candidate.to_dict(),
+            )
+
+        # --------------------------------------------------
+        # Random "open" wording must not be hijacked.
+        # --------------------------------------------------
+
+        unrelated = classify_turn(
+            "Can you explain open source software?"
+        )
+
+        assert unrelated.intent != (
+            "launch_application"
+        )
+
+    finally:
+        application_launch.launch_application_via_agent = (
+            original_launch_via_agent
+        )
 
     print(
         "Deterministic application-launch Core regression tests: PASS"

@@ -1,6 +1,5 @@
 import sys
 import ast
-import types
 from pathlib import Path
 
 
@@ -17,63 +16,13 @@ if str(SRC_DIR) not in sys.path:
     )
 
 
-# --------------------------------------------------
-# Fake registry before workflow imports.
-# Launch tests must never open real applications.
-# --------------------------------------------------
-
-fake_registry = types.ModuleType(
-    "tools.tool_registry"
-)
-
-launch_calls = []
-
-
-def fake_execute_tool(
-    tool_name,
-    arguments=None,
-):
-    arguments = arguments or {}
-
-    launch_calls.append(
-        (
-            tool_name,
-            dict(arguments),
-        )
-    )
-
-    if tool_name == "launch_application":
-        return {
-            "success": True,
-            "target_id": arguments.get(
-                "app_name"
-            ),
-            "message": "Launch requested.",
-        }
-
-    return {
-        "success": False,
-        "message": "Unexpected tool call.",
-    }
-
-
-fake_registry.execute_tool = (
-    fake_execute_tool
-)
-
-import tools
-
-sys.modules[
-    "tools.tool_registry"
-] = fake_registry
-
-
 from core.desktop_catalog import (
     extract_desktop_action_request,
 )
 from core.intent_router import (
     classify_turn,
 )
+import core.workflows.application_launch as launch_module
 import core.workflows.application_control as control_module
 from core.orchestrator import (
     MaironCore,
@@ -148,197 +97,232 @@ def run():
 
     # --------------------------------------------------
     # 3. Full Core launch path remains model-free.
+    #
+    # Phase 9.2 architecture:
+    # Core -> application workflow -> Desktop Agent client.
+    #
+    # Mock the agent boundary so this regression never opens a real app.
     # --------------------------------------------------
 
-    launch_calls.clear()
-
-    core = MaironCore()
-
-    opened = core.prepare_turn(
-        "Open Spotify"
+    original_launch_via_agent = (
+        launch_module.launch_application_via_agent
     )
 
-    assert opened.direct_response == (
-        "Spotify's open."
-    )
+    launch_calls = []
 
-    assert launch_calls == [
-        (
-            "launch_application",
-            {
-                "app_name": "spotify",
-            },
+    def fake_launch_application_via_agent(
+        app_name,
+    ):
+        app_name = str(
+            app_name
+            or ""
+        ).strip().lower()
+
+        launch_calls.append(
+            app_name
         )
-    ]
 
-    assert (
-        core.conversation_state
-        .active_desktop_target
-        == "spotify"
-    )
-
-    # --------------------------------------------------
-    # 4. Intervening banter does not erase desktop referent.
-    # --------------------------------------------------
-
-    banter = core.prepare_turn(
-        "cheers cunt"
-    )
-
-    assert (
-        banter.turn.intent
-        in {
-            "acknowledge",
-            "casual_conversation",
+        return {
+            "success": True,
+            "status": "launch_requested",
+            "target_id": app_name,
+            "message": (
+                f"{app_name.title()} launch requested."
+            ),
         }
+
+    launch_module.launch_application_via_agent = (
+        fake_launch_application_via_agent
     )
-
-    assert (
-        core.conversation_state
-        .active_desktop_target
-        == "spotify"
-    )
-
-    # --------------------------------------------------
-    # 5. Deictic close resolves from Core desktop referent state.
-    # --------------------------------------------------
-
-    original_close = (
-        control_module.close_application
-    )
-
-    original_focus = (
-        control_module.focus_application
-    )
-
-    close_calls = []
-    focus_calls = []
 
     try:
-        def fake_close(
-            app_name,
-        ):
-            close_calls.append(
-                app_name
-            )
+        core = MaironCore()
 
-            return {
-                "success": True,
-                "status": "close_requested",
-                "target_id": app_name,
-            }
-
-        def fake_focus(
-            app_name,
-        ):
-            focus_calls.append(
-                app_name
-            )
-
-            return {
-                "success": True,
-                "status": "focused",
-                "target_id": app_name,
-            }
-
-        control_module.close_application = (
-            fake_close
+        opened = core.prepare_turn(
+            "Open Spotify"
         )
 
-        control_module.focus_application = (
-            fake_focus
+        assert opened.direct_response == (
+            "Spotify's open."
         )
 
-        closed = core.prepare_turn(
-            "actually close it"
-        )
-
-        assert (
-            closed.turn.intent
-            == "close_application"
-        )
-
-        assert (
-            closed.turn.entities[
-                "app_name"
-            ]
-            == "spotify"
-        )
-
-        assert (
-            closed.turn.is_follow_up
-            is True
-        )
-
-        assert close_calls == [
+        assert launch_calls == [
             "spotify"
         ]
 
-        assert closed.direct_response == (
-            "Spotify window's closed."
+        assert (
+            core.conversation_state
+            .active_desktop_target
+            == "spotify"
         )
 
         # --------------------------------------------------
-        # 6. Named focus works and becomes the new desktop referent.
+        # 4. Intervening banter does not erase desktop referent.
         # --------------------------------------------------
 
-        focused = core.prepare_turn(
-            "Bring Discord to the front"
+        banter = core.prepare_turn(
+            "cheers cunt"
         )
 
         assert (
-            focused.turn.intent
-            == "focus_application"
-        )
-
-        assert (
-            focused.turn.entities[
-                "app_name"
-            ]
-            == "discord"
-        )
-
-        assert focus_calls == [
-            "discord"
-        ]
-
-        assert focused.direct_response == (
-            "Discord's in front."
+            banter.turn.intent
+            in {
+                "acknowledge",
+                "casual_conversation",
+            }
         )
 
         assert (
             core.conversation_state
             .active_desktop_target
-            == "discord"
+            == "spotify"
         )
 
         # --------------------------------------------------
-        # 7. Deictic focus inherits Discord.
+        # 5. Deictic close resolves from Core desktop referent state.
         # --------------------------------------------------
 
-        focus_again = core.prepare_turn(
-            "focus it"
+        original_close = (
+            control_module.close_application
         )
 
-        assert (
-            focus_again.turn.entities[
-                "app_name"
+        original_focus = (
+            control_module.focus_application
+        )
+
+        close_calls = []
+        focus_calls = []
+
+        try:
+            def fake_close(
+                app_name,
+            ):
+                close_calls.append(
+                    app_name
+                )
+
+                return {
+                    "success": True,
+                    "status": "close_requested",
+                    "target_id": app_name,
+                }
+
+            def fake_focus(
+                app_name,
+            ):
+                focus_calls.append(
+                    app_name
+                )
+
+                return {
+                    "success": True,
+                    "status": "focused",
+                    "target_id": app_name,
+                }
+
+            control_module.close_application = (
+                fake_close
+            )
+
+            control_module.focus_application = (
+                fake_focus
+            )
+
+            closed = core.prepare_turn(
+                "actually close it"
+            )
+
+            assert (
+                closed.turn.intent
+                == "close_application"
+            )
+
+            assert (
+                closed.turn.entities[
+                    "app_name"
+                ]
+                == "spotify"
+            )
+
+            assert (
+                closed.turn.is_follow_up
+                is True
+            )
+
+            assert close_calls == [
+                "spotify"
             ]
-            == "discord"
-        )
 
-        assert focus_calls == [
-            "discord",
-            "discord",
-        ]
+            assert closed.direct_response == (
+                "Spotify window's closed."
+            )
+
+            # --------------------------------------------------
+            # 6. Named focus works and becomes the new desktop referent.
+            # --------------------------------------------------
+
+            focused = core.prepare_turn(
+                "Bring Discord to the front"
+            )
+
+            assert (
+                focused.turn.intent
+                == "focus_application"
+            )
+
+            assert (
+                focused.turn.entities[
+                    "app_name"
+                ]
+                == "discord"
+            )
+
+            assert focus_calls == [
+                "discord"
+            ]
+
+            assert focused.direct_response == (
+                "Discord's in front."
+            )
+
+            assert (
+                core.conversation_state
+                .active_desktop_target
+                == "discord"
+            )
+
+            # --------------------------------------------------
+            # 7. Deictic focus inherits Discord.
+            # --------------------------------------------------
+
+            focus_again = core.prepare_turn(
+                "focus it"
+            )
+
+            assert (
+                focus_again.turn.entities[
+                    "app_name"
+                ]
+                == "discord"
+            )
+
+            assert focus_calls == [
+                "discord",
+                "discord",
+            ]
+
+        finally:
+            control_module.close_application = (
+                original_close
+            )
+
+            control_module.focus_application = (
+                original_focus
+            )
 
     finally:
-        control_module.close_application = (
-            original_close
-        )
-
-        control_module.focus_application = (
-            original_focus
+        launch_module.launch_application_via_agent = (
+            original_launch_via_agent
         )
 
     # --------------------------------------------------

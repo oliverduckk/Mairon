@@ -9,8 +9,8 @@ from core.evidence import (
 from core.workflow_result import (
     WorkflowResult,
 )
-from tools.tool_registry import (
-    execute_tool,
+from core.desktop_agent_client import (
+    launch_application_via_agent,
 )
 
 
@@ -62,11 +62,8 @@ def launch_approved_application(
             },
         )
 
-    result = execute_tool(
-        "launch_application",
-        {
-            "app_name": app_name,
-        },
+    result = launch_application_via_agent(
+        app_name=app_name,
     )
 
     if not isinstance(
@@ -86,19 +83,40 @@ def launch_approved_application(
         )
 
     if result.get("success") is not True:
-        return WorkflowResult(
-            success=False,
-            status="launch_failed",
-            error=(
-                result.get("message")
+        status = str(
+            result.get(
+                "status",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if status == "agent_unavailable":
+            error = (
+                "The Windows Desktop Agent isn't running, so I can't "
+                f"open {desktop_display_name(app_name)} right now."
+            )
+            workflow_status = "desktop_agent_unavailable"
+
+        else:
+            error = (
+                result.get(
+                    "message"
+                )
                 or (
                     f"{desktop_display_name(app_name)} "
                     "could not be opened."
                 )
-            ),
+            )
+            workflow_status = "launch_failed"
+
+        return WorkflowResult(
+            success=False,
+            status=workflow_status,
+            error=error,
             data={
                 "app_name": app_name,
-                "tool_result": result,
+                "agent_result": result,
             },
         )
 
@@ -114,10 +132,10 @@ def launch_approved_application(
     evidence.add(
         Evidence(
             claim=(
-                "The local desktop tool successfully requested opening "
+                "The Windows Desktop Agent successfully requested opening "
                 f"{desktop_display_name(app_name)}."
             ),
-            provenance="desktop_tool",
+            provenance="desktop_agent",
             confidence="verified",
             source_name="launch_application",
             data={
@@ -133,6 +151,6 @@ def launch_approved_application(
         evidence=evidence,
         data={
             "app_name": app_name,
-            "tool_result": result,
+            "agent_result": result,
         },
     )
