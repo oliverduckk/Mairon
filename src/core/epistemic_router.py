@@ -28,6 +28,20 @@ def route_epistemic_authority(
     This is intentionally deterministic for high-value/private workflows.
     """
 
+    if turn.intent == "calculate_arithmetic":
+        return EpistemicRoute(
+            authority="core_arithmetic",
+            mode="deterministic_calculation",
+            verification_required=False,
+            allow_model_memory=False,
+            live_data_required=False,
+            private_data_required=False,
+            reason=(
+                "Unambiguous arithmetic is owned by deterministic Core "
+                "evaluation, not language-model interpretation or memory."
+            ),
+        )
+
     if turn.intent == "order_status":
         return EpistemicRoute(
             authority="gmail",

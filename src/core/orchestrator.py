@@ -24,6 +24,9 @@ from core.workflow_result import (
 from core.workflows.application_launch import (
     launch_approved_application,
 )
+from core.workflows.arithmetic import (
+    calculate_arithmetic,
+)
 from core.workflows.application_control import (
     control_approved_application,
 )
@@ -316,6 +319,103 @@ class MaironCore:
 
         workflow_result = None
         direct_response = None
+
+        # --------------------------------------------------
+        # Deterministic arithmetic authority
+        # --------------------------------------------------
+
+        if turn.intent == "calculate_arithmetic":
+            expression = str(
+                turn.entities.get(
+                    "arithmetic_expression",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            operation = str(
+                turn.entities.get(
+                    "arithmetic_operation",
+                    "expression",
+                )
+                or "expression"
+            ).strip().lower()
+
+            operands = str(
+                turn.entities.get(
+                    "arithmetic_operands",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            display_expression = str(
+                turn.entities.get(
+                    "arithmetic_display",
+                    expression,
+                )
+                or expression
+            ).strip()
+
+            workflow_result = (
+                calculate_arithmetic(
+                    expression=expression,
+                    operation=operation,
+                    operands=operands,
+                    display_expression=(
+                        display_expression
+                    ),
+                )
+            )
+
+            contract = build_answer_contract(
+                turn=turn,
+                route=route,
+                evidence=(
+                    workflow_result.evidence
+                    if workflow_result
+                    else None
+                ),
+            )
+
+            if (
+                workflow_result
+                and workflow_result.answer_fact
+            ):
+                contract.required_claims.append(
+                    workflow_result.answer_fact
+                )
+
+            direct_response = (
+                workflow_result.answer_fact
+                if (
+                    workflow_result
+                    and workflow_result.success
+                    and workflow_result.answer_fact
+                )
+                else (
+                    workflow_result.error
+                    if (
+                        workflow_result
+                        and workflow_result.error
+                    )
+                    else (
+                        "I couldn't calculate that safely."
+                    )
+                )
+            )
+
+            self.conversation_state.update_from_turn(
+                turn
+            )
+
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
+                workflow_result=workflow_result,
+                direct_response=direct_response,
+            )
 
         # --------------------------------------------------
         # Deterministic approved local file/folder actions

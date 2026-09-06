@@ -2,6 +2,9 @@ import re
 from typing import Optional
 
 from core.turn_state import TurnState
+from core.arithmetic import (
+    extract_arithmetic_request,
+)
 from core.email_intent import is_inbox_attention_request
 from core.desktop_catalog import (
     extract_desktop_action_request,
@@ -1931,6 +1934,77 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.add_reason(
             "user explicitly asks what was said in conversation"
         )
+        return state
+
+    arithmetic_request = (
+        extract_arithmetic_request(
+            raw,
+            conversation_state=(
+                conversation_state
+            ),
+        )
+    )
+
+    if arithmetic_request is not None:
+        state.speech_act = "question"
+        state.intent = "calculate_arithmetic"
+        state.subject = (
+            arithmetic_request
+            .display_expression
+        )
+
+        state.entities[
+            "arithmetic_expression"
+        ] = arithmetic_request.expression
+
+        state.entities[
+            "arithmetic_operation"
+        ] = arithmetic_request.operation
+
+        state.entities[
+            "arithmetic_operands"
+        ] = "|".join(
+            arithmetic_request.operands
+        )
+
+        state.entities[
+            "arithmetic_display"
+        ] = (
+            arithmetic_request
+            .display_expression
+        )
+
+        state.requested_action = None
+        state.requires_private_data = False
+        state.requires_live_data = False
+        state.factuality = "deterministic_calculation"
+        state.preferred_authority = "core_arithmetic"
+        state.should_use_tools = False
+        state.should_answer_directly = True
+        state.should_recommend = False
+        state.should_continue_conversation = True
+        state.confidence = 0.995
+
+        if arithmetic_request.inherited:
+            state.is_follow_up = True
+
+            state.resolved_referents[
+                "arithmetic_operands"
+            ] = "|".join(
+                arithmetic_request.operands
+            )
+
+            state.add_reason(
+                "resolved arithmetic correction/follow-up against the "
+                "Core-owned operands from the previous calculation"
+            )
+
+        else:
+            state.add_reason(
+                "unambiguous arithmetic request; deterministic Core "
+                "calculation outranks conversation-model interpretation"
+            )
+
         return state
 
     if _matches_any(
