@@ -5723,6 +5723,35 @@ def build_spoiler_safe_media_evidence(
         + "."
     )
 
+    read_attempt_count = int(
+        research_result.get(
+            "read_attempt_count",
+            0,
+        )
+        or 0
+    )
+
+    readable_source_count = int(
+        research_result.get(
+            "readable_source_count",
+            0,
+        )
+        or 0
+    )
+
+    if read_attempt_count > readable_source_count:
+        print(
+            "[Research] Page reads attempted: "
+            + str(
+                read_attempt_count
+            )
+            + " to obtain "
+            + str(
+                readable_source_count
+            )
+            + " readable source(s)."
+        )
+
     skipped_spoiler_heavy = (
         research_result.get(
             "skipped_spoiler_heavy_sources",
@@ -5730,6 +5759,57 @@ def build_spoiler_safe_media_evidence(
         )
         or []
     )
+
+    requested_medium = research_result.get(
+        "requested_medium"
+    )
+
+    if requested_medium:
+        print(
+            "[Research] Requested media boundary: "
+            + str(
+                requested_medium
+            ).replace(
+                "_",
+                " ",
+            )
+            + "."
+        )
+
+    skipped_medium_mismatch = (
+        research_result.get(
+            "skipped_medium_mismatch_sources",
+            [],
+        )
+        or []
+    )
+
+    if skipped_medium_mismatch:
+        print(
+            "[Research] Skipped medium-mismatched search results: "
+            + str(
+                len(
+                    skipped_medium_mismatch
+                )
+            )
+            + "."
+        )
+
+        for item in skipped_medium_mismatch[
+            :3
+        ]:
+            print(
+                "[Research] Skipped medium mismatch: "
+                + str(
+                    item.get(
+                        "title"
+                    )
+                    or item.get(
+                        "url"
+                    )
+                    or "untitled source"
+                )
+            )
 
     if skipped_spoiler_heavy:
         print(
@@ -7999,6 +8079,134 @@ def handle_direct_conversation(
     else:
         personality_draft_limit = MAX_PERSONALITY_DRAFTS
 
+    def _validate_salvaged_research_draft(
+        candidate_text,
+    ):
+        """
+        Re-run deterministic acceptance guards after sentence-level media
+        salvage without paying for another semantic verifier call.
+
+        The public-source verifier already approved each retained sentence as
+        both supported and within scope. These checks make sure mechanical
+        deletion did not leave a response that violates Mairon's ordinary
+        personality, conversation, spoiler, contract, or personal-history
+        boundaries.
+        """
+
+        candidate_violations = []
+
+        candidate_violations.extend(
+            find_personality_violations(
+                candidate_text
+            )
+        )
+
+        candidate_violations.extend(
+            find_conversation_policy_violations(
+                candidate_text
+            )
+        )
+
+        candidate_violations.extend(
+            find_mairon_agency_modality_violations(
+                user_input=user_input,
+                draft=candidate_text,
+                conversation=conversation,
+            )
+        )
+
+        candidate_violations.extend(
+            find_relative_date_weekday_violations(
+                user_input=user_input,
+                draft=candidate_text,
+            )
+        )
+
+        if media_domain_active:
+            candidate_violations.extend(
+                find_spoiler_guard_violations(
+                    response_text=candidate_text,
+                    spoiler_context=spoiler_context,
+                )
+            )
+
+        if not core_is_live_recall:
+            candidate_violations.extend(
+                find_repetition_violations(
+                    response_text=candidate_text,
+                    conversation=conversation,
+                    allow_stable_repeat=bool(
+                        opinion_entry
+                    ),
+                )
+            )
+
+        candidate_violations.extend(
+            find_core_answer_contract_violations(
+                response_text=candidate_text,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
+        candidate_violations.extend(
+            find_forbidden_recommendation_violations(
+                response_text=candidate_text,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
+        candidate_violations.extend(
+            find_email_read_contract_violations(
+                response_text=candidate_text,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
+        candidate_violations.extend(
+            find_core_micro_act_relevance_violations(
+                response_text=candidate_text,
+                user_input=user_input,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
+        candidate_violations.extend(
+            find_incidental_public_attribution_violations(
+                user_input=user_input,
+                draft=candidate_text,
+                core_answer_contract=core_answer_contract,
+                conversation=conversation,
+            )
+        )
+
+        if factual_focus_fidelity_required:
+            candidate_violations.extend(
+                find_factual_answer_integrity_violations(
+                    draft=candidate_text,
+                )
+            )
+
+            candidate_violations.extend(
+                find_factual_process_commentary_violations(
+                    draft=candidate_text,
+                )
+            )
+
+            candidate_violations.extend(
+                find_factual_personal_history_violations(
+                    user_input=user_input,
+                    draft=candidate_text,
+                    conversation=conversation,
+                    max_prior_user_messages=4,
+                )
+            )
+
+        return list(
+            dict.fromkeys(
+                candidate_violations
+            )
+        )
+
     for attempt in range(
         1,
         personality_draft_limit + 1
@@ -8755,22 +8963,26 @@ def handle_direct_conversation(
                     )
                 )
 
+        media_verification = None
+
         if research_evidence:
+            media_verification = verify_media_draft(
+                client=client,
+                model=get_local_model_name(),
+                user_input=(
+                    spoiler_context.get(
+                        "pending_question"
+                    )
+                    or user_input
+                ),
+                draft=draft_text,
+                research_evidence=research_evidence,
+                self_correction_context=self_correction_context,
+                opinion_context=opinion_context,
+            )
+
             violations.extend(
-                verify_media_draft(
-                    client=client,
-                    model=get_local_model_name(),
-                    user_input=(
-                        spoiler_context.get(
-                            "pending_question"
-                        )
-                        or user_input
-                    ),
-                    draft=draft_text,
-                    research_evidence=research_evidence,
-                    self_correction_context=self_correction_context,
-                    opinion_context=opinion_context,
-                )
+                media_verification
             )
 
         violations = list(
@@ -8784,6 +8996,55 @@ def handle_direct_conversation(
                 draft_text
             )
             break
+
+        # Phase 10.7.8 — deterministic sentence salvage.
+        #
+        # The media verifier has already judged every sentence against the
+        # actual public-source packet and Core's answer-scope ceiling. If the
+        # draft contains a good synopsis plus one bad tail/detail, preserve
+        # the approved original sentences instead of discarding the entire
+        # answer and asking Qwen to improvise a fresh one.
+        if (
+            research_evidence
+            and media_verification is not None
+        ):
+            approved_sentences = list(
+                getattr(
+                    media_verification,
+                    "accepted_sentences",
+                    [],
+                )
+                or []
+            )
+
+            if approved_sentences:
+                salvaged_draft = " ".join(
+                    approved_sentences[
+                        :3
+                    ]
+                ).strip()
+
+                if (
+                    salvaged_draft
+                    and salvaged_draft != draft_text.strip()
+                ):
+                    salvage_violations = (
+                        _validate_salvaged_research_draft(
+                            salvaged_draft
+                        )
+                    )
+
+                    if not salvage_violations:
+                        accepted_draft_text = (
+                            salvaged_draft
+                        )
+                        violations = []
+
+                        print(
+                            "[Grounding] Salvaged verified in-scope sentences "
+                            "from the first draft; no creative rewrite required."
+                        )
+                        break
 
         print(
             "[Personality] Rejected draft: "
