@@ -51,6 +51,17 @@ from research.media_grounding import (
     verify_media_draft,
 )
 
+from research.public_factual_research import (
+    build_internal_public_factual_packet,
+    gather_public_factual_research,
+)
+
+from research.public_factual_grounding import (
+    build_failed_public_factual_fallback,
+    build_public_factual_retry_instruction,
+    verify_public_factual_draft,
+)
+
 from personality.opinion_ledger import (
     build_opinion_context_text,
     classify_opinion_subject,
@@ -7574,6 +7585,19 @@ def handle_direct_conversation(
 
     research_evidence = None
 
+    factual_epistemic_mode = _core_contract_value(
+        core_answer_contract,
+        "Epistemic mode",
+    )
+
+    if (
+        core_intent == "factual_question"
+        and factual_epistemic_mode == "stable_model_knowledge"
+    ):
+        print(
+            "[Epistemic] Stable general knowledge; local model knowledge permitted."
+        )
+
     if (
         media_domain_active
         and should_research_media_turn(
@@ -7605,6 +7629,119 @@ def handle_direct_conversation(
             )
         )
 
+    public_factual_evidence = None
+    public_factual_research_success = False
+
+    if (
+        core_intent == "factual_question"
+        and not research_evidence
+        and factual_epistemic_mode == "public_source_verified"
+    ):
+        print(
+            "[Research] Core requires public verification for this factual question."
+        )
+
+        public_research_result = (
+            gather_public_factual_research(
+                user_input=user_input,
+                max_reads=2,
+            )
+        )
+
+        print(
+            "[Research] Search results: "
+            + str(
+                public_research_result.get(
+                    "search_result_count",
+                    0,
+                )
+            )
+            + "; readable sources: "
+            + str(
+                public_research_result.get(
+                    "readable_source_count",
+                    0,
+                )
+            )
+            + "."
+        )
+
+        public_read_attempts = int(
+            public_research_result.get(
+                "read_attempt_count",
+                0,
+            )
+            or 0
+        )
+
+        public_readable_count = int(
+            public_research_result.get(
+                "readable_source_count",
+                0,
+            )
+            or 0
+        )
+
+        if public_read_attempts > public_readable_count:
+            print(
+                "[Research] Page reads attempted: "
+                + str(public_read_attempts)
+                + " to obtain "
+                + str(public_readable_count)
+                + " readable source(s)."
+            )
+
+        public_readable_sources = [
+            source
+            for source in public_research_result.get(
+                "sources",
+                []
+            )
+            if source.get("read_success")
+        ]
+
+        for index, source in enumerate(
+            public_readable_sources,
+            start=1,
+        ):
+            print(
+                "[Research] Evidence source S"
+                + str(index)
+                + ": "
+                + str(
+                    source.get("title")
+                    or source.get("url")
+                    or "untitled source"
+                )
+            )
+
+        public_factual_research_success = bool(
+            public_research_result.get("success")
+        )
+
+        if not public_factual_research_success:
+            print(
+                "[Research] Evidence retrieval insufficient: "
+                + str(
+                    public_research_result.get(
+                        "failure_reason",
+                        "Public-source retrieval did not produce readable evidence.",
+                    )
+                    or "Public-source retrieval did not produce readable evidence."
+                )
+            )
+
+        public_factual_evidence = (
+            build_internal_public_factual_packet(
+                public_research_result
+            )
+        )
+
+    grounded_research_evidence = (
+        research_evidence
+        or public_factual_evidence
+    )
+
     # Spoiler-progress turns already have the current conversation plus
     # dedicated spoiler state. Do not retrieve unrelated historical
     # conversation while Oliver is merely setting/confirming his
@@ -7626,7 +7763,7 @@ def handle_direct_conversation(
         or spoiler_context.get(
             "must_confirm_latest"
         )
-        or research_evidence
+        or grounded_research_evidence
         or not should_retrieve_past_context_for_turn(
             user_input=user_input,
             core_answer_contract=core_answer_contract,
@@ -7824,6 +7961,12 @@ def handle_direct_conversation(
             "content": research_evidence
         })
 
+    if public_factual_evidence:
+        base_messages.append({
+            "role": "system",
+            "content": public_factual_evidence
+        })
+
     if media_domain_active:
         base_messages.append({
             "role": "system",
@@ -7971,7 +8114,7 @@ def handle_direct_conversation(
     # either answer from its retrieved evidence or fail closed.
     if (
         allow_cloud_escalation
-        and not research_evidence
+        and not grounded_research_evidence
     ):
         conversation_tools.append(
             CLOUD_ESCALATION_TOOL
@@ -8067,7 +8210,7 @@ def handle_direct_conversation(
             None,
         )
 
-    if research_evidence:
+    if grounded_research_evidence:
         # Public-source factual turns get one normal draft plus at most one
         # evidence-grounded repair. The old three-draft loop multiplied
         # expensive verifier calls without improving authority.
@@ -8377,6 +8520,29 @@ def handle_direct_conversation(
                         "content": grounding_retry
                     })
 
+            if public_factual_evidence:
+                attempt_messages.append({
+                    "role": "system",
+                    "content": (
+                        "PUBLIC FACTUAL SOURCE RETRY: Core retrieved public evidence "
+                        "for this turn. Use ONLY the supplied CORE PUBLIC FACTUAL "
+                        "EVIDENCE PACKET for specific external-world claims. Remove "
+                        "unsupported details rather than replacing them with guesses."
+                    )
+                })
+
+                public_grounding_retry = (
+                    build_public_factual_retry_instruction(
+                        effective_retry_violations
+                    )
+                )
+
+                if public_grounding_retry:
+                    attempt_messages.append({
+                        "role": "system",
+                        "content": public_grounding_retry
+                    })
+
             if (
                 core_answer_contract
                 and not core_is_micro_act
@@ -8465,18 +8631,31 @@ def handle_direct_conversation(
             )
 
         if (
-            research_evidence
+            grounded_research_evidence
             and core_intent == "factual_question"
         ):
-            # A synopsis/grounded explanation needs more room than the tiny
-            # 96-token factual-answer lane, while still keeping generation
-            # bounded and low-variance.
+            # Grounded public answers need more room than the tiny 96-token
+            # factual-answer lane. Media synopsis remains compact; an explicit
+            # general explanation may use a larger bounded ceiling.
+            grounded_num_predict = 240
+
+            if (
+                public_factual_evidence
+                and _factual_question_requests_explanation(
+                    user_input
+                )
+            ):
+                grounded_num_predict = 384
+
+            elif public_factual_evidence:
+                grounded_num_predict = 192
+
             chat_kwargs.setdefault(
                 "options",
                 {},
             ).update({
                 "temperature": 0.15,
-                "num_predict": 240,
+                "num_predict": grounded_num_predict,
             })
 
         # Output budgets are safety ceilings, not desired response lengths.
@@ -8502,7 +8681,7 @@ def handle_direct_conversation(
         )
 
         if context_window is not None:
-            if research_evidence:
+            if grounded_research_evidence:
                 context_window = max(
                     context_window,
                     12288,
@@ -8947,7 +9126,7 @@ def handle_direct_conversation(
                     factual_history_violations
                 )
 
-            elif not research_evidence:
+            elif not grounded_research_evidence:
                 # Researched factual turns already receive a stricter semantic
                 # verifier against the actual public-source packet below. Avoid
                 # paying for a second LLM verifier whose only job is personal
@@ -8964,6 +9143,7 @@ def handle_direct_conversation(
                 )
 
         media_verification = None
+        public_factual_verification = None
 
         if research_evidence:
             media_verification = verify_media_draft(
@@ -8985,6 +9165,21 @@ def handle_direct_conversation(
                 media_verification
             )
 
+        if public_factual_evidence:
+            public_factual_verification = (
+                verify_public_factual_draft(
+                    client=client,
+                    model=get_local_model_name(),
+                    user_input=user_input,
+                    draft=draft_text,
+                    research_evidence=public_factual_evidence,
+                )
+            )
+
+            violations.extend(
+                public_factual_verification
+            )
+
         violations = list(
             dict.fromkeys(
                 violations
@@ -9004,13 +9199,18 @@ def handle_direct_conversation(
         # draft contains a good synopsis plus one bad tail/detail, preserve
         # the approved original sentences instead of discarding the entire
         # answer and asking Qwen to improvise a fresh one.
+        active_research_verification = (
+            media_verification
+            or public_factual_verification
+        )
+
         if (
-            research_evidence
-            and media_verification is not None
+            grounded_research_evidence
+            and active_research_verification is not None
         ):
             approved_sentences = list(
                 getattr(
-                    media_verification,
+                    active_research_verification,
                     "accepted_sentences",
                     [],
                 )
@@ -9018,9 +9218,15 @@ def handle_direct_conversation(
             )
 
             if approved_sentences:
+                salvage_sentence_limit = (
+                    3
+                    if research_evidence
+                    else len(approved_sentences)
+                )
+
                 salvaged_draft = " ".join(
                     approved_sentences[
-                        :3
+                        :salvage_sentence_limit
                     ]
                 ).strip()
 
@@ -9041,8 +9247,8 @@ def handle_direct_conversation(
                         violations = []
 
                         print(
-                            "[Grounding] Salvaged verified in-scope sentences "
-                            "from the first draft; no creative rewrite required."
+                            "[Grounding] Salvaged verifier-approved sentences "
+                            "from the draft; no creative rewrite required."
                         )
                         break
 
@@ -9090,6 +9296,16 @@ def handle_direct_conversation(
 
             print(
                 "[Research] Drafts remained insufficiently grounded; "
+                "Core used a fail-closed response."
+            )
+
+        elif public_factual_evidence:
+            final_response_text = (
+                build_failed_public_factual_fallback()
+            )
+
+            print(
+                "[Research] Public factual drafts remained insufficiently grounded; "
                 "Core used a fail-closed response."
             )
 

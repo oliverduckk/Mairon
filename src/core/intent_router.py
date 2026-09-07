@@ -32,6 +32,12 @@ THANKS_PATTERNS = [
 QUESTION_PATTERNS = [
     r"\?$",
     r"^\s*(?:what|why|who|where|when|how|does|do|did|is|are|can|could|would|should|has|have|will)\b",
+
+    # Imperative information requests are still questions semantically.
+    # Without these, prompts such as "Explain how DNS works." fall through
+    # to casual conversation and never reach the epistemic router.
+    r"^\s*(?:explain|describe|define|compare)\b",
+    r"^\s*walk\s+me\s+through\b",
 ]
 
 ACTION_PATTERNS = [

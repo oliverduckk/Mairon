@@ -202,6 +202,9 @@ def build_answer_contract(
             in {
                 "conversation",
                 "subjective",
+                "stable_model_knowledge",
+                # Backward-compatible legacy mode for older tests/serialized
+                # contracts. New factual routing no longer emits this mode.
                 "classify_then_verify",
             }
         ),
@@ -241,6 +244,26 @@ def build_answer_contract(
             "Do not revive an old product, device, trip, joke, or assistant phrase merely "
             "because it appears in conversation history.",
         ])
+
+        if route.mode == "stable_model_knowledge":
+            contract.forbidden_behaviours.extend([
+                "Use model knowledge only for durable general explanations or definitions.",
+                "Do not invent or volunteer current prices, availability, leadership roles, "
+                "release status, schedules, laws, versions, recent events, or other changing facts.",
+                "If the answer would require a specific changing public-world fact, omit that "
+                "detail rather than pretending model memory is current.",
+            ])
+
+        if route.mode == "public_source_verified":
+            contract.allow_new_factual_claims = False
+            contract.forbidden_behaviours.extend([
+                "Specific external-world factual claims must come from Core's retrieved public evidence.",
+                "Do not use model training memory to fill gaps in the public evidence packet.",
+                "Do not extrapolate a verified current fact into a prediction about what will probably, likely, "
+                "or definitely happen next unless Oliver explicitly asked for a forecast and Core evidence supports it.",
+                "Do not turn continuity, permanence, likely tenure, future intent, or future outcomes into personality filler.",
+                "If Core cannot verify the requested fact, fail closed rather than bluffing.",
+            ])
 
     if turn.intent == "share_context":
         contract.allow_recommendations = False

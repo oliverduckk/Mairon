@@ -254,7 +254,7 @@ def run():
 
         assert (
             "allow_cloud_escalation\n"
-            "        and not research_evidence"
+            "        and not grounded_research_evidence"
             in provider_source
         )
 

@@ -1762,7 +1762,9 @@ def should_verify_core_grounding(
 
     Declarative shares are the first high-value target because Qwen tends
     to embellish them with product/location/media facts that Oliver did not
-    actually supply.
+    actually supply. Factual questions are intentionally excluded here: their
+    public-world authority is handled by the factual-focus/public-evidence
+    validators instead of this conversation-grounding verifier.
     """
 
     if not contract_forbids_new_factual_claims(
@@ -1776,6 +1778,19 @@ def should_verify_core_grounding(
 
     if intent in {
         "acknowledge",
+
+        # Factual questions use a different authority model:
+        # - stable_model_knowledge may legitimately use local model knowledge;
+        # - public_source_verified is checked against the dedicated retrieved
+        #   evidence packet by the public factual verifier.
+        #
+        # The generic source-locked Core verifier only sees the user turn,
+        # recent user context, and Answer Contract. Letting it police factual
+        # answers therefore creates false rejections for evidence-backed names
+        # and facts (for example, a CEO name retrieved from public sources).
+        # Personal/conversation-history fidelity remains enforced separately by
+        # verify_factual_focus_fidelity().
+        "factual_question",
     }:
         return False
 

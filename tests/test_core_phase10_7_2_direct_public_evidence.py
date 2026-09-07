@@ -178,16 +178,16 @@ def run():
     assert "return build_internal_research_packet(" in evidence_builder
 
     # Researched factual turns keep one repair attempt, not the old three-pass loop.
-    assert "if research_evidence:\n        # Public-source factual turns" in provider_source
+    assert "if grounded_research_evidence:\n        # Public-source factual turns" in provider_source
     assert "personality_draft_limit = 2" in provider_source
 
     # The generic personal-history semantic verifier is skipped when the stricter
     # public-source verifier is already active.
-    assert "elif not research_evidence:" in provider_source
+    assert "elif not grounded_research_evidence:" in provider_source
 
     # Grounded explanations receive enough output/context headroom without
     # re-enabling hidden reasoning.
-    assert '"num_predict": 240' in provider_source
+    assert "grounded_num_predict = 240" in provider_source
     assert "12288" in provider_source
 
     print(
