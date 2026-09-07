@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -12,6 +13,7 @@ from core.action_manager import (
     describe_action,
 )
 from core.conversation_state import (
+    ConversationState,
     append_visible_turn_to_model_history,
 )
 from core.orchestrator import (
@@ -30,6 +32,19 @@ from core.router import (
 from continuity.conversation_journal import (
     get_response_timing_report,
     record_conversation_turn,
+)
+from continuity.chat_session_store import (
+    apply_semantic_chat_title,
+    delete_chat_session,
+    list_chat_sessions,
+    load_chat_session,
+    new_session_id,
+    record_chat_turn,
+    rename_chat_session,
+    restore_conversation_state,
+)
+from continuity.chat_title_generator import (
+    generate_semantic_chat_title,
 )
 from mairon_identity import (
     build_mairon_instructions,
@@ -207,6 +222,10 @@ class MaironApplication:
         self.last_user_input = None
         self.last_assistant_answer = None
 
+        self.session_id = (
+            new_session_id()
+        )
+
         self._pending: Optional[
             _PendingApproval
         ] = None
@@ -249,7 +268,283 @@ class MaironApplication:
                 if self._pending
                 else None
             ),
+            "session_id": (
+                self.session_id
+            ),
         }
+
+    # --------------------------------------------------
+    # Chat sessions
+    # --------------------------------------------------
+
+    def new_chat(
+        self,
+    ) -> dict:
+        """
+        Start a clean short-term conversation without touching durable memory.
+
+        Preferences, long-term memory, account connections and the persistent
+        conversation journal remain available. Only live conversational/model
+        state is reset.
+        """
+
+        if self._pending is not None:
+            raise RuntimeError(
+                "Resolve the pending approval before starting a new chat."
+            )
+
+        self.core.reset_conversation_state()
+
+        self.local_state = None
+        self.cloud_state = None
+
+        self.last_user_input = None
+        self.last_assistant_answer = None
+
+        self.session_id = (
+            new_session_id()
+        )
+
+        self._emit_event(
+            "[Session] Started new chat "
+            + self.session_id[
+                :8
+            ]
+            + "."
+        )
+
+        return {
+            "session_id": (
+                self.session_id
+            ),
+            "title": "New Chat",
+            "turns": [],
+        }
+
+    def recent_chats(
+        self,
+        *,
+        limit: int = 10,
+    ) -> list[dict]:
+        return list_chat_sessions(
+            limit=limit,
+        )
+
+    def rename_chat(
+        self,
+        session_id: str,
+        title: str,
+    ) -> dict:
+        session_value = str(
+            session_id
+            or ""
+        ).strip()
+
+        if not session_value:
+            raise ValueError(
+                "session_id is required"
+            )
+
+        changed = rename_chat_session(
+            session_value,
+            title,
+        )
+
+        if not changed:
+            raise ValueError(
+                "That chat session could not be found."
+            )
+
+        session = load_chat_session(
+            session_value
+        )
+
+        if session is None:
+            raise ValueError(
+                "That chat session could not be found."
+            )
+
+        self._emit_event(
+            "[Session] Renamed chat "
+            + session_value[
+                :8
+            ]
+            + "."
+        )
+
+        return session
+
+    def delete_chat(
+        self,
+        session_id: str,
+    ) -> dict:
+        session_value = str(
+            session_id
+            or ""
+        ).strip()
+
+        if not session_value:
+            raise ValueError(
+                "session_id is required"
+            )
+
+        is_current = (
+            session_value
+            == self.session_id
+        )
+
+        deleted = delete_chat_session(
+            session_value
+        )
+
+        if not deleted:
+            raise ValueError(
+                "That chat session could not be found."
+            )
+
+        replacement = None
+
+        if is_current:
+            replacement = self.new_chat()
+
+        self._emit_event(
+            "[Session] Deleted chat "
+            + session_value[
+                :8
+            ]
+            + "."
+        )
+
+        return {
+            "deleted_session_id": (
+                session_value
+            ),
+            "replacement": (
+                replacement
+            ),
+        }
+
+    def open_chat(
+        self,
+        session_id: str,
+    ) -> dict:
+        """
+        Restore a persisted chat without replaying any historical actions.
+
+        Visible dialogue is reconstructed directly from the local session
+        store. Core's authoritative working state is restored from its stored
+        snapshot, and model-visible history is rebuilt from the transcript.
+        """
+
+        if self._pending is not None:
+            raise RuntimeError(
+                "Resolve the pending approval before switching chats."
+            )
+
+        session = load_chat_session(
+            session_id
+        )
+
+        if session is None:
+            raise ValueError(
+                "That chat session could not be found."
+            )
+
+        restored_core_state = (
+            restore_conversation_state(
+                ConversationState,
+                session.get(
+                    "core_state"
+                ),
+            )
+        )
+
+        self.core.conversation_state = (
+            restored_core_state
+        )
+
+        rebuilt_state = None
+
+        for turn in session.get(
+            "turns",
+            [],
+        ):
+            rebuilt_state = (
+                append_visible_turn_to_model_history(
+                    current_state=rebuilt_state,
+                    user_input=turn.get(
+                        "user_text",
+                        "",
+                    ),
+                    assistant_text=turn.get(
+                        "assistant_text",
+                        "",
+                    ),
+                    system_instructions=(
+                        self.instructions
+                    ),
+                )
+            )
+
+        self.local_state = rebuilt_state
+
+        # Cloud is permission-gated and can reconstruct from the same visible
+        # transcript if it is used later. No historical cloud completion or
+        # hidden provider state is treated as authority.
+        self.cloud_state = (
+            list(
+                rebuilt_state
+            )
+            if rebuilt_state
+            is not None
+            else None
+        )
+
+        turns = session.get(
+            "turns",
+            [],
+        )
+
+        if turns:
+            last_turn = turns[
+                -1
+            ]
+
+            self.last_user_input = str(
+                last_turn.get(
+                    "user_text",
+                    "",
+                )
+                or ""
+            )
+
+            self.last_assistant_answer = str(
+                last_turn.get(
+                    "assistant_text",
+                    "",
+                )
+                or ""
+            )
+
+        else:
+            self.last_user_input = None
+            self.last_assistant_answer = None
+
+        self.session_id = str(
+            session[
+                "session_id"
+            ]
+        )
+
+        self._emit_event(
+            "[Session] Opened chat "
+            + self.session_id[
+                :8
+            ]
+            + "."
+        )
+
+        return session
 
     # --------------------------------------------------
     # Core turn entrypoint
@@ -909,6 +1204,101 @@ class MaironApplication:
             status="error",
         )
 
+    def _generate_semantic_title_for_first_turn(
+        self,
+        *,
+        session_id: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        """
+        Generate low-risk presentation metadata in a completely isolated local
+        model call. This never mutates Core/model conversation state.
+        """
+
+        title = generate_semantic_chat_title(
+            local_ai=self.local_ai,
+            model_name=(
+                self.local_model_name
+            ),
+            user_text=user_text,
+            assistant_text=assistant_text,
+        )
+
+        if not title:
+            return
+
+        changed = apply_semantic_chat_title(
+            session_id,
+            title,
+        )
+
+        if changed:
+            self._emit_event(
+                "[Session] Semantic title: "
+                + title
+            )
+
+    def _schedule_semantic_title_if_first_turn(
+        self,
+        *,
+        session_id: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        if self.local_ai is None:
+            return
+
+        try:
+            session = load_chat_session(
+                session_id
+            )
+
+        except Exception:
+            return
+
+        if (
+            session is None
+            or len(
+                session.get(
+                    "turns",
+                    [],
+                )
+            )
+            != 1
+            or str(
+                session.get(
+                    "title_origin",
+                    "",
+                )
+                or ""
+            )
+            != "auto"
+        ):
+            return
+
+        worker = threading.Thread(
+            target=(
+                self._generate_semantic_title_for_first_turn
+            ),
+            kwargs={
+                "session_id": session_id,
+                "user_text": user_text,
+                "assistant_text": assistant_text,
+            },
+            name=(
+                "MaironChatTitle-"
+                + str(
+                    session_id
+                )[
+                    :8
+                ]
+            ),
+            daemon=True,
+        )
+
+        worker.start()
+
     def _record_final_turn(
         self,
         *,
@@ -937,6 +1327,39 @@ class MaironApplication:
         except Exception as exc:
             self._emit_event(
                 "[Context] Conversation journal write failed: "
+                + str(
+                    exc
+                )
+            )
+
+        try:
+            record_chat_turn(
+                session_id=(
+                    self.session_id
+                ),
+                user_text=user_text,
+                assistant_text=answer,
+                channel=channel,
+                response_seconds=(
+                    response_seconds
+                ),
+                core_state=(
+                    self.core
+                    .conversation_state
+                ),
+            )
+
+            self._schedule_semantic_title_if_first_turn(
+                session_id=(
+                    self.session_id
+                ),
+                user_text=user_text,
+                assistant_text=answer,
+            )
+
+        except Exception as exc:
+            self._emit_event(
+                "[Session] Chat persistence failed: "
                 + str(
                     exc
                 )

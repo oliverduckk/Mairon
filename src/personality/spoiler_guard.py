@@ -63,6 +63,7 @@ MEDIA_WORDS = [
     "season",
     "character",
     "characters",
+    "synopsis",
 ]
 
 HIGH_SPOILER_RISK_PATTERNS = [
@@ -544,6 +545,16 @@ def _extract_title_from_discussion(
     text,
 ):
     patterns = [
+        # "synopsis on Shadow Slave"
+        r"(?i:\bsynopsis\s+(?:on|of|for)\s+(.+?)(?:[?.!,]|$))",
+        # "summary of Dune" / "overview of Bleach"
+        r"(?i:\b(?:summary|overview)\s+(?:on|of|for)\s+(.+?)(?:[?.!,]|$))",
+        # "is One Piece a manga or anime?"
+        r"(?i:\bis\s+(.+?)\s+(?:an?\s+)?"
+        r"(?:anime|manga|manhwa|manhua|light novel|web novel|novel)"
+        r"(?:\s+or\s+(?:an?\s+)?"
+        r"(?:anime|manga|manhwa|manhua|light novel|web novel|novel))?"
+        r"\s*[?.!]*$)",
         # Opinion wording must be explicit. A generic phrase such as
         # "changed about when I cleaned it" is NOT a media-title signal.
         r"\bwhat\s+do\s+you\s+think\s+(?:about|of)\s+(.+?)(?:[?.!,]|$)",

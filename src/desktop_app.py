@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from tkinter import messagebox, simpledialog
 import tkinter.font as tkfont
 from datetime import datetime
 from pathlib import Path
@@ -783,27 +784,73 @@ class RoundedMessageBubble(
             fill="x",
         )
 
-        self.message_label = tk.Label(
+        self.message_text = tk.Text(
             self.inner,
-            text=self._message,
             bg=fill,
             fg=text_color,
-            anchor="w",
-            justify="left",
-            wraplength=max(
-                130,
-                self._bubble_width - 36,
-            ),
+            selectbackground=speaker_color,
+            selectforeground=text_color,
+            wrap="word",
+            height=1,
+            width=1,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=0,
+            pady=0,
+            cursor="xterm",
+            takefocus=True,
             font=self._message_font,
         )
 
-        self.message_label.pack(
+        self.message_text.insert(
+            "1.0",
+            self._message,
+        )
+
+        self.message_text.configure(
+            state="disabled"
+        )
+
+        # Backward-compatible attribute name for older UI fixtures/helpers.
+        self.message_label = (
+            self.message_text
+        )
+
+        self.message_text.pack(
             anchor="w",
             fill="x",
             pady=(
                 5,
                 0,
             ),
+        )
+
+        self.message_text.bind(
+            "<Configure>",
+            lambda event: (
+                self.after_idle(
+                    self._sync_text_height
+                )
+            ),
+        )
+
+        self.message_text.bind(
+            "<Button-1>",
+            lambda event: (
+                self.message_text.focus_set()
+            ),
+            add="+",
+        )
+
+        self.message_text.bind(
+            "<Control-c>",
+            self._copy_message_selection,
+        )
+
+        self.message_text.bind(
+            "<Control-C>",
+            self._copy_message_selection,
         )
 
         self.inner.bind(
@@ -870,12 +917,91 @@ class RoundedMessageBubble(
             width=inner_width,
         )
 
-        self.message_label.configure(
-            wraplength=max(
-                130,
-                inner_width,
-            ),
+        self.after_idle(
+            self._sync_text_height
         )
+
+        self.after_idle(
+            self._sync_height
+        )
+
+    def _copy_message_selection(
+        self,
+        event=None,
+    ):
+        try:
+            selected = self.message_text.get(
+                "sel.first",
+                "sel.last",
+            )
+
+        except tk.TclError:
+            return "break"
+
+        if not selected:
+            return "break"
+
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(
+                selected
+            )
+
+        except Exception:
+            pass
+
+        return "break"
+
+    def _sync_text_height(
+        self,
+    ) -> None:
+        try:
+            self.message_text.update_idletasks()
+
+            count = self.message_text.count(
+                "1.0",
+                "end-1c",
+                "displaylines",
+            )
+
+            display_lines = (
+                int(
+                    count[
+                        0
+                    ]
+                )
+                if count
+                else 1
+            )
+
+        except Exception:
+            display_lines = max(
+                1,
+                self._message.count(
+                    "\n"
+                )
+                + 1,
+            )
+
+        display_lines = max(
+            1,
+            display_lines,
+        )
+
+        try:
+            current_height = int(
+                self.message_text.cget(
+                    "height"
+                )
+            )
+
+        except Exception:
+            current_height = 1
+
+        if current_height != display_lines:
+            self.message_text.configure(
+                height=display_lines
+            )
 
         self.after_idle(
             self._sync_height
@@ -1581,6 +1707,23 @@ class ScrollableChat(
 
         self._stick_to_bottom = True
 
+    def clear_messages(
+        self,
+    ) -> None:
+        for child in self.inner.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+
+        self.canvas.configure(
+            scrollregion=(0, 0, 0, 0)
+        )
+        self.canvas.yview_moveto(
+            0.0
+        )
+        self._stick_to_bottom = True
+
     def add_message(
         self,
         *,
@@ -1937,6 +2080,8 @@ class MaironDesktopApp:
         self.voice_recording = False
         self.speaking = False
 
+        self.current_session_id = None
+
         self.voice_runtime = VoiceRuntime(
             event_sink=(
                 lambda message: (
@@ -2171,8 +2316,52 @@ class MaironDesktopApp:
 
         self._sidebar_item(
             sidebar,
+            "＋  New Chat",
+            command=self._new_chat,
+        )
+
+        self._sidebar_item(
+            sidebar,
             "◉  Chat",
             selected=True,
+        )
+
+        tk.Label(
+            sidebar,
+            text="RECENT",
+            bg=self.theme[
+                "surface"
+            ],
+            fg=self.theme[
+                "text_muted"
+            ],
+            font=(
+                self.font_family,
+                9,
+                "bold",
+            ),
+        ).pack(
+            anchor="w",
+            padx=20,
+            pady=(
+                14,
+                4,
+            ),
+        )
+
+        self.recent_chats_frame = tk.Frame(
+            sidebar,
+            bg=self.theme[
+                "surface"
+            ],
+        )
+
+        self.recent_chats_frame.pack(
+            fill="x",
+            pady=(
+                0,
+                8,
+            ),
         )
 
         self._sidebar_item(
@@ -2300,6 +2489,7 @@ class MaironDesktopApp:
         *,
         selected: bool = False,
         suffix: str = "",
+        command=None,
     ) -> None:
         bg = (
             self.theme[
@@ -2325,6 +2515,13 @@ class MaironDesktopApp:
             parent,
             bg=bg,
             height=40,
+            cursor=(
+                "hand2"
+                if callable(
+                    command
+                )
+                else "arrow"
+            ),
         )
 
         row.pack(
@@ -2337,7 +2534,7 @@ class MaironDesktopApp:
             False
         )
 
-        tk.Label(
+        label = tk.Label(
             row,
             text=text,
             bg=bg,
@@ -2350,12 +2547,34 @@ class MaironDesktopApp:
                 else "normal",
             ),
             anchor="w",
-        ).pack(
+            cursor=(
+                "hand2"
+                if callable(
+                    command
+                )
+                else "arrow"
+            ),
+        )
+
+        label.pack(
             side="left",
             fill="x",
             expand=True,
             padx=12,
         )
+
+        if callable(
+            command
+        ):
+            row.bind(
+                "<Button-1>",
+                lambda event: command(),
+            )
+
+            label.bind(
+                "<Button-1>",
+                lambda event: command(),
+            )
 
         if suffix:
             tk.Label(
@@ -2419,7 +2638,7 @@ class MaironDesktopApp:
             ),
         )
 
-        tk.Label(
+        self.chat_title_label = tk.Label(
             header,
             text="New Chat",
             bg=self.theme[
@@ -2433,7 +2652,9 @@ class MaironDesktopApp:
                 12,
                 "bold",
             ),
-        ).pack(
+        )
+
+        self.chat_title_label.pack(
             side="left",
         )
 
@@ -3014,6 +3235,578 @@ class MaironDesktopApp:
                 application,
             )
         )
+
+    # --------------------------------------------------
+    # Chat sessions
+    # --------------------------------------------------
+
+    def _refresh_current_chat_title(
+        self,
+    ) -> None:
+        if (
+            self.application is None
+            or not self.current_session_id
+        ):
+            return
+
+        try:
+            sessions = self.application.recent_chats(
+                limit=12
+            )
+        except Exception:
+            return
+
+        for session in sessions:
+            if str(
+                session.get(
+                    "session_id",
+                    "",
+                )
+                or ""
+            ) != str(
+                self.current_session_id
+            ):
+                continue
+
+            self.chat_title_label.config(
+                text=str(
+                    session.get(
+                        "title",
+                        "New Chat",
+                    )
+                    or "New Chat"
+                )
+            )
+            return
+
+    def _refresh_recent_chats(
+        self,
+    ) -> None:
+        if (
+            self.application is None
+            or not hasattr(
+                self,
+                "recent_chats_frame",
+            )
+        ):
+            return
+
+        for child in self.recent_chats_frame.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+
+        try:
+            sessions = self.application.recent_chats(
+                limit=6
+            )
+        except Exception as exc:
+            self._append_system_message(
+                "Could not load recent chats: "
+                + str(exc)
+            )
+            return
+
+        if not sessions:
+            tk.Label(
+                self.recent_chats_frame,
+                text="No saved chats yet",
+                bg=self.theme[
+                    "surface"
+                ],
+                fg=self.theme[
+                    "text_muted"
+                ],
+                font=(
+                    self.font_family,
+                    8,
+                ),
+                anchor="w",
+            ).pack(
+                fill="x",
+                padx=24,
+                pady=4,
+            )
+            return
+
+        for session in sessions:
+            session_id = str(
+                session.get(
+                    "session_id",
+                    "",
+                )
+                or ""
+            )
+
+            title = str(
+                session.get(
+                    "title",
+                    "New Chat",
+                )
+                or "New Chat"
+            )
+
+            selected = (
+                session_id
+                == self.current_session_id
+            )
+
+            bg = (
+                self.theme[
+                    "surface_hover"
+                ]
+                if selected
+                else self.theme[
+                    "surface"
+                ]
+            )
+
+            fg = (
+                self.theme[
+                    "accent"
+                ]
+                if selected
+                else self.theme[
+                    "text_secondary"
+                ]
+            )
+
+            row = tk.Frame(
+                self.recent_chats_frame,
+                bg=bg,
+                height=34,
+                cursor="hand2",
+            )
+
+            row.pack(
+                fill="x",
+                padx=12,
+                pady=1,
+            )
+
+            row.pack_propagate(
+                False
+            )
+
+            display_title = title
+
+            if len(
+                display_title
+            ) > 24:
+                display_title = (
+                    display_title[
+                        :23
+                    ].rstrip()
+                    + "…"
+                )
+
+            # Pack the menu control first so it always reserves its own space.
+            menu_button = tk.Label(
+                row,
+                text="⋯",
+                bg=bg,
+                fg=self.theme[
+                    "text_muted"
+                ],
+                font=(
+                    self.font_family,
+                    12,
+                    "bold",
+                ),
+                cursor="hand2",
+            )
+
+            menu_button.pack(
+                side="right",
+                padx=8,
+            )
+
+            label = tk.Label(
+                row,
+                text=display_title,
+                bg=bg,
+                fg=fg,
+                anchor="w",
+                font=(
+                    self.font_family,
+                    9,
+                    "bold"
+                    if selected
+                    else "normal",
+                ),
+                cursor="hand2",
+            )
+
+            label.pack(
+                side="left",
+                fill="both",
+                expand=True,
+                padx=(
+                    12,
+                    4,
+                ),
+            )
+
+            row.bind(
+                "<Button-3>",
+                lambda event, sid=session_id, title_value=title: (
+                    self._show_chat_menu(
+                        event,
+                        sid,
+                        title_value,
+                    )
+                ),
+            )
+
+            label.bind(
+                "<Button-3>",
+                lambda event, sid=session_id, title_value=title: (
+                    self._show_chat_menu(
+                        event,
+                        sid,
+                        title_value,
+                    )
+                ),
+            )
+
+            menu_button.bind(
+                "<Button-1>",
+                lambda event, sid=session_id, title_value=title: (
+                    self._show_chat_menu(
+                        event,
+                        sid,
+                        title_value,
+                    )
+                ),
+            )
+
+            row.bind(
+                "<Button-1>",
+                lambda event, sid=session_id: self._open_chat(
+                    sid
+                ),
+            )
+
+            label.bind(
+                "<Button-1>",
+                lambda event, sid=session_id: self._open_chat(
+                    sid
+                ),
+            )
+
+    def _show_chat_menu(
+        self,
+        event,
+        session_id: str,
+        title: str,
+    ) -> None:
+        menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            bg=self.theme[
+                "surface"
+            ],
+            fg=self.theme[
+                "text_primary"
+            ],
+            activebackground=self.theme[
+                "surface_hover"
+            ],
+            activeforeground=self.theme[
+                "accent"
+            ],
+        )
+
+        menu.add_command(
+            label="Rename",
+            command=lambda: (
+                self._rename_chat(
+                    session_id,
+                    title,
+                )
+            ),
+        )
+
+        menu.add_command(
+            label="Delete",
+            command=lambda: (
+                self._delete_chat(
+                    session_id,
+                    title,
+                )
+            ),
+        )
+
+        try:
+            menu.tk_popup(
+                event.x_root,
+                event.y_root,
+            )
+
+        finally:
+            menu.grab_release()
+
+    def _rename_chat(
+        self,
+        session_id: str,
+        current_title: str,
+    ) -> None:
+        if (
+            self.application is None
+            or self.busy
+            or self.pending_approval
+        ):
+            return
+
+        new_title = simpledialog.askstring(
+            "Rename chat",
+            "Chat name:",
+            initialvalue=current_title,
+            parent=self.root,
+        )
+
+        if new_title is None:
+            return
+
+        new_title = str(
+            new_title
+        ).strip()
+
+        if not new_title:
+            return
+
+        try:
+            session = self.application.rename_chat(
+                session_id,
+                new_title,
+            )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Rename failed",
+                str(
+                    exc
+                ),
+                parent=self.root,
+            )
+            return
+
+        if str(
+            session.get(
+                "session_id",
+                "",
+            )
+            or ""
+        ) == str(
+            self.current_session_id
+            or ""
+        ):
+            self.chat_title_label.config(
+                text=str(
+                    session.get(
+                        "title",
+                        new_title,
+                    )
+                    or new_title
+                )
+            )
+
+        self._refresh_recent_chats()
+
+    def _delete_chat(
+        self,
+        session_id: str,
+        title: str,
+    ) -> None:
+        if (
+            self.application is None
+            or self.busy
+            or self.pending_approval
+        ):
+            return
+
+        confirmed = messagebox.askyesno(
+            "Delete chat",
+            (
+                f'Delete "{title}"?\\n\\n'
+                "This removes the local chat transcript and "
+                "its short-term session state."
+            ),
+            parent=self.root,
+        )
+
+        if not confirmed:
+            return
+
+        try:
+            result = self.application.delete_chat(
+                session_id
+            )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "Delete failed",
+                str(
+                    exc
+                ),
+                parent=self.root,
+            )
+            return
+
+        if str(
+            session_id
+        ) == str(
+            self.current_session_id
+            or ""
+        ):
+            replacement = (
+                result.get(
+                    "replacement",
+                    {},
+                )
+                or {}
+            )
+
+            self.current_session_id = str(
+                replacement.get(
+                    "session_id",
+                    "",
+                )
+                or ""
+            )
+
+            self.chat.clear_messages()
+
+            self.chat_title_label.config(
+                text="New Chat"
+            )
+
+        self._refresh_recent_chats()
+        self.input.focus_set()
+
+    def _new_chat(
+        self,
+    ) -> None:
+        if (
+            self.application is None
+            or self.busy
+            or self.pending_approval
+            or self.voice_recording
+            or self.speaking
+        ):
+            return
+
+        try:
+            session = self.application.new_chat()
+        except Exception as exc:
+            self._append_system_message(
+                "Could not start a new chat: "
+                + str(exc)
+            )
+            return
+
+        self.current_session_id = str(
+            session.get(
+                "session_id",
+                "",
+            )
+            or ""
+        )
+
+        self.chat.clear_messages()
+
+        self.chat_title_label.config(
+            text="New Chat"
+        )
+
+        self._set_status(
+            "Ready",
+            self.theme[
+                "success"
+            ],
+        )
+
+        self._refresh_recent_chats()
+        self.input.focus_set()
+
+    def _open_chat(
+        self,
+        session_id: str,
+    ) -> None:
+        if (
+            self.application is None
+            or self.busy
+            or self.pending_approval
+            or self.voice_recording
+            or self.speaking
+        ):
+            return
+
+        try:
+            session = self.application.open_chat(
+                session_id
+            )
+        except Exception as exc:
+            self._append_system_message(
+                "Could not open that chat: "
+                + str(exc)
+            )
+            return
+
+        self.current_session_id = str(
+            session.get(
+                "session_id",
+                "",
+            )
+            or ""
+        )
+
+        self.chat.clear_messages()
+
+        for turn in session.get(
+            "turns",
+            [],
+        ):
+            self._append_user_message(
+                str(
+                    turn.get(
+                        "user_text",
+                        "",
+                    )
+                    or ""
+                )
+            )
+
+            self._append_mairon_message(
+                str(
+                    turn.get(
+                        "assistant_text",
+                        "",
+                    )
+                    or ""
+                )
+            )
+
+        self.chat_title_label.config(
+            text=str(
+                session.get(
+                    "title",
+                    "New Chat",
+                )
+                or "New Chat"
+            )
+        )
+
+        self._set_status(
+            "Ready",
+            self.theme[
+                "success"
+            ],
+        )
+
+        self._refresh_recent_chats()
+        self.input.focus_set()
 
     # --------------------------------------------------
     # Sending / approvals
@@ -3602,6 +4395,15 @@ class MaironDesktopApp:
                 True
             )
 
+            self.current_session_id = str(
+                status.get(
+                    "session_id",
+                    "",
+                )
+                or ""
+            )
+
+            self._refresh_recent_chats()
             self.input.focus_set()
 
         elif kind == "bootstrap_error":
@@ -3802,7 +4604,24 @@ class MaironDesktopApp:
                 or ""
             )
 
+            # When launched from VS Code/PowerShell this keeps application-
+            # service/Core diagnostics visible. pythonw.exe simply has no
+            # console to display them, which is harmless.
+            try:
+                print(
+                    text
+                )
+
+            except Exception:
+                pass
+
             if text.startswith(
+                "[Session] Semantic title:"
+            ):
+                self._refresh_current_chat_title()
+                self._refresh_recent_chats()
+
+            elif text.startswith(
                 "[Core]"
             ):
                 self.status_label.config(
@@ -3862,6 +4681,35 @@ class MaironDesktopApp:
                 self._append_mairon_message(
                     result.answer
                 )
+
+        try:
+            self._refresh_current_chat_title()
+            self._refresh_recent_chats()
+
+            # Semantic title generation runs on an isolated background thread.
+            # Refresh a couple of times after the answer so the nicer title
+            # appears without blocking Mairon's response.
+            self.root.after(
+                1200,
+                self._refresh_current_chat_title,
+            )
+
+            self.root.after(
+                1200,
+                self._refresh_recent_chats,
+            )
+
+            self.root.after(
+                3500,
+                self._refresh_current_chat_title,
+            )
+
+            self.root.after(
+                3500,
+                self._refresh_recent_chats,
+            )
+        except Exception:
+            pass
 
         if (
             result.response_seconds
