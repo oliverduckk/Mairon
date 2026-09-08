@@ -1216,6 +1216,10 @@ class MaironApplication:
         model call. This never mutates Core/model conversation state.
         """
 
+        self._emit_event(
+            "[Session] Semantic title generation started."
+        )
+
         title = generate_semantic_chat_title(
             local_ai=self.local_ai,
             model_name=(
@@ -1226,6 +1230,9 @@ class MaironApplication:
         )
 
         if not title:
+            self._emit_event(
+                "[Session] Semantic title generation returned no usable title."
+            )
             return
 
         changed = apply_semantic_chat_title(
@@ -1238,6 +1245,12 @@ class MaironApplication:
                 "[Session] Semantic title: "
                 + title
             )
+            return
+
+        self._emit_event(
+            "[Session] Semantic title was generated but not applied; "
+            "the session is no longer eligible for an automatic title upgrade."
+        )
 
     def _schedule_semantic_title_if_first_turn(
         self,
@@ -1276,6 +1289,10 @@ class MaironApplication:
             != "auto"
         ):
             return
+
+        self._emit_event(
+            "[Session] Semantic title queued."
+        )
 
         worker = threading.Thread(
             target=(

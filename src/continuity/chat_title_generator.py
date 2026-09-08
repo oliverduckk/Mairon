@@ -190,6 +190,7 @@ def generate_semantic_chat_title(
         response = client.chat(
             model=model_value,
             messages=messages,
+            think=False,
             options={
                 "temperature": 0.2,
                 "num_predict": 24,
@@ -202,6 +203,7 @@ def generate_semantic_chat_title(
             response = client.chat(
                 model=model_value,
                 messages=messages,
+                think=False,
             )
 
         except Exception:
