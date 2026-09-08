@@ -853,6 +853,36 @@ class RoundedMessageBubble(
             self._copy_message_selection,
         )
 
+        self.message_text.bind(
+            "<Control-a>",
+            self._select_all_message_text,
+        )
+
+        self.message_text.bind(
+            "<Control-A>",
+            self._select_all_message_text,
+        )
+
+        self.message_text.bind(
+            "<Button-3>",
+            self._show_message_context_menu,
+        )
+
+        self._message_context_menu = tk.Menu(
+            self.message_text,
+            tearoff=0,
+        )
+
+        self._message_context_menu.add_command(
+            label="Copy",
+            command=self._copy_message_selection,
+        )
+
+        self._message_context_menu.add_command(
+            label="Select All",
+            command=self._select_all_message_text,
+        )
+
         self.inner.bind(
             "<Configure>",
             self._sync_height,
@@ -925,18 +955,33 @@ class RoundedMessageBubble(
             self._sync_height
         )
 
-    def _copy_message_selection(
+    def _message_selection_text(
         self,
-        event=None,
-    ):
+    ) -> str:
+        """
+        Return the current selection from this message only.
+
+        Chat bubbles are deliberately read-only, but Tk's selection tag remains
+        available while the Text widget is disabled. Keeping selection lookup in
+        one helper makes keyboard and context-menu copy behave identically.
+        """
+
         try:
-            selected = self.message_text.get(
+            return self.message_text.get(
                 "sel.first",
                 "sel.last",
             )
 
         except tk.TclError:
-            return "break"
+            return ""
+
+    def _copy_message_selection(
+        self,
+        event=None,
+    ):
+        selected = (
+            self._message_selection_text()
+        )
 
         if not selected:
             return "break"
@@ -947,8 +992,78 @@ class RoundedMessageBubble(
                 selected
             )
 
+            # Ensure Windows owns the clipboard contents immediately rather
+            # than waiting for another Tk event before another application
+            # tries to paste them.
+            self.update_idletasks()
+
         except Exception:
             pass
+
+        return "break"
+
+    def _select_all_message_text(
+        self,
+        event=None,
+    ):
+        """
+        Select only the focused message body.
+
+        Ctrl+A must never hijack the entire desktop app or select text from
+        neighbouring bubbles.
+        """
+
+        try:
+            self.message_text.focus_set()
+            self.message_text.tag_remove(
+                "sel",
+                "1.0",
+                "end",
+            )
+            self.message_text.tag_add(
+                "sel",
+                "1.0",
+                "end-1c",
+            )
+        except tk.TclError:
+            pass
+
+        return "break"
+
+    def _show_message_context_menu(
+        self,
+        event,
+    ):
+        """
+        Open the message-local copy menu without making the bubble editable.
+        """
+
+        self.message_text.focus_set()
+
+        selected = (
+            self._message_selection_text()
+        )
+
+        self._message_context_menu.entryconfigure(
+            "Copy",
+            state=(
+                "normal"
+                if selected
+                else "disabled"
+            ),
+        )
+
+        try:
+            self._message_context_menu.tk_popup(
+                event.x_root,
+                event.y_root,
+            )
+
+        finally:
+            try:
+                self._message_context_menu.grab_release()
+            except tk.TclError:
+                pass
 
         return "break"
 

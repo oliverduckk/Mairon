@@ -4,6 +4,7 @@ import re
 from html.parser import HTMLParser
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -74,12 +75,106 @@ def clean_email_text(text):
 # Authentication
 # --------------------------------------------------
 
+def _save_credentials(credentials):
+    """Persist the Gmail-only OAuth token after refresh/authorisation."""
+
+    GOOGLE_DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    TOKEN_PATH.write_text(
+        credentials.to_json(),
+        encoding="utf-8"
+    )
+
+
+def _refresh_error_requires_reauthentication(error):
+    """
+    Return True only when Google says the stored grant itself is no longer
+    usable and an interactive OAuth grant is required.
+
+    Network/transient refresh failures deliberately do not trigger a browser
+    login loop.
+    """
+
+    fragments = [
+        str(error),
+    ]
+
+    response_data = getattr(
+        error,
+        "response_data",
+        None,
+    )
+
+    if response_data is not None:
+        fragments.append(
+            str(response_data)
+        )
+
+    for value in getattr(
+        error,
+        "args",
+        (),
+    ):
+        fragments.append(
+            str(value)
+        )
+
+    text = " ".join(
+        fragments
+    ).lower()
+
+    return any(
+        marker in text
+        for marker in {
+            "invalid_grant",
+            "expired or revoked",
+            "invalid_rapt",
+            "reauth",
+            "re-auth",
+        }
+    )
+
+
+def _authorise_gmail_interactively():
+    """Create a fresh Gmail read-only grant through Google's OAuth flow."""
+
+    if not CREDENTIALS_PATH.exists():
+        raise FileNotFoundError(
+            "Google OAuth credentials were not found at "
+            f"{CREDENTIALS_PATH}"
+        )
+
+    print(
+        "[Gmail] Gmail authorisation is required; opening Google OAuth."
+    )
+
+    flow = InstalledAppFlow.from_client_secrets_file(
+        str(CREDENTIALS_PATH),
+        SCOPES
+    )
+
+    credentials = flow.run_local_server(
+        port=0
+    )
+
+    _save_credentials(
+        credentials
+    )
+
+    return credentials
+
+
 def get_credentials():
     """
     Load Gmail-specific OAuth credentials.
 
-    Gmail uses its own token so Gmail authorization
-    remains separate from Calendar authorization.
+    Gmail uses its own token so Gmail authorization remains separate from
+    Calendar authorization. If Google's refresh endpoint explicitly reports
+    that the stored Gmail grant was revoked/expired, recover by running a new
+    Gmail-only interactive OAuth flow and replacing gmail_token.json.
     """
 
     credentials = None
@@ -90,44 +185,39 @@ def get_credentials():
             SCOPES
         )
 
-    if not credentials or not credentials.valid:
+    if credentials and credentials.valid:
+        return credentials
 
-        if (
-            credentials
-            and credentials.expired
-            and credentials.refresh_token
-        ):
+    if (
+        credentials
+        and credentials.expired
+        and credentials.refresh_token
+    ):
+        try:
             credentials.refresh(
                 Request()
             )
 
-        else:
-            if not CREDENTIALS_PATH.exists():
-                raise FileNotFoundError(
-                    "Google OAuth credentials were not found at "
-                    f"{CREDENTIALS_PATH}"
-                )
+        except RefreshError as error:
+            if not _refresh_error_requires_reauthentication(
+                error
+            ):
+                raise
 
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(CREDENTIALS_PATH),
-                SCOPES
+            print(
+                "[Gmail] Stored Gmail OAuth grant expired or was revoked; "
+                "requesting a fresh authorisation."
             )
 
-            credentials = flow.run_local_server(
-                port=0
-            )
+            return _authorise_gmail_interactively()
 
-        GOOGLE_DATA_DIR.mkdir(
-            parents=True,
-            exist_ok=True
+        _save_credentials(
+            credentials
         )
 
-        TOKEN_PATH.write_text(
-            credentials.to_json(),
-            encoding="utf-8"
-        )
+        return credentials
 
-    return credentials
+    return _authorise_gmail_interactively()
 
 
 def create_gmail_service():

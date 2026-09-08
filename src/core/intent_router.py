@@ -78,8 +78,12 @@ EMAIL_READ_PATTERNS = [
     r"(?:say|says|said|contain|contains|include|includes)\b",
 
     # Explicit read/summarise/open actions.
+    #
+    # IMPORTANT: bare deictic forms such as "explain it" / "read that" do
+    # NOT belong here. They may inherit Gmail only from a verified active
+    # Gmail message referent later in classify_turn(). A pronoun may continue
+    # a tool workflow; it must never create one.
     r"\b(?:read|summari[sz]e|explain)\b[^?]{0,120}\b(?:email|message)\b",
-    r"\b(?:read|summari[sz]e|explain)\s+(?:it|that|this)\b",
 
     # Opening/showing a named or latest email is semantically a Gmail read.
     # This must be recognised before generic desktop/Steam launch fallbacks.
@@ -273,6 +277,67 @@ def _recent_email_context_for_target(
         require_message=True,
         allow_bare=allow_bare,
     )
+
+
+def _active_verified_email_message_context(
+    conversation_state,
+):
+    """
+    Return the active Gmail context only when it resolves to exactly one
+    verified message ID.
+
+    This is the authority gate for bare deictic follow-ups such as
+    "explain it", "read that", or "does it need a reply?". Merely having
+    active_intent == email_search/email_read is not enough: a previous search
+    may have produced zero or multiple candidates, and a singular pronoun must
+    not invent which message Oliver meant.
+    """
+
+    if conversation_state is None:
+        return None
+
+    if getattr(
+        conversation_state,
+        "active_intent",
+        None,
+    ) not in {
+        "email_search",
+        "email_read",
+    }:
+        return None
+
+    context = _recent_email_context_for_target(
+        conversation_state,
+        target=None,
+        allow_bare=True,
+    )
+
+    if not context:
+        return None
+
+    messages = list(
+        context.get(
+            "messages",
+            [],
+        )
+        or []
+    )
+
+    if len(messages) != 1:
+        return None
+
+    message_id = str(
+        messages[0].get(
+            "message_id",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if not message_id:
+        return None
+
+    return context
 
 
 CONTEXTUAL_EMAIL_FOLLOWUP_PATTERNS = [
@@ -1595,10 +1660,20 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         }
     )
 
+    # A bare pronoun may inherit Gmail only when Core already owns one
+    # unambiguous verified Gmail message referent. Active Gmail intent alone
+    # is insufficient because the previous search may have had zero or
+    # multiple candidates.
+    verified_active_email_context = (
+        _active_verified_email_message_context(
+            conversation_state
+        )
+    )
+
     # A judgement/action follow-up about the active email is still a Gmail
     # evidence question. It must not be answered from Mairon's prior prose.
     email_action_assessment_request = bool(
-        active_specific_email
+        verified_active_email_context
         and re.search(
             r"^\s*(?:and\s+)?(?:"
             r"do\s+i\s+need\s+to\s+(?:do\s+anything|act|reply|respond|worry)"
@@ -1616,7 +1691,7 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
     # A compact deictic request such as "what did it say?" is Gmail-specific
     # only while a specific email search/read remains actively selected.
     deictic_email_read_request = bool(
-        active_specific_email
+        verified_active_email_context
         and re.search(
             r"^\s*(?:and\s+)?"
             r"(?:what\s+(?:did|does)\s+(?:it|that)\s+say|"
@@ -1671,16 +1746,27 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
                 "email_selector"
             ] = email_selector
 
-        prior_context = (
-            _recent_email_context_for_target(
-                conversation_state,
-                target=target,
-                allow_bare=(
-                    target is None
-                    and active_specific_email
-                ),
+        if (
+            target is None
+            and (
+                deictic_email_read_request
+                or email_action_assessment_request
             )
-        )
+        ):
+            prior_context = (
+                verified_active_email_context
+            )
+        else:
+            prior_context = (
+                _recent_email_context_for_target(
+                    conversation_state,
+                    target=target,
+                    allow_bare=(
+                        target is None
+                        and active_specific_email
+                    ),
+                )
+            )
 
         if prior_context:
             messages = list(
