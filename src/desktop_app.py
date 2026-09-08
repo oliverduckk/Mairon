@@ -1079,12 +1079,19 @@ class RoundedMessageBubble(
                 "displaylines",
             )
 
+            # Tk's ``Text.count(..., "displaylines")`` reports the number
+            # of display-line *boundaries crossed* between the two indices,
+            # not the number of occupied display lines.  A message that wraps
+            # across five visual lines therefore reports four transitions.
+            # Add the starting line back so the read-only widget never clips
+            # its final wrapped line.
             display_lines = (
                 int(
                     count[
                         0
                     ]
                 )
+                + 1
                 if count
                 else 1
             )
