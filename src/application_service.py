@@ -88,6 +88,7 @@ class ApplicationTurn:
     reason: Optional[str] = None
 
     channel: str = "text"
+    diagnostics: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -98,6 +99,11 @@ class _PendingApproval:
     instructions: str
     response_timer: ResponseTimer
     channel: str
+    intent: Optional[str] = None
+    authority: Optional[str] = None
+    route_mode: Optional[str] = None
+    workflow: Optional[str] = None
+    agent_action: Optional[str] = None
 
 
 class MaironApplication:
@@ -325,9 +331,16 @@ class MaironApplication:
         self,
         *,
         limit: int = 10,
+        query: str | None = None,
     ) -> list[dict]:
+        """
+        Return recent persisted chats, optionally filtering the local saved
+        titles and transcript text. Search remains entirely local.
+        """
+
         return list_chat_sessions(
             limit=limit,
+            query=query,
         )
 
     def rename_chat(
@@ -719,6 +732,9 @@ class MaironApplication:
 
         intent = None
         authority = None
+        route_mode = None
+        workflow = None
+        agent_action = None
 
         if core_decision is not None:
             turn = (
@@ -746,6 +762,27 @@ class MaironApplication:
                 )
                 or ""
             ).strip() or None
+
+            route_mode = str(
+                getattr(
+                    route,
+                    "mode",
+                    "",
+                )
+                or ""
+            ).strip() or None
+
+            if getattr(
+                core_decision,
+                "workflow_result",
+                None,
+            ) is not None:
+                workflow = intent
+
+                if authority == "desktop":
+                    agent_action = intent
+            else:
+                workflow = route_mode
 
             if (
                 intent
@@ -795,6 +832,9 @@ class MaironApplication:
                     channel=channel_value,
                     intent=intent,
                     authority=authority,
+                    route_mode=route_mode,
+                    workflow=workflow,
+                    agent_action=agent_action,
                 )
 
             if (
@@ -810,6 +850,9 @@ class MaironApplication:
                     channel=channel_value,
                     intent=intent,
                     authority=authority,
+                    route_mode=route_mode,
+                    workflow=workflow,
+                    agent_action=agent_action,
                 )
 
             turn_instructions = (
@@ -841,6 +884,8 @@ class MaironApplication:
                 channel=channel_value,
                 intent=intent,
                 authority=authority,
+                route_mode=route_mode,
+                workflow=workflow,
             )
 
         try:
@@ -866,6 +911,8 @@ class MaironApplication:
                 channel=channel_value,
                 intent=intent,
                 authority=authority,
+                route_mode=route_mode,
+                workflow=workflow,
             )
 
         self.local_state = (
@@ -889,6 +936,10 @@ class MaironApplication:
                     instructions=turn_instructions,
                     response_timer=response_timer,
                     channel=channel_value,
+                    intent=intent,
+                    authority=authority,
+                    route_mode=route_mode,
+                    workflow=workflow,
                 )
             )
 
@@ -918,6 +969,15 @@ class MaironApplication:
                 intent=intent,
                 authority=authority,
                 channel=channel_value,
+                diagnostics=self._build_turn_diagnostics(
+                    intent=intent,
+                    authority=authority,
+                    route_mode=route_mode,
+                    workflow=workflow,
+                    model_used="Pending cloud approval",
+                    status="cloud_approval_required",
+                    channel=channel_value,
+                ),
             )
 
         if result.status == (
@@ -933,6 +993,17 @@ class MaironApplication:
                     instructions=turn_instructions,
                     response_timer=response_timer,
                     channel=channel_value,
+                    intent=intent,
+                    authority=authority,
+                    route_mode=route_mode,
+                    workflow=workflow,
+                    agent_action=str(
+                        (result.pending_action or {}).get(
+                            "type",
+                            "",
+                        )
+                        or ""
+                    ).strip() or None,
                 )
             )
 
@@ -951,6 +1022,22 @@ class MaironApplication:
                 intent=intent,
                 authority=authority,
                 channel=channel_value,
+                diagnostics=self._build_turn_diagnostics(
+                    intent=intent,
+                    authority=authority,
+                    route_mode=route_mode,
+                    workflow=workflow,
+                    model_used=self.local_model_name,
+                    agent_action=str(
+                        (result.pending_action or {}).get(
+                            "type",
+                            "",
+                        )
+                        or ""
+                    ).strip() or None,
+                    status="action_approval_required",
+                    channel=channel_value,
+                ),
             )
 
         return self._finalize_router_response(
@@ -960,6 +1047,14 @@ class MaironApplication:
             channel=channel_value,
             intent=intent,
             authority=authority,
+            route_mode=route_mode,
+            workflow=workflow,
+            model_used=(
+                "GPT-5.6 Luna"
+                if text.lower() == "/cloud"
+                or text.lower().startswith("/cloud ")
+                else self.local_model_name
+            ),
         )
 
     # --------------------------------------------------
@@ -1081,6 +1176,17 @@ class MaironApplication:
                         pending.response_timer
                     ),
                     channel=pending.channel,
+                    intent=pending.intent,
+                    authority=pending.authority,
+                    route_mode=pending.route_mode,
+                    workflow=pending.workflow,
+                    agent_action=str(
+                        (result.pending_action or {}).get(
+                            "type",
+                            "",
+                        )
+                        or ""
+                    ).strip() or None,
                 )
             )
 
@@ -1098,7 +1204,25 @@ class MaironApplication:
                         result.pending_action
                     )
                 ),
+                intent=pending.intent,
+                authority=pending.authority,
                 channel=pending.channel,
+                diagnostics=self._build_turn_diagnostics(
+                    intent=pending.intent,
+                    authority=pending.authority,
+                    route_mode=pending.route_mode,
+                    workflow=pending.workflow,
+                    model_used=self.local_model_name,
+                    agent_action=str(
+                        (result.pending_action or {}).get(
+                            "type",
+                            "",
+                        )
+                        or ""
+                    ).strip() or None,
+                    status="action_approval_required",
+                    channel=pending.channel,
+                ),
             )
 
         return self._finalize_router_response(
@@ -1106,6 +1230,20 @@ class MaironApplication:
             result=result,
             timer=pending.response_timer,
             channel=pending.channel,
+            intent=pending.intent,
+            authority=pending.authority,
+            route_mode=pending.route_mode,
+            workflow=pending.workflow,
+            model_used=(
+                "GPT-5.6 Luna"
+                if pending.kind == "cloud" and approved
+                else (
+                    self.local_model_name
+                    if pending.kind == "cloud"
+                    else "Core action"
+                )
+            ),
+            agent_action=pending.agent_action,
         )
 
     # --------------------------------------------------
@@ -1121,6 +1259,9 @@ class MaironApplication:
         channel: str,
         intent: Optional[str],
         authority: Optional[str],
+        route_mode: Optional[str] = None,
+        workflow: Optional[str] = None,
+        agent_action: Optional[str] = None,
     ) -> ApplicationTurn:
         answer_value = str(
             answer
@@ -1148,6 +1289,10 @@ class MaironApplication:
             intent=intent,
             authority=authority,
             status="answered",
+            route_mode=route_mode,
+            workflow=workflow,
+            model_used="Core",
+            agent_action=agent_action,
         )
 
     def _finalize_router_response(
@@ -1159,6 +1304,10 @@ class MaironApplication:
         channel: str,
         intent: Optional[str] = None,
         authority: Optional[str] = None,
+        route_mode: Optional[str] = None,
+        workflow: Optional[str] = None,
+        model_used: Optional[str] = None,
+        agent_action: Optional[str] = None,
     ) -> ApplicationTurn:
         answer = str(
             getattr(
@@ -1182,6 +1331,13 @@ class MaironApplication:
             intent=intent,
             authority=authority,
             status="answered",
+            route_mode=route_mode,
+            workflow=workflow,
+            model_used=(
+                model_used
+                or self.local_model_name
+            ),
+            agent_action=agent_action,
         )
 
     def _finalize_error(
@@ -1193,6 +1349,10 @@ class MaironApplication:
         channel: str,
         intent: Optional[str] = None,
         authority: Optional[str] = None,
+        route_mode: Optional[str] = None,
+        workflow: Optional[str] = None,
+        model_used: Optional[str] = None,
+        agent_action: Optional[str] = None,
     ) -> ApplicationTurn:
         return self._record_final_turn(
             user_text=user_text,
@@ -1202,6 +1362,10 @@ class MaironApplication:
             intent=intent,
             authority=authority,
             status="error",
+            route_mode=route_mode,
+            workflow=workflow,
+            model_used=model_used,
+            agent_action=agent_action,
         )
 
     def _generate_semantic_title_for_first_turn(
@@ -1326,6 +1490,10 @@ class MaironApplication:
         intent: Optional[str],
         authority: Optional[str],
         status: str,
+        route_mode: Optional[str] = None,
+        workflow: Optional[str] = None,
+        model_used: Optional[str] = None,
+        agent_action: Optional[str] = None,
     ) -> ApplicationTurn:
         response_seconds = (
             timer.stop()
@@ -1406,11 +1574,54 @@ class MaironApplication:
             intent=intent,
             authority=authority,
             channel=channel,
+            diagnostics=self._build_turn_diagnostics(
+                intent=intent,
+                authority=authority,
+                route_mode=route_mode,
+                workflow=workflow,
+                model_used=model_used,
+                agent_action=agent_action,
+                status=status,
+                channel=channel,
+                response_seconds=response_seconds,
+            ),
         )
 
     # --------------------------------------------------
     # Helpers
     # --------------------------------------------------
+
+    def _build_turn_diagnostics(
+        self,
+        *,
+        intent: Optional[str],
+        authority: Optional[str],
+        route_mode: Optional[str],
+        workflow: Optional[str],
+        model_used: Optional[str],
+        status: str,
+        channel: str,
+        agent_action: Optional[str] = None,
+        response_seconds: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Return safe operational metadata for optional developer UI.
+
+        This deliberately excludes prompts, answers, model hidden reasoning,
+        raw evidence packets, OAuth data, and private tool payloads.
+        """
+
+        return {
+            "intent": str(intent or "").strip() or None,
+            "authority": str(authority or "").strip() or None,
+            "route_mode": str(route_mode or "").strip() or None,
+            "workflow": str(workflow or "").strip() or None,
+            "model": str(model_used or "").strip() or None,
+            "agent_action": str(agent_action or "").strip() or None,
+            "status": str(status or "").strip() or None,
+            "channel": str(channel or "").strip() or None,
+            "response_seconds": response_seconds,
+            "session_id": str(self.session_id or "")[:8] or None,
+        }
 
     def _describe_pending_action(
         self,

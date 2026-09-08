@@ -83,7 +83,7 @@ def run():
 
     # Menu control is packed before title label, reserving its horizontal slot.
     recent_start = app_source.index(
-        "        for session in sessions:"
+        "            for session in group_sessions:"
     )
 
     recent_end = app_source.index(

@@ -842,11 +842,47 @@ def delete_chat_session(
         )
 
 
+def _escape_like_value(
+    value: str,
+) -> str:
+    """
+    Escape SQLite LIKE wildcard characters so chat-history search behaves
+    like a literal substring search rather than exposing SQL pattern syntax.
+    """
+
+    return (
+        str(
+            value
+            or ""
+        )
+        .replace(
+            "\\",
+            "\\\\",
+        )
+        .replace(
+            "%",
+            "\\%",
+        )
+        .replace(
+            "_",
+            "\\_",
+        )
+    )
+
+
 def list_chat_sessions(
     *,
     limit: int = 12,
+    query: str | None = None,
     db_path=None,
 ) -> list[dict[str, Any]]:
+    """
+    Return recent saved chat sessions, optionally filtering by local history.
+
+    Search is entirely local and matches the persisted title plus user and
+    assistant transcript text. A query never leaves the machine.
+    """
+
     initialise_chat_sessions(
         db_path
     )
@@ -861,11 +897,55 @@ def list_chat_sessions(
         ),
     )
 
+    query_value = " ".join(
+        str(
+            query
+            or ""
+        ).split()
+    ).strip()
+
+    where_sql = ""
+    parameters: list[Any] = []
+
+    if query_value:
+        like_value = (
+            "%"
+            + _escape_like_value(
+                query_value
+            )
+            + "%"
+        )
+
+        where_sql = """
+            WHERE (
+                s.title LIKE ? ESCAPE '\\' COLLATE NOCASE
+                OR EXISTS (
+                    SELECT 1
+                    FROM chat_turns AS search_turn
+                    WHERE search_turn.session_id = s.session_id
+                      AND (
+                          search_turn.user_text LIKE ? ESCAPE '\\' COLLATE NOCASE
+                          OR search_turn.assistant_text LIKE ? ESCAPE '\\' COLLATE NOCASE
+                      )
+                )
+            )
+        """
+
+        parameters.extend([
+            like_value,
+            like_value,
+            like_value,
+        ])
+
+    parameters.append(
+        limit_value
+    )
+
     with _connection(
         db_path
     ) as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT
                 s.session_id,
                 s.created_at,
@@ -876,14 +956,13 @@ def list_chat_sessions(
             FROM chat_sessions AS s
             LEFT JOIN chat_turns AS t
                 ON t.session_id = s.session_id
+            {where_sql}
             GROUP BY s.session_id
             HAVING COUNT(t.id) > 0
             ORDER BY s.updated_at DESC
             LIMIT ?
             """,
-            (
-                limit_value,
-            ),
+            parameters,
         ).fetchall()
 
     return [

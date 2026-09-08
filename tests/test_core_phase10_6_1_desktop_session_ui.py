@@ -65,7 +65,7 @@ def run():
 
     for token in (
         "＋  New Chat",
-        'text="RECENT"',
+        'text="CHATS"',
         "recent_chats_frame",
         "def _new_chat(",
         "def _open_chat(",

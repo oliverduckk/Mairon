@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import queue
 import subprocess
@@ -17,6 +18,9 @@ from tkinter import messagebox
 from application_service import (
     ApplicationTurn,
     MaironApplication,
+)
+from continuity.chat_history import (
+    group_chat_sessions,
 )
 from core.desktop_agent_client import (
     ping_desktop_agent,
@@ -51,6 +55,19 @@ APP_ICON_PATH = (
     / "mairon.ico"
 )
 
+DESKTOP_UI_STATE_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "desktop_ui_state.json"
+)
+
+DEFAULT_SIDEBAR_WIDTH = 220
+MIN_SIDEBAR_WIDTH = 165
+MAX_SIDEBAR_WIDTH = 320
+SIDEBAR_SPLITTER_WIDTH = 10
+DIAGNOSTICS_PANEL_WIDTH = 270
+MAX_DIAGNOSTIC_EVENTS = 10
+
 CREATE_NO_WINDOW = getattr(
     subprocess,
     "CREATE_NO_WINDOW",
@@ -74,6 +91,106 @@ DWMWCP_ROUND = 2
 MAIRON_DWM_CAPTION_COLOR = 0x002F1B1A   # #1A1B2F
 MAIRON_DWM_TEXT_COLOR = 0x006349D4      # #D44963
 MAIRON_DWM_BORDER_COLOR = 0x00573134    # #343157
+
+
+def _clamp_sidebar_width(
+    value,
+) -> int:
+    try:
+        width = int(
+            value
+        )
+
+    except (TypeError, ValueError):
+        width = DEFAULT_SIDEBAR_WIDTH
+
+    return max(
+        MIN_SIDEBAR_WIDTH,
+        min(
+            MAX_SIDEBAR_WIDTH,
+            width,
+        ),
+    )
+
+
+def _load_sidebar_width(
+    path: Path = DESKTOP_UI_STATE_PATH,
+) -> int:
+    try:
+        payload = json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+    ):
+        return DEFAULT_SIDEBAR_WIDTH
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        return DEFAULT_SIDEBAR_WIDTH
+
+    return _clamp_sidebar_width(
+        payload.get(
+            "sidebar_width",
+            DEFAULT_SIDEBAR_WIDTH,
+        )
+    )
+
+
+def _save_sidebar_width(
+    width: int,
+    path: Path = DESKTOP_UI_STATE_PATH,
+) -> None:
+    payload = {}
+
+    try:
+        existing = json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if isinstance(
+            existing,
+            dict,
+        ):
+            payload.update(
+                existing
+            )
+
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+    ):
+        pass
+
+    payload[
+        "sidebar_width"
+    ] = _clamp_sidebar_width(
+        width
+    )
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    path.write_text(
+        json.dumps(
+            payload,
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _pick_font_family(
@@ -2221,6 +2338,19 @@ class MaironDesktopApp:
         self.thinking_step = 0
         self.thinking_after_id = None
 
+        self.sidebar_width = (
+            _load_sidebar_width()
+        )
+        self._sidebar_width_save_after_id = None
+        self._sidebar_restore_after_id = None
+
+        # Developer diagnostics are deliberately transient and off by default.
+        # They expose safe operational metadata only; prompts, answers, private
+        # evidence payloads and model hidden reasoning never enter this panel.
+        self.diagnostics_visible = False
+        self._diagnostic_events = []
+        self._last_turn_diagnostics = {}
+
         self._build_ui()
 
         if self.native_windows_chrome:
@@ -2290,45 +2420,123 @@ class MaironDesktopApp:
             sticky="nsew",
         )
 
+        self.body = body
+
         body.grid_rowconfigure(
             0,
             weight=1,
         )
-
         body.grid_columnconfigure(
-            1,
+            0,
             weight=1,
         )
 
-        self._build_sidebar(
-            body
+        panes = tk.PanedWindow(
+            body,
+            orient=tk.HORIZONTAL,
+            bg=self.theme[
+                "app_bg"
+            ],
+            bd=0,
+            borderwidth=0,
+            relief="flat",
+            sashwidth=SIDEBAR_SPLITTER_WIDTH,
+            sashpad=0,
+            sashrelief="flat",
+            sashcursor="sb_h_double_arrow",
+            showhandle=False,
+            opaqueresize=False,
+            proxybackground=self.theme[
+                "accent"
+            ],
+            proxyborderwidth=0,
+            proxyrelief="flat",
+        )
+        panes.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
         )
 
+        self.sidebar_panes = panes
+
+        self._build_sidebar(
+            panes,
+            manage_geometry=False,
+        )
         self._build_main_area(
-            body
+            panes,
+            manage_geometry=False,
+        )
+
+        panes.add(
+            self.sidebar,
+            minsize=MIN_SIDEBAR_WIDTH,
+            width=self.sidebar_width,
+            sticky="nsew",
+        )
+        panes.add(
+            self.main_area,
+            minsize=360,
+            sticky="nsew",
+        )
+
+        panes.bind(
+            "<ButtonRelease-1>",
+            self._on_sidebar_sash_release,
+            add="+",
+        )
+        panes.bind(
+            "<Double-Button-1>",
+            self._on_sidebar_sash_double_click,
+            add="+",
+        )
+
+        self._sidebar_restore_after_id = self.root.after_idle(
+            self._restore_sidebar_sash
         )
 
     def _build_sidebar(
         self,
         parent,
+        *,
+        manage_geometry: bool = True,
     ) -> None:
         sidebar = tk.Frame(
             parent,
             bg=self.theme[
                 "surface"
             ],
-            width=220,
+            width=self.sidebar_width,
         )
 
-        sidebar.grid(
-            row=0,
-            column=0,
-            sticky="nsw",
-        )
+        self.sidebar = sidebar
+
+        if manage_geometry:
+            sidebar.grid(
+                row=0,
+                column=0,
+                sticky="nsw",
+            )
 
         sidebar.grid_propagate(
             False
         )
+
+        # Keep system controls permanently reachable at ordinary/small window
+        # heights. The chat-history viewport is the flexible middle region;
+        # when vertical space gets tight it shrinks before footer controls do.
+        sidebar_footer = tk.Frame(
+            sidebar,
+            bg=self.theme[
+                "surface"
+            ],
+        )
+        sidebar_footer.pack(
+            side="bottom",
+            fill="x",
+        )
+        self.sidebar_footer = sidebar_footer
 
         heading = tk.Frame(
             sidebar,
@@ -2450,7 +2658,7 @@ class MaironDesktopApp:
 
         tk.Label(
             sidebar,
-            text="RECENT",
+            text="CHATS",
             bg=self.theme[
                 "surface"
             ],
@@ -2467,45 +2675,203 @@ class MaironDesktopApp:
             padx=20,
             pady=(
                 14,
-                4,
+                6,
             ),
         )
 
-        self.recent_chats_frame = tk.Frame(
+        self._history_search_placeholder = "Search chats..."
+        self._history_search_placeholder_active = True
+
+        self.history_search_var = tk.StringVar(
+            value=self._history_search_placeholder
+        )
+
+        search_shell = tk.Frame(
             sidebar,
             bg=self.theme[
-                "surface"
+                "surface_hover"
+            ],
+            highlightthickness=1,
+            highlightbackground=self.theme[
+                "border"
             ],
         )
 
-        self.recent_chats_frame.pack(
+        search_shell.pack(
             fill="x",
+            padx=14,
             pady=(
                 0,
                 8,
             ),
         )
 
-        self._sidebar_item(
-            sidebar,
-            "▣  Files",
-            suffix="soon",
+        tk.Label(
+            search_shell,
+            text="⌕",
+            bg=self.theme[
+                "surface_hover"
+            ],
+            fg=self.theme[
+                "text_muted"
+            ],
+            font=(
+                self.font_family,
+                11,
+            ),
+        ).pack(
+            side="left",
+            padx=(
+                8,
+                4,
+            ),
         )
 
-        spacer = tk.Frame(
+        self.history_search_entry = tk.Entry(
+            search_shell,
+            textvariable=self.history_search_var,
+            bg=self.theme[
+                "surface_hover"
+            ],
+            fg=self.theme[
+                "text_muted"
+            ],
+            insertbackground=self.theme[
+                "text_primary"
+            ],
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            font=(
+                self.font_family,
+                9,
+            ),
+        )
+
+        self.history_search_entry.pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(
+                0,
+                8,
+            ),
+            pady=7,
+        )
+
+        self.history_search_entry.bind(
+            "<FocusIn>",
+            self._on_history_search_focus_in,
+        )
+
+        self.history_search_entry.bind(
+            "<FocusOut>",
+            self._on_history_search_focus_out,
+        )
+
+        history_viewport = tk.Frame(
             sidebar,
             bg=self.theme[
                 "surface"
             ],
         )
 
-        spacer.pack(
+        history_viewport.pack(
+            fill="both",
+            expand=True,
+            pady=(
+                0,
+                6,
+            ),
+        )
+
+        self.recent_chats_canvas = tk.Canvas(
+            history_viewport,
+            bg=self.theme[
+                "surface"
+            ],
+            bd=0,
+            highlightthickness=0,
+            relief="flat",
+        )
+
+        self.recent_chats_canvas.pack(
+            side="left",
             fill="both",
             expand=True,
         )
 
+        self.recent_chats_scrollbar = ThemedScrollbar(
+            history_viewport,
+            command=(
+                self.recent_chats_canvas.yview_moveto
+            ),
+            theme=self.theme,
+            width=9,
+        )
+
+        self.recent_chats_scrollbar.pack(
+            side="right",
+            fill="y",
+            padx=(
+                0,
+                4,
+            ),
+        )
+
+        self.recent_chats_canvas.configure(
+            yscrollcommand=(
+                self.recent_chats_scrollbar.set
+            )
+        )
+
+        self.recent_chats_frame = tk.Frame(
+            self.recent_chats_canvas,
+            bg=self.theme[
+                "surface"
+            ],
+        )
+
+        self._recent_chats_window = (
+            self.recent_chats_canvas.create_window(
+                0,
+                0,
+                anchor="nw",
+                window=self.recent_chats_frame,
+            )
+        )
+
+        self.recent_chats_frame.bind(
+            "<Configure>",
+            self._on_recent_chats_frame_configure,
+        )
+
+        self.recent_chats_canvas.bind(
+            "<Configure>",
+            self._on_recent_chats_canvas_configure,
+        )
+
+        self.root.bind_all(
+            "<MouseWheel>",
+            self._on_recent_chats_mousewheel,
+            add="+",
+        )
+
+        self._history_search_after_id = None
+
+        self.history_search_var.trace_add(
+            "write",
+            self._on_history_search_changed,
+        )
+
+        self._sidebar_item(
+            sidebar_footer,
+            "▣  Files",
+            suffix="soon",
+        )
+
         tk.Label(
-            sidebar,
+            sidebar_footer,
             text="SYSTEM",
             bg=self.theme[
                 "surface"
@@ -2528,7 +2894,7 @@ class MaironDesktopApp:
         )
 
         self.agent_label = tk.Label(
-            sidebar,
+            sidebar_footer,
             text="●  Desktop Agent: checking",
             bg=self.theme[
                 "surface"
@@ -2550,7 +2916,7 @@ class MaironDesktopApp:
         )
 
         self.model_label = tk.Label(
-            sidebar,
+            sidebar_footer,
             text="Local model: starting",
             bg=self.theme[
                 "surface"
@@ -2576,14 +2942,18 @@ class MaironDesktopApp:
             ),
         )
 
+        self._build_diagnostics_toggle(
+            sidebar_footer
+        )
+
         self._sidebar_item(
-            sidebar,
+            sidebar_footer,
             "⚙  Themes",
             suffix="future",
         )
 
         tk.Label(
-            sidebar,
+            sidebar_footer,
             text="v0.1 • Phase 10",
             bg=self.theme[
                 "surface"
@@ -2602,6 +2972,288 @@ class MaironDesktopApp:
                 6,
                 18,
             ),
+        )
+
+    def _build_diagnostics_toggle(
+        self,
+        parent,
+    ) -> None:
+        row = tk.Frame(
+            parent,
+            bg=self.theme[
+                "surface"
+            ],
+            height=36,
+            cursor="hand2",
+        )
+
+        row.pack(
+            fill="x",
+            padx=12,
+            pady=(
+                0,
+                2,
+            ),
+        )
+        row.pack_propagate(
+            False
+        )
+
+        label = tk.Label(
+            row,
+            text="⌁  Diagnostics",
+            bg=self.theme[
+                "surface"
+            ],
+            fg=self.theme[
+                "text_secondary"
+            ],
+            font=(
+                self.font_family,
+                9,
+            ),
+            anchor="w",
+            cursor="hand2",
+        )
+        label.pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(
+                12,
+                4,
+            ),
+        )
+
+        state_label = tk.Label(
+            row,
+            text="off",
+            bg=self.theme[
+                "surface"
+            ],
+            fg=self.theme[
+                "text_muted"
+            ],
+            font=(
+                self.font_family,
+                8,
+            ),
+            cursor="hand2",
+        )
+        state_label.pack(
+            side="right",
+            padx=10,
+        )
+
+        self.diagnostics_toggle_row = row
+        self.diagnostics_toggle_label = label
+        self.diagnostics_toggle_state_label = state_label
+
+        for widget in (
+            row,
+            label,
+            state_label,
+        ):
+            widget.bind(
+                "<Button-1>",
+                lambda _event: self._toggle_diagnostics(),
+            )
+
+    def _toggle_diagnostics(
+        self,
+    ) -> None:
+        self._set_diagnostics_visible(
+            not self.diagnostics_visible
+        )
+
+    def _set_diagnostics_visible(
+        self,
+        visible: bool,
+    ) -> None:
+        self.diagnostics_visible = bool(
+            visible
+        )
+
+        panel = getattr(
+            self,
+            "diagnostics_panel",
+            None,
+        )
+
+        if panel is not None:
+            if self.diagnostics_visible:
+                panel.grid()
+                self._render_diagnostics_panel()
+            else:
+                panel.grid_remove()
+
+        state_label = getattr(
+            self,
+            "diagnostics_toggle_state_label",
+            None,
+        )
+
+        if state_label is not None:
+            state_label.config(
+                text=(
+                    "on"
+                    if self.diagnostics_visible
+                    else "off"
+                ),
+                fg=(
+                    self.theme[
+                        "accent"
+                    ]
+                    if self.diagnostics_visible
+                    else self.theme[
+                        "text_muted"
+                    ]
+                ),
+            )
+
+    def _restore_sidebar_sash(
+        self,
+    ) -> None:
+        self._sidebar_restore_after_id = None
+
+        try:
+            self.root.update_idletasks()
+            self.sidebar_panes.sash_place(
+                0,
+                _clamp_sidebar_width(
+                    self.sidebar_width
+                ),
+                0,
+            )
+        except tk.TclError:
+            pass
+
+    def _current_sidebar_sash_width(
+        self,
+    ) -> int:
+        try:
+            sash_x, _ = self.sidebar_panes.sash_coord(
+                0
+            )
+        except tk.TclError:
+            return _clamp_sidebar_width(
+                self.sidebar_width
+            )
+
+        return _clamp_sidebar_width(
+            sash_x
+        )
+
+    def _apply_sidebar_width(
+        self,
+        width,
+        *,
+        persist: bool = False,
+    ) -> None:
+        resolved = _clamp_sidebar_width(
+            width
+        )
+        self.sidebar_width = resolved
+
+        try:
+            self.sidebar_panes.sash_place(
+                0,
+                resolved,
+                0,
+            )
+        except tk.TclError:
+            self.sidebar.config(
+                width=resolved
+            )
+
+        if persist:
+            self._schedule_sidebar_width_save()
+
+    def _schedule_sidebar_width_save(
+        self,
+    ) -> None:
+        pending = getattr(
+            self,
+            "_sidebar_width_save_after_id",
+            None,
+        )
+
+        if pending is not None:
+            try:
+                self.root.after_cancel(
+                    pending
+                )
+            except Exception:
+                pass
+
+        self._sidebar_width_save_after_id = self.root.after(
+            250,
+            self._persist_sidebar_width,
+        )
+
+    def _persist_sidebar_width(
+        self,
+    ) -> None:
+        self._sidebar_width_save_after_id = None
+
+        try:
+            _save_sidebar_width(
+                self.sidebar_width
+            )
+        except OSError:
+            # UI preference persistence must never stop the desktop client.
+            pass
+
+    def _on_sidebar_sash_release(
+        self,
+        _event,
+    ) -> None:
+        resolved = self._current_sidebar_sash_width()
+        self.sidebar_width = resolved
+
+        # Let Tk own the drag gesture. With opaqueresize=False, only Tk's
+        # native proxy sash moves until release, so the expensive chat layout
+        # is not reflowed for every mouse-motion event.
+        try:
+            sash_x, _ = self.sidebar_panes.sash_coord(
+                0
+            )
+        except tk.TclError:
+            sash_x = resolved
+
+        if int(sash_x) != resolved:
+            try:
+                self.sidebar_panes.sash_place(
+                    0,
+                    resolved,
+                    0,
+                )
+            except tk.TclError:
+                pass
+
+        self._schedule_sidebar_width_save()
+
+    def _on_sidebar_sash_double_click(
+        self,
+        event,
+    ) -> None:
+        try:
+            sash_x, _ = self.sidebar_panes.sash_coord(
+                0
+            )
+        except tk.TclError:
+            return
+
+        # Do not make ordinary double-clicks inside either pane reset the
+        # sidebar. Only clicks landing on/very near the native sash count.
+        if abs(
+            int(event.x) - int(sash_x)
+        ) > (SIDEBAR_SPLITTER_WIDTH + 4):
+            return
+
+        self._apply_sidebar_width(
+            DEFAULT_SIDEBAR_WIDTH,
+            persist=True,
         )
 
     def _sidebar_item(
@@ -2718,6 +3370,8 @@ class MaironDesktopApp:
     def _build_main_area(
         self,
         parent,
+        *,
+        manage_geometry: bool = True,
     ) -> None:
         main = tk.Frame(
             parent,
@@ -2725,12 +3379,14 @@ class MaironDesktopApp:
                 "app_bg"
             ],
         )
+        self.main_area = main
 
-        main.grid(
-            row=0,
-            column=1,
-            sticky="nsew",
-        )
+        if manage_geometry:
+            main.grid(
+                row=0,
+                column=2,
+                sticky="nsew",
+            )
 
         main.grid_rowconfigure(
             1,
@@ -2740,6 +3396,10 @@ class MaironDesktopApp:
         main.grid_columnconfigure(
             0,
             weight=1,
+        )
+        main.grid_columnconfigure(
+            1,
+            weight=0,
         )
 
         header = tk.Frame(
@@ -2839,6 +3499,10 @@ class MaironDesktopApp:
                 0,
                 8,
             ),
+        )
+
+        self._build_diagnostics_panel(
+            main
         )
 
         self.thinking_panel = RoundedPanel(
@@ -3305,6 +3969,433 @@ class MaironDesktopApp:
             side="right",
         )
 
+    def _build_diagnostics_panel(
+        self,
+        parent,
+    ) -> None:
+        panel = tk.Frame(
+            parent,
+            bg=self.theme[
+                "surface"
+            ],
+            width=DIAGNOSTICS_PANEL_WIDTH,
+            highlightthickness=1,
+            highlightbackground=self.theme[
+                "border"
+            ],
+        )
+        panel.grid(
+            row=1,
+            column=1,
+            sticky="ns",
+            padx=(
+                0,
+                30,
+            ),
+            pady=(
+                0,
+                8,
+            ),
+        )
+        panel.grid_propagate(
+            False
+        )
+        panel.grid_remove()
+
+        self.diagnostics_panel = panel
+
+        header = tk.Frame(
+            panel,
+            bg=self.theme[
+                "surface"
+            ],
+        )
+        header.pack(
+            fill="x",
+            padx=14,
+            pady=(
+                12,
+                8,
+            ),
+        )
+
+        tk.Label(
+            header,
+            text="Developer diagnostics",
+            bg=self.theme[
+                "surface"
+            ],
+            fg=self.theme[
+                "text_primary"
+            ],
+            font=(
+                self.font_family,
+                9,
+                "bold",
+            ),
+        ).pack(
+            side="left"
+        )
+
+        tk.Button(
+            header,
+            text="×",
+            command=lambda: self._set_diagnostics_visible(
+                False
+            ),
+            bg=self.theme[
+                "surface"
+            ],
+            fg=self.theme[
+                "text_muted"
+            ],
+            activebackground=self.theme[
+                "surface_hover"
+            ],
+            activeforeground=self.theme[
+                "text_primary"
+            ],
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            font=(
+                self.font_family,
+                11,
+            ),
+        ).pack(
+            side="right"
+        )
+
+        tk.Label(
+            panel,
+            text=(
+                "Operational metadata only — no prompts, private payloads "
+                "or hidden model reasoning."
+            ),
+            bg=self.theme[
+                "surface"
+            ],
+            fg=self.theme[
+                "text_muted"
+            ],
+            justify="left",
+            anchor="w",
+            wraplength=(
+                DIAGNOSTICS_PANEL_WIDTH
+                - 28
+            ),
+            font=(
+                self.font_family,
+                7,
+            ),
+        ).pack(
+            fill="x",
+            padx=14,
+            pady=(
+                0,
+                10,
+            ),
+        )
+
+        fields = tk.Frame(
+            panel,
+            bg=self.theme[
+                "surface"
+            ],
+        )
+        fields.pack(
+            fill="x",
+            padx=14,
+        )
+        fields.grid_columnconfigure(
+            1,
+            weight=1,
+        )
+
+        self.diagnostics_value_labels = {}
+
+        for row_index, (key, label_text) in enumerate((
+            ("intent", "Intent"),
+            ("authority", "Authority"),
+            ("route_mode", "Mode"),
+            ("workflow", "Workflow"),
+            ("model", "Model"),
+            ("agent_action", "Agent action"),
+            ("status", "Status"),
+            ("channel", "Channel"),
+            ("response_seconds", "Response"),
+            ("session_id", "Session"),
+        )):
+            tk.Label(
+                fields,
+                text=label_text,
+                bg=self.theme[
+                    "surface"
+                ],
+                fg=self.theme[
+                    "text_muted"
+                ],
+                anchor="w",
+                font=(
+                    self.font_family,
+                    7,
+                    "bold",
+                ),
+            ).grid(
+                row=row_index,
+                column=0,
+                sticky="nw",
+                padx=(
+                    0,
+                    10,
+                ),
+                pady=2,
+            )
+
+            value_label = tk.Label(
+                fields,
+                text="—",
+                bg=self.theme[
+                    "surface"
+                ],
+                fg=self.theme[
+                    "text_secondary"
+                ],
+                justify="left",
+                anchor="w",
+                wraplength=150,
+                font=(
+                    self.font_family,
+                    7,
+                ),
+            )
+            value_label.grid(
+                row=row_index,
+                column=1,
+                sticky="ew",
+                pady=2,
+            )
+            self.diagnostics_value_labels[
+                key
+            ] = value_label
+
+        tk.Label(
+            panel,
+            text="RECENT EVENTS",
+            bg=self.theme[
+                "surface"
+            ],
+            fg=self.theme[
+                "text_muted"
+            ],
+            font=(
+                self.font_family,
+                7,
+                "bold",
+            ),
+        ).pack(
+            anchor="w",
+            padx=14,
+            pady=(
+                14,
+                5,
+            ),
+        )
+
+        event_text = tk.Text(
+            panel,
+            height=9,
+            bg=self.theme[
+                "surface_hover"
+            ],
+            fg=self.theme[
+                "text_secondary"
+            ],
+            selectbackground=self.theme[
+                "border"
+            ],
+            relief="flat",
+            bd=0,
+            wrap="word",
+            state="disabled",
+            cursor="arrow",
+            font=(
+                self.font_family,
+                7,
+            ),
+        )
+        event_text.pack(
+            fill="both",
+            expand=True,
+            padx=14,
+            pady=(
+                0,
+                14,
+            ),
+        )
+        self.diagnostics_event_text = event_text
+
+    def _record_diagnostic_event(
+        self,
+        text: str,
+    ) -> None:
+        value = str(
+            text
+            or ""
+        ).strip()
+
+        safe_prefixes = (
+            "[Core]",
+            "[Context]",
+            "[Grounding]",
+            "[Research]",
+            "[AI]",
+            "[Desktop Agent]",
+            "[Tool]",
+            "[Session]",
+            "[Timing]",
+        )
+
+        if not value.startswith(
+            safe_prefixes
+        ):
+            return
+
+        # Keep the panel operational rather than becoming a raw log viewer.
+        # Long/private payloads are never accepted here.
+        value = value[:180]
+
+        self._diagnostic_events.append(
+            value
+        )
+        self._diagnostic_events = (
+            self._diagnostic_events[
+                -MAX_DIAGNOSTIC_EVENTS:
+            ]
+        )
+
+        if self.diagnostics_visible:
+            self._render_diagnostics_panel()
+
+    def _update_turn_diagnostics(
+        self,
+        result: ApplicationTurn,
+    ) -> None:
+        data = dict(
+            result.diagnostics
+            or {}
+        )
+
+        if not data.get(
+            "intent"
+        ):
+            data[
+                "intent"
+            ] = result.intent
+
+        if not data.get(
+            "authority"
+        ):
+            data[
+                "authority"
+            ] = result.authority
+
+        if data.get(
+            "response_seconds"
+        ) is None:
+            data[
+                "response_seconds"
+            ] = result.response_seconds
+
+        if not data.get(
+            "status"
+        ):
+            data[
+                "status"
+            ] = result.status
+
+        if not data.get(
+            "channel"
+        ):
+            data[
+                "channel"
+            ] = result.channel
+
+        self._last_turn_diagnostics = data
+
+        if self.diagnostics_visible:
+            self._render_diagnostics_panel()
+
+    def _render_diagnostics_panel(
+        self,
+    ) -> None:
+        labels = getattr(
+            self,
+            "diagnostics_value_labels",
+            {},
+        )
+        data = dict(
+            self._last_turn_diagnostics
+            or {}
+        )
+
+        for key, label in labels.items():
+            value = data.get(
+                key
+            )
+
+            if (
+                key == "response_seconds"
+                and value is not None
+            ):
+                try:
+                    value = f"{float(value):.2f}s"
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    pass
+
+            text = str(
+                value
+                if value not in {
+                    None,
+                    "",
+                }
+                else "—"
+            )
+
+            label.config(
+                text=text
+            )
+
+        event_text = getattr(
+            self,
+            "diagnostics_event_text",
+            None,
+        )
+
+        if event_text is None:
+            return
+
+        event_text.config(
+            state="normal"
+        )
+        event_text.delete(
+            "1.0",
+            "end",
+        )
+        event_text.insert(
+            "1.0",
+            "\n".join(
+                self._diagnostic_events
+            )
+            or "No diagnostic events yet.",
+        )
+        event_text.config(
+            state="disabled"
+        )
+
     # --------------------------------------------------
     # Bootstrap
     # --------------------------------------------------
@@ -3401,8 +4492,227 @@ class MaironDesktopApp:
             )
             return
 
+    def _on_recent_chats_frame_configure(
+        self,
+        event=None,
+    ) -> None:
+        if not hasattr(
+            self,
+            "recent_chats_canvas",
+        ):
+            return
+
+        bbox = self.recent_chats_canvas.bbox(
+            "all"
+        )
+
+        self.recent_chats_canvas.configure(
+            scrollregion=(
+                bbox
+                or (
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            )
+        )
+
+    def _on_recent_chats_canvas_configure(
+        self,
+        event,
+    ) -> None:
+        if not hasattr(
+            self,
+            "_recent_chats_window",
+        ):
+            return
+
+        self.recent_chats_canvas.itemconfigure(
+            self._recent_chats_window,
+            width=max(
+                1,
+                int(
+                    event.width
+                ),
+            ),
+        )
+
+    def _pointer_is_over_recent_chats(
+        self,
+    ) -> bool:
+        if not hasattr(
+            self,
+            "recent_chats_canvas",
+        ):
+            return False
+
+        try:
+            x, y = self.root.winfo_pointerxy()
+            widget = self.root.winfo_containing(
+                x,
+                y,
+            )
+
+            while widget is not None:
+                if widget is self.recent_chats_canvas:
+                    return True
+
+                widget = getattr(
+                    widget,
+                    "master",
+                    None,
+                )
+
+        except Exception:
+            return False
+
+        return False
+
+    def _on_recent_chats_mousewheel(
+        self,
+        event,
+    ):
+        if not self._pointer_is_over_recent_chats():
+            return None
+
+        delta = int(
+            event.delta
+            or 0
+        )
+
+        if delta == 0:
+            return None
+
+        steps = int(
+            -1
+            * (
+                delta
+                / 120
+            )
+        )
+
+        if steps == 0:
+            steps = (
+                -1
+                if delta > 0
+                else 1
+            )
+
+        self.recent_chats_canvas.yview_scroll(
+            steps,
+            "units",
+        )
+
+        return "break"
+
+    def _history_search_query(
+        self,
+    ) -> str:
+        if (
+            not hasattr(
+                self,
+                "history_search_var",
+            )
+            or getattr(
+                self,
+                "_history_search_placeholder_active",
+                False,
+            )
+        ):
+            return ""
+
+        return str(
+            self.history_search_var.get()
+            or ""
+        ).strip()
+
+    def _on_history_search_focus_in(
+        self,
+        event=None,
+    ) -> None:
+        if not getattr(
+            self,
+            "_history_search_placeholder_active",
+            False,
+        ):
+            return
+
+        self._history_search_placeholder_active = False
+
+        self.history_search_var.set(
+            ""
+        )
+
+        self.history_search_entry.config(
+            fg=self.theme[
+                "text_primary"
+            ]
+        )
+
+    def _on_history_search_focus_out(
+        self,
+        event=None,
+    ) -> None:
+        if self._history_search_query():
+            return
+
+        self._history_search_placeholder_active = True
+
+        self.history_search_var.set(
+            self._history_search_placeholder
+        )
+
+        self.history_search_entry.config(
+            fg=self.theme[
+                "text_muted"
+            ]
+        )
+
+    def _on_history_search_changed(
+        self,
+        *args,
+    ) -> None:
+        if not hasattr(
+            self,
+            "history_search_var",
+        ):
+            return
+
+        if getattr(
+            self,
+            "_history_search_placeholder_active",
+            False,
+        ):
+            return
+
+        previous = getattr(
+            self,
+            "_history_search_after_id",
+            None,
+        )
+
+        if previous is not None:
+            try:
+                self.root.after_cancel(
+                    previous
+                )
+            except Exception:
+                pass
+
+        self._history_search_after_id = (
+            self.root.after(
+                120,
+                lambda: self._refresh_recent_chats(
+                    reset_scroll=True
+                ),
+            )
+        )
+
     def _refresh_recent_chats(
         self,
+        *,
+        reset_scroll: bool = False,
     ) -> None:
         if (
             self.application is None
@@ -3413,6 +4723,24 @@ class MaironDesktopApp:
         ):
             return
 
+        query = self._history_search_query()
+
+        previous_scroll = 0.0
+
+        if (
+            not reset_scroll
+            and hasattr(
+                self,
+                "recent_chats_canvas",
+            )
+        ):
+            try:
+                previous_scroll = float(
+                    self.recent_chats_canvas.yview()[0]
+                )
+            except Exception:
+                previous_scroll = 0.0
+
         for child in self.recent_chats_frame.winfo_children():
             try:
                 child.destroy()
@@ -3421,19 +4749,29 @@ class MaironDesktopApp:
 
         try:
             sessions = self.application.recent_chats(
-                limit=6
+                limit=100,
+                query=(
+                    query
+                    or None
+                ),
             )
         except Exception as exc:
             self._append_system_message(
-                "Could not load recent chats: "
+                "Could not load chat history: "
                 + str(exc)
             )
             return
 
         if not sessions:
+            empty_text = (
+                "No chats match your search"
+                if query
+                else "No saved chats yet"
+            )
+
             tk.Label(
                 self.recent_chats_frame,
-                text="No saved chats yet",
+                text=empty_text,
                 bg=self.theme[
                     "surface"
                 ],
@@ -3445,176 +4783,234 @@ class MaironDesktopApp:
                     8,
                 ),
                 anchor="w",
+                wraplength=170,
+                justify="left",
             ).pack(
                 fill="x",
-                padx=24,
-                pady=4,
+                padx=20,
+                pady=8,
             )
+
+            self._on_recent_chats_frame_configure()
+
+            if hasattr(
+                self,
+                "recent_chats_canvas",
+            ):
+                self.recent_chats_canvas.yview_moveto(
+                    0.0
+                )
+
             return
 
-        for session in sessions:
-            session_id = str(
-                session.get(
-                    "session_id",
-                    "",
-                )
-                or ""
-            )
+        grouped_sessions = group_chat_sessions(
+            sessions
+        )
 
-            title = str(
-                session.get(
-                    "title",
-                    "New Chat",
-                )
-                or "New Chat"
-            )
+        for group_name, group_sessions in grouped_sessions:
+            if not group_sessions:
+                continue
 
-            selected = (
-                session_id
-                == self.current_session_id
-            )
-
-            bg = (
-                self.theme[
-                    "surface_hover"
-                ]
-                if selected
-                else self.theme[
-                    "surface"
-                ]
-            )
-
-            fg = (
-                self.theme[
-                    "accent"
-                ]
-                if selected
-                else self.theme[
-                    "text_secondary"
-                ]
-            )
-
-            row = tk.Frame(
+            tk.Label(
                 self.recent_chats_frame,
-                bg=bg,
-                height=34,
-                cursor="hand2",
-            )
-
-            row.pack(
-                fill="x",
-                padx=12,
-                pady=1,
-            )
-
-            row.pack_propagate(
-                False
-            )
-
-            display_title = title
-
-            if len(
-                display_title
-            ) > 24:
-                display_title = (
-                    display_title[
-                        :23
-                    ].rstrip()
-                    + "…"
-                )
-
-            # Pack the menu control first so it always reserves its own space.
-            menu_button = tk.Label(
-                row,
-                text="⋯",
-                bg=bg,
+                text=group_name,
+                bg=self.theme[
+                    "surface"
+                ],
                 fg=self.theme[
                     "text_muted"
                 ],
                 font=(
                     self.font_family,
-                    12,
+                    7,
                     "bold",
                 ),
-                cursor="hand2",
-            )
-
-            menu_button.pack(
-                side="right",
-                padx=8,
-            )
-
-            label = tk.Label(
-                row,
-                text=display_title,
-                bg=bg,
-                fg=fg,
                 anchor="w",
-                font=(
-                    self.font_family,
-                    9,
-                    "bold"
+            ).pack(
+                fill="x",
+                padx=20,
+                pady=(
+                    8,
+                    2,
+                ),
+            )
+
+            for session in group_sessions:
+                session_id = str(
+                    session.get(
+                        "session_id",
+                        "",
+                    )
+                    or ""
+                )
+
+                title = str(
+                    session.get(
+                        "title",
+                        "New Chat",
+                    )
+                    or "New Chat"
+                )
+
+                selected = (
+                    session_id
+                    == self.current_session_id
+                )
+
+                bg = (
+                    self.theme[
+                        "surface_hover"
+                    ]
                     if selected
-                    else "normal",
-                ),
-                cursor="hand2",
-            )
+                    else self.theme[
+                        "surface"
+                    ]
+                )
 
-            label.pack(
-                side="left",
-                fill="both",
-                expand=True,
-                padx=(
-                    12,
-                    4,
-                ),
-            )
+                fg = (
+                    self.theme[
+                        "accent"
+                    ]
+                    if selected
+                    else self.theme[
+                        "text_secondary"
+                    ]
+                )
 
-            row.bind(
-                "<Button-3>",
-                lambda event, sid=session_id, title_value=title: (
-                    self._show_chat_menu(
-                        event,
-                        sid,
-                        title_value,
+                row = tk.Frame(
+                    self.recent_chats_frame,
+                    bg=bg,
+                    height=34,
+                    cursor="hand2",
+                )
+
+                row.pack(
+                    fill="x",
+                    padx=10,
+                    pady=1,
+                )
+
+                row.pack_propagate(
+                    False
+                )
+
+                display_title = title
+
+                if len(
+                    display_title
+                ) > 24:
+                    display_title = (
+                        display_title[
+                            :23
+                        ].rstrip()
+                        + "…"
                     )
-                ),
-            )
 
-            label.bind(
-                "<Button-3>",
-                lambda event, sid=session_id, title_value=title: (
-                    self._show_chat_menu(
-                        event,
-                        sid,
-                        title_value,
-                    )
-                ),
-            )
+                menu_button = tk.Label(
+                    row,
+                    text="⋯",
+                    bg=bg,
+                    fg=self.theme[
+                        "text_muted"
+                    ],
+                    font=(
+                        self.font_family,
+                        12,
+                        "bold",
+                    ),
+                    cursor="hand2",
+                )
 
-            menu_button.bind(
-                "<Button-1>",
-                lambda event, sid=session_id, title_value=title: (
-                    self._show_chat_menu(
-                        event,
-                        sid,
-                        title_value,
-                    )
-                ),
-            )
+                menu_button.pack(
+                    side="right",
+                    padx=8,
+                )
 
-            row.bind(
-                "<Button-1>",
-                lambda event, sid=session_id: self._open_chat(
-                    sid
-                ),
-            )
+                label = tk.Label(
+                    row,
+                    text=display_title,
+                    bg=bg,
+                    fg=fg,
+                    anchor="w",
+                    font=(
+                        self.font_family,
+                        9,
+                        "bold"
+                        if selected
+                        else "normal",
+                    ),
+                    cursor="hand2",
+                )
 
-            label.bind(
-                "<Button-1>",
-                lambda event, sid=session_id: self._open_chat(
-                    sid
-                ),
+                label.pack(
+                    side="left",
+                    fill="both",
+                    expand=True,
+                    padx=(
+                        12,
+                        4,
+                    ),
+                )
+
+                row.bind(
+                    "<Button-3>",
+                    lambda event, sid=session_id, title_value=title: (
+                        self._show_chat_menu(
+                            event,
+                            sid,
+                            title_value,
+                        )
+                    ),
+                )
+
+                label.bind(
+                    "<Button-3>",
+                    lambda event, sid=session_id, title_value=title: (
+                        self._show_chat_menu(
+                            event,
+                            sid,
+                            title_value,
+                        )
+                    ),
+                )
+
+                menu_button.bind(
+                    "<Button-1>",
+                    lambda event, sid=session_id, title_value=title: (
+                        self._show_chat_menu(
+                            event,
+                            sid,
+                            title_value,
+                        )
+                    ),
+                )
+
+                row.bind(
+                    "<Button-1>",
+                    lambda event, sid=session_id: self._open_chat(
+                        sid
+                    ),
+                )
+
+                label.bind(
+                    "<Button-1>",
+                    lambda event, sid=session_id: self._open_chat(
+                        sid
+                    ),
+                )
+
+        self._on_recent_chats_frame_configure()
+
+        if hasattr(
+            self,
+            "recent_chats_canvas",
+        ):
+            self.root.update_idletasks()
+
+            self.recent_chats_canvas.yview_moveto(
+                0.0
+                if reset_scroll
+                else previous_scroll
             )
 
     def _show_chat_menu(
@@ -4446,6 +5842,15 @@ class MaironDesktopApp:
         )
 
         if kind == "agent_status":
+            self._record_diagnostic_event(
+                "[Desktop Agent] "
+                + (
+                    "connected"
+                    if payload
+                    else "unavailable"
+                )
+            )
+
             if payload:
                 self.agent_label.config(
                     text=(
@@ -4726,6 +6131,10 @@ class MaironDesktopApp:
                 or ""
             )
 
+            self._record_diagnostic_event(
+                text
+            )
+
             # When launched from VS Code/PowerShell this keeps application-
             # service/Core diagnostics visible. pythonw.exe simply has no
             # console to display them, which is harmless.
@@ -4758,6 +6167,10 @@ class MaironDesktopApp:
         self,
         result: ApplicationTurn,
     ) -> None:
+        self._update_turn_diagnostics(
+            result
+        )
+
         if result.status in {
             "cloud_approval_required",
             "action_approval_required",
@@ -5159,6 +6572,14 @@ class MaironDesktopApp:
         self,
     ) -> None:
         self._hide_thinking()
+
+        try:
+            _save_sidebar_width(
+                self.sidebar_width
+            )
+
+        except OSError:
+            pass
 
         try:
             self.voice_runtime.cancel_recording()
