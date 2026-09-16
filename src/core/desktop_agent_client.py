@@ -21,6 +21,8 @@ from core.desktop_agent_protocol import (
     decode_json,
     encode_json,
     load_or_create_agent_secret,
+    node_supports_action as node_descriptor_supports_action,
+    normalise_node_descriptor,
 )
 
 
@@ -278,6 +280,107 @@ def ping_desktop_agent(
         action="ping",
         args={},
         **kwargs,
+    )
+
+
+def describe_desktop_node(
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Perform the authenticated capability handshake with the Windows node.
+    """
+
+    result = call_desktop_agent(
+        action="describe_node",
+        args={},
+        **kwargs,
+    )
+
+    if result.get(
+        "success"
+    ) is not True:
+        return result
+
+    try:
+        node = normalise_node_descriptor(
+            result.get(
+                "node"
+            )
+        )
+
+    except ValueError as exc:
+        return {
+            "success": False,
+            "status": "invalid_node_descriptor",
+            "message": str(
+                exc
+            ),
+        }
+
+    return {
+        **result,
+        "node": node,
+    }
+
+
+def probe_desktop_node(
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Return one Core-friendly availability result.
+
+    Unreachable transport is represented as an unavailable node rather than a
+    fabricated descriptor.
+    """
+
+    result = describe_desktop_node(
+        **kwargs,
+    )
+
+    if result.get(
+        "success"
+    ) is not True:
+        return {
+            **result,
+            "available": False,
+            "node": None,
+        }
+
+    return {
+        **result,
+        "available": True,
+    }
+
+
+def desktop_node_supports_action(
+    node_or_probe: Any,
+    action: str,
+) -> bool:
+    """
+    Check one action against authenticated advertised node capabilities.
+
+    Accept either the raw descriptor or the result from probe_desktop_node().
+    """
+
+    candidate = node_or_probe
+
+    if isinstance(
+        node_or_probe,
+        dict,
+    ):
+        nested = node_or_probe.get(
+            "node"
+        )
+
+        if isinstance(
+            nested,
+            dict,
+        ):
+            candidate = nested
+
+    return node_descriptor_supports_action(
+        candidate,
+        action,
     )
 
 

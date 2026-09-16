@@ -1,6 +1,7 @@
 import hmac
 import json
 import os
+import re
 import secrets
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -13,8 +14,43 @@ MAX_REQUEST_BYTES = 64 * 1024
 
 TOKEN_HEADER = "X-Mairon-Agent-Token"
 
+NODE_DESCRIPTOR_VERSION = "1"
+DEFAULT_DESKTOP_NODE_ID = "windows_desktop"
+DESKTOP_NODE_TYPE = "desktop"
+DESKTOP_NODE_PLATFORM = "windows"
+DESKTOP_NODE_TRANSPORT_SCOPE = "localhost_only"
+
+DESKTOP_CAPABILITY_ACTIONS = {
+    "application_control": {
+        "launch_application",
+        "close_application",
+        "focus_application",
+    },
+    "trusted_browser": {
+        "open_trusted_browser_site",
+    },
+    "approved_local_files": {
+        "search_approved_local_files",
+        "open_approved_local_path",
+        "open_trusted_folder",
+    },
+    "steam_library": {
+        "list_installed_steam_games",
+        "launch_steam_game_appid",
+    },
+}
+
+KNOWN_DESKTOP_CAPABILITIES = frozenset(
+    DESKTOP_CAPABILITY_ACTIONS.keys()
+)
+
+_NODE_ID_PATTERN = re.compile(
+    r"^[a-z0-9][a-z0-9_.-]{0,63}$"
+)
+
 ALLOWED_ACTIONS = {
     "ping",
+    "describe_node",
     "launch_application",
     "close_application",
     "focus_application",
@@ -25,6 +61,349 @@ ALLOWED_ACTIONS = {
     "launch_steam_game_appid",
     "open_trusted_folder",
 }
+
+
+def get_desktop_node_id() -> str:
+    """
+    Resolve the stable logical identity of this Windows capability node.
+
+    Phase 10.10.1 still uses localhost-only transport, but Core no longer
+    needs to equate "the desktop" with one hard-coded socket endpoint.
+    """
+
+    value = str(
+        os.environ.get(
+            "MAIRON_DESKTOP_NODE_ID",
+            DEFAULT_DESKTOP_NODE_ID,
+        )
+        or ""
+    ).strip().lower()
+
+    if not value:
+        value = DEFAULT_DESKTOP_NODE_ID
+
+    if not _NODE_ID_PATTERN.fullmatch(
+        value
+    ):
+        raise ValueError(
+            "MAIRON_DESKTOP_NODE_ID must use 1-64 lowercase letters, "
+            "numbers, dots, underscores, or hyphens."
+        )
+
+    return value
+
+
+def build_desktop_node_descriptor(
+    node_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Build the safe authenticated capability descriptor returned to Core.
+
+    The descriptor intentionally contains no secrets, filesystem paths,
+    executable paths, shell authority, private user data, or model state.
+    """
+
+    resolved_node_id = (
+        str(
+            node_id
+            or ""
+        ).strip().lower()
+        or get_desktop_node_id()
+    )
+
+    if not _NODE_ID_PATTERN.fullmatch(
+        resolved_node_id
+    ):
+        raise ValueError(
+            "Desktop node_id is invalid."
+        )
+
+    return {
+        "schema_version": NODE_DESCRIPTOR_VERSION,
+        "node_id": resolved_node_id,
+        "node_type": DESKTOP_NODE_TYPE,
+        "platform": DESKTOP_NODE_PLATFORM,
+        "protocol_version": PROTOCOL_VERSION,
+        "transport_scope": DESKTOP_NODE_TRANSPORT_SCOPE,
+        "available": True,
+        "status": "online",
+        "capabilities": list(
+            DESKTOP_CAPABILITY_ACTIONS.keys()
+        ),
+        "power": {
+            # Wake-on-LAN is intentionally NOT enabled merely because the
+            # future architecture may use it. Capability must be truthful.
+            "wake_supported": False,
+        },
+    }
+
+
+def normalise_node_descriptor(
+    payload: Any,
+) -> Dict[str, Any]:
+    """
+    Validate an Agent-supplied node descriptor before Core trusts it.
+
+    Phase 10.10.1 accepts only the current localhost Windows node contract.
+    Future remote/Pi transport can version this boundary rather than silently
+    broadening today's trust assumptions.
+    """
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        raise ValueError(
+            "Desktop node descriptor must be a JSON object."
+        )
+
+    schema_version = str(
+        payload.get(
+            "schema_version",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if schema_version != NODE_DESCRIPTOR_VERSION:
+        raise ValueError(
+            "Unsupported desktop node descriptor version."
+        )
+
+    node_id = str(
+        payload.get(
+            "node_id",
+            "",
+        )
+        or ""
+    ).strip().lower()
+
+    if not _NODE_ID_PATTERN.fullmatch(
+        node_id
+    ):
+        raise ValueError(
+            "Desktop node descriptor has an invalid node_id."
+        )
+
+    node_type = str(
+        payload.get(
+            "node_type",
+            "",
+        )
+        or ""
+    ).strip().lower()
+
+    if node_type != DESKTOP_NODE_TYPE:
+        raise ValueError(
+            "Desktop node descriptor has an unsupported node_type."
+        )
+
+    platform = str(
+        payload.get(
+            "platform",
+            "",
+        )
+        or ""
+    ).strip().lower()
+
+    if platform != DESKTOP_NODE_PLATFORM:
+        raise ValueError(
+            "Desktop node descriptor has an unsupported platform."
+        )
+
+    protocol_version = str(
+        payload.get(
+            "protocol_version",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if protocol_version != PROTOCOL_VERSION:
+        raise ValueError(
+            "Desktop node descriptor protocol version does not match Core."
+        )
+
+    transport_scope = str(
+        payload.get(
+            "transport_scope",
+            "",
+        )
+        or ""
+    ).strip().lower()
+
+    if transport_scope != DESKTOP_NODE_TRANSPORT_SCOPE:
+        raise ValueError(
+            "Desktop node descriptor attempted an unsupported transport scope."
+        )
+
+    if payload.get(
+        "available"
+    ) is not True:
+        raise ValueError(
+            "Desktop node descriptor did not report the node online."
+        )
+
+    status = str(
+        payload.get(
+            "status",
+            "",
+        )
+        or ""
+    ).strip().lower()
+
+    if status != "online":
+        raise ValueError(
+            "Desktop node descriptor has an invalid availability status."
+        )
+
+    capabilities_raw = payload.get(
+        "capabilities"
+    )
+
+    if not isinstance(
+        capabilities_raw,
+        list,
+    ):
+        raise ValueError(
+            "Desktop node capabilities must be a list."
+        )
+
+    capabilities = []
+
+    for item in capabilities_raw:
+        capability = str(
+            item
+            or ""
+        ).strip().lower()
+
+        if (
+            not capability
+            or capability not in KNOWN_DESKTOP_CAPABILITIES
+        ):
+            raise ValueError(
+                "Desktop node advertised an unknown capability."
+            )
+
+        if capability not in capabilities:
+            capabilities.append(
+                capability
+            )
+
+    power = payload.get(
+        "power"
+    )
+
+    if not isinstance(
+        power,
+        dict,
+    ):
+        raise ValueError(
+            "Desktop node power metadata must be an object."
+        )
+
+    wake_supported = power.get(
+        "wake_supported"
+    )
+
+    if not isinstance(
+        wake_supported,
+        bool,
+    ):
+        raise ValueError(
+            "Desktop node wake_supported must be boolean."
+        )
+
+    return {
+        "schema_version": NODE_DESCRIPTOR_VERSION,
+        "node_id": node_id,
+        "node_type": DESKTOP_NODE_TYPE,
+        "platform": DESKTOP_NODE_PLATFORM,
+        "protocol_version": PROTOCOL_VERSION,
+        "transport_scope": DESKTOP_NODE_TRANSPORT_SCOPE,
+        "available": True,
+        "status": "online",
+        "capabilities": capabilities,
+        "power": {
+            "wake_supported": wake_supported,
+        },
+    }
+
+
+def required_capability_for_action(
+    action: str,
+) -> Optional[str]:
+    """
+    Return the capability Core must see before dispatching one action.
+
+    Control-plane actions are authenticated but do not require a workload
+    capability.
+    """
+
+    action_value = str(
+        action
+        or ""
+    ).strip().lower()
+
+    if action_value in {
+        "ping",
+        "describe_node",
+    }:
+        return None
+
+    for (
+        capability,
+        actions,
+    ) in DESKTOP_CAPABILITY_ACTIONS.items():
+        if action_value in actions:
+            return capability
+
+    return None
+
+
+def node_supports_action(
+    node_descriptor: Any,
+    action: str,
+) -> bool:
+    """
+    Fail-closed capability check for Core-side dispatch decisions.
+    """
+
+    action_value = str(
+        action
+        or ""
+    ).strip().lower()
+
+    if action_value not in ALLOWED_ACTIONS:
+        return False
+
+    try:
+        node = normalise_node_descriptor(
+            node_descriptor
+        )
+
+    except ValueError:
+        return False
+
+    if action_value in {
+        "ping",
+        "describe_node",
+    }:
+        return True
+
+    capability = required_capability_for_action(
+        action_value
+    )
+
+    if not capability:
+        return False
+
+    return capability in set(
+        node.get(
+            "capabilities",
+            [],
+        )
+    )
 
 
 def get_agent_secret_path() -> Path:
@@ -229,10 +608,13 @@ def validate_request(
             "args must be a JSON object."
         )
 
-    if action == "ping":
+    if action in {
+        "ping",
+        "describe_node",
+    }:
         if args:
             raise ValueError(
-                "ping does not accept arguments."
+                f"{action} does not accept arguments."
             )
 
     elif action == "open_trusted_folder":

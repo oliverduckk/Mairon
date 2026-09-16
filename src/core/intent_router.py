@@ -2,6 +2,9 @@ import re
 from typing import Optional
 
 from core.turn_state import TurnState
+from core.seriousness import (
+    assess_consequential_advice,
+)
 from core.arithmetic import (
     extract_arithmetic_request,
 )
@@ -19,6 +22,11 @@ from core.file_catalog import (
 )
 from core.steam_library import (
     resolve_steam_candidate_confirmation,
+)
+from core.debate_state import (
+    extract_pairwise_comparison,
+    looks_like_debate_continuation,
+    pairwise_subject_from_hint,
 )
 
 
@@ -496,6 +504,18 @@ RECOMMENDATION_REQUEST_PATTERNS = [
     r"\bany suggestions\b",
     r"\bwhat shoes should\b",
     r"\bwhat would you buy\b",
+
+    # Phase 11.2.1 — ordinary recommendation/advice-shaped questions should
+    # not fall through to generic factual routing merely because they begin
+    # with "what should I ...". Keep this bounded to low-risk choice/consumption
+    # verbs; consequential "what should I do?" remains available to later
+    # seriousness/advice routing rather than being silently generalised here.
+    r"^\s*(?:so\s+)?what\s+should\s+i\s+"
+    r"(?:watch|read|play|buy|pick|choose|try|start|"
+    r"listen\s+to|eat|cook|wear|get)\b",
+
+    r"^\s*(?:so\s+)?which\s+(?:one|ones|option|thing)\s+"
+    r"should\s+i\b",
 ]
 
 
@@ -518,7 +538,12 @@ CONTENT_GENERATION_REQUEST_PATTERNS = [
 ]
 
 FOLLOW_UP_PRONOUNS = {
-    "it", "that", "this", "they", "them", "those", "these", "he", "she",
+    "it", "its",
+    "that", "this",
+    "they", "them", "their", "theirs",
+    "those", "these",
+    "he", "him", "his",
+    "she", "her", "hers",
 }
 
 
@@ -907,6 +932,134 @@ def _extract_email_days(
 def _contains_follow_up_pronoun(text: str) -> bool:
     tokens = re.findall(r"[a-z']+", text.lower())
     return any(token in FOLLOW_UP_PRONOUNS for token in tokens)
+
+
+def _active_pairwise_debate_subject(
+    conversation_state,
+):
+    """
+    Resolve the active pairwise debate only from Core-owned conversation state.
+
+    The previous user turn may establish a comparison such as "Rhea clears
+    Mina". The compact active_subject label may preserve the same relation on
+    later turns. Neither source makes prior assistant prose factual evidence.
+    """
+
+    if conversation_state is None:
+        return None
+
+    latest_user_turn = getattr(
+        conversation_state,
+        "latest_user_turn",
+        None,
+    )
+
+    if callable(
+        latest_user_turn
+    ):
+        previous = latest_user_turn()
+
+        if previous:
+            comparison = extract_pairwise_comparison(
+                previous.get(
+                    "text",
+                    "",
+                )
+            )
+
+            if comparison:
+                return comparison
+
+    active_subject = str(
+        getattr(
+            conversation_state,
+            "active_subject",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if active_subject:
+        return pairwise_subject_from_hint(
+            active_subject
+        )
+
+    return None
+
+
+def _apply_pairwise_opinion_turn(
+    state: TurnState,
+    comparison,
+    *,
+    reason: str,
+    follow_up: bool = False,
+) -> TurnState:
+    state.speech_act = (
+        "opinion_challenge"
+        if follow_up
+        else "opinion"
+    )
+
+    state.intent = "share_opinion"
+    state.subject = comparison[
+        "label"
+    ]
+
+    state.should_recommend = False
+    state.should_continue_conversation = True
+    state.should_use_tools = False
+    state.should_answer_directly = True
+    state.factuality = "subjective"
+    state.confidence = (
+        0.97
+        if follow_up
+        else 0.94
+    )
+
+    state.entities[
+        "_debate_subject_key"
+    ] = comparison[
+        "key"
+    ]
+
+    state.entities[
+        "_pairwise_left"
+    ] = comparison[
+        "left"
+    ]
+
+    state.entities[
+        "_pairwise_right"
+    ] = comparison[
+        "right"
+    ]
+
+    state.entities[
+        "_pairwise_asserted_side"
+    ] = comparison.get(
+        "asserted_side",
+        "left",
+    )
+
+    state.entities[
+        "_pairwise_relation"
+    ] = comparison.get(
+        "relation",
+        "",
+    )
+
+    if follow_up:
+        state.is_follow_up = True
+
+        state.entities[
+            "_debate_continuation"
+        ] = "true"
+
+    state.add_reason(
+        reason
+    )
+
+    return state
 
 
 def classify_turn(user_input: str, conversation_state=None) -> TurnState:
@@ -2115,6 +2268,29 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         )
         return state
 
+    if (
+        looks_like_debate_continuation(
+            raw
+        )
+        and conversation_state is not None
+    ):
+        active_debate = (
+            _active_pairwise_debate_subject(
+                conversation_state
+            )
+        )
+
+        if active_debate:
+            return _apply_pairwise_opinion_turn(
+                state,
+                active_debate,
+                reason=(
+                    "explicit challenge continues the active pairwise opinion "
+                    "rather than opening a new factual/correction workflow"
+                ),
+                follow_up=True,
+            )
+
     if _matches_any(
         text,
         MAIRON_CORRECTION_PATTERNS,
@@ -2177,6 +2353,48 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
 
         return state
 
+    consequential = (
+        assess_consequential_advice(
+            raw
+        )
+    )
+
+    if consequential.is_consequential:
+        state.speech_act = "request_advice"
+        state.intent = "consequential_advice"
+        state.requested_action = (
+            "get_consequential_guidance"
+        )
+        state.factuality = (
+            "public_guidance_required"
+        )
+        state.preferred_authority = (
+            "public_web"
+        )
+        state.requires_private_data = False
+        state.requires_live_data = True
+        state.should_use_tools = False
+        state.should_answer_directly = False
+        state.should_recommend = True
+        state.should_continue_conversation = False
+        state.confidence = 0.97
+
+        state.entities[
+            "seriousness"
+        ] = consequential.seriousness
+
+        if consequential.domain:
+            state.entities[
+                "consequence_domain"
+            ] = consequential.domain
+
+        state.add_reason(
+            consequential.reason
+            or "high-consequence advice request"
+        )
+
+        return state
+
     if _matches_any(text, THANKS_PATTERNS):
         state.speech_act = "thanks"
         state.intent = "acknowledge"
@@ -2212,6 +2430,22 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
             "explicit content-generation/planning request"
         )
         return state
+
+    pairwise_comparison = (
+        extract_pairwise_comparison(
+            raw
+        )
+    )
+
+    if pairwise_comparison:
+        return _apply_pairwise_opinion_turn(
+            state,
+            pairwise_comparison,
+            reason=(
+                "user expressed a pairwise comparative opinion; Core preserved "
+                "the comparison semantics for debate continuity"
+            ),
+        )
 
     if _matches_any(
         text,

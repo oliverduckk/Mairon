@@ -8,6 +8,13 @@ from zoneinfo import ZoneInfo
 from continuity.conversation_journal import (
     search_relevant_turns,
 )
+from core.debate_state import (
+    extract_pairwise_comparison,
+    infer_pairwise_position,
+    pairwise_position_label,
+    pairwise_response_is_explicitly_uncertain,
+    pairwise_subject_from_hint,
+)
 
 
 # --------------------------------------------------
@@ -281,17 +288,32 @@ def _classify_generic_category_ranking(
 def classify_opinion_subject(
     user_input,
     media_title=None,
+    subject_hint=None,
 ):
     """
-    Return a stable opinion subject for common recurring media debates.
+    Return a stable opinion subject for recurring preferences/debates.
 
-    v1 intentionally focuses on categories where continuity matters
-    immediately: rankings, favourite characters, and overall stance.
+    Pairwise comparisons are generic conversation state, not franchise-specific
+    logic. A compact Core subject hint can rehydrate the same comparison on a
+    later "defend your take" turn without treating prior assistant prose as
+    factual authority.
     """
 
     text = _normalise(
         user_input
     )
+
+    pairwise_subject = (
+        extract_pairwise_comparison(
+            user_input
+        )
+        or pairwise_subject_from_hint(
+            subject_hint
+        )
+    )
+
+    if pairwise_subject:
+        return pairwise_subject
 
     generic_category_ranking = (
         _classify_generic_category_ranking(
@@ -503,6 +525,23 @@ def _looks_like_matching_historical_prompt(
         "kind"
     )
 
+    if kind == "pairwise_comparison":
+        recovered_subject = (
+            extract_pairwise_comparison(
+                text
+            )
+        )
+
+        return bool(
+            recovered_subject
+            and recovered_subject.get(
+                "key"
+            )
+            == subject.get(
+                "key"
+            )
+        )
+
     if kind == "category_ranking":
         recovered_subject = (
             _classify_generic_category_ranking(
@@ -685,6 +724,27 @@ def recover_opinion_from_journal(
         "count": subject.get(
             "count"
         ),
+        "left": subject.get(
+            "left"
+        ),
+        "right": subject.get(
+            "right"
+        ),
+        "position": (
+            infer_pairwise_position(
+                subject,
+                user_input=selected.get(
+                    "user_text",
+                    "",
+                ),
+                response_text=assistant_text,
+            )
+            if subject.get(
+                "kind"
+            )
+            == "pairwise_comparison"
+            else None
+        ),
         "stance_text": assistant_text,
         "created_at": now,
         "last_updated": now,
@@ -741,14 +801,82 @@ def build_opinion_context_text(
     if not entry:
         return None
 
-    return (
-        "CORE MAIRON OPINION LEDGER:\n"
-        f"Subject: {entry.get('label')}\n"
-        f"Status: {entry.get('confidence')}\n\n"
-        "Mairon's established previous stance is reproduced below:\n"
-        "-----\n"
-        f"{entry.get('stance_text', '')}\n"
-        "-----\n\n"
+    lines = [
+        "CORE MAIRON OPINION LEDGER:",
+        f"Subject: {entry.get('label')}",
+        f"Status: {entry.get('confidence')}",
+    ]
+
+    if entry.get(
+        "kind"
+    ) == "pairwise_comparison":
+        left = str(
+            entry.get(
+                "left"
+            )
+            or ""
+        ).strip()
+
+        right = str(
+            entry.get(
+                "right"
+            )
+            or ""
+        ).strip()
+
+        position = str(
+            entry.get(
+                "position"
+            )
+            or "unclear"
+        ).strip().lower()
+
+        position_label = (
+            pairwise_position_label(
+                {
+                    "kind": "pairwise_comparison",
+                    "left": left,
+                    "right": right,
+                },
+                position,
+            )
+            if left and right
+            else None
+        )
+
+        lines.extend([
+            "",
+            "STRUCTURED PAIRWISE PERSONA STATE:",
+            (
+                "- Comparison: "
+                + left
+                + " vs "
+                + right
+            ),
+            (
+                "- Mairon's established side: "
+                + (
+                    position_label
+                    or "unclear"
+                )
+            ),
+            "- This structured side is authoritative only for Mairon's prior "
+            "subjective preference. It is NOT evidence about either subject.",
+        ])
+
+    lines.extend([
+        "",
+        "Mairon's established previous stance is reproduced below:",
+        "-----",
+        str(
+            entry.get(
+                "stance_text",
+                ""
+            )
+            or ""
+        ),
+        "-----",
+        "",
         "This is PERSONA STATE, not objective truth. Preserve the underlying "
         "subjective stance/selection unless the current conversation gives "
         "Mairon an actual reason to revise it. Do not silently swap "
@@ -756,7 +884,11 @@ def build_opinion_context_text(
         "IMPORTANT: factual/canon claims inside the historical wording are "
         "NOT authoritative and must be independently verified before reuse. "
         "Preserve the preference, not old misinformation. If Mairon changes "
-        "its mind, the change must be explicit and reasoned."
+        "its mind, the change must be explicit and reasoned.",
+    ])
+
+    return "\n".join(
+        lines
     )
 
 
@@ -809,8 +941,66 @@ def record_opinion_if_needed(
     if not response_value:
         return None
 
+    new_pairwise_position = (
+        infer_pairwise_position(
+            subject,
+            user_input=user_input,
+            response_text=response_value,
+        )
+        if subject.get(
+            "kind"
+        )
+        == "pairwise_comparison"
+        else None
+    )
+
+    # "Unclear" is not a settled side. If a later accepted reply finally
+    # establishes one, promote that provisional entry rather than freezing the
+    # old non-position forever. Once a real side exists, explicit revision is
+    # still required to change it.
+    can_promote_unclear_pairwise_position = bool(
+        existing_entry
+        and subject.get(
+            "kind"
+        )
+        == "pairwise_comparison"
+        and str(
+            existing_entry.get(
+                "position"
+            )
+            or "unclear"
+        ).strip().lower()
+        not in {
+            "left",
+            "right",
+        }
+        and new_pairwise_position
+        in {
+            "left",
+            "right",
+        }
+    )
+
+    # A clear "I don't actually have a side" statement is also legitimate
+    # persona revision. This matters when an older entry was inferred from a
+    # reflected Oliver preference rather than a genuine Mairon stance.
+    explicit_pairwise_uncertainty_revision = bool(
+        existing_entry
+        and subject.get(
+            "kind"
+        )
+        == "pairwise_comparison"
+        and new_pairwise_position
+        == "unclear"
+        and pairwise_response_is_explicitly_uncertain(
+            response_value
+        )
+    )
+
     if (
         existing_entry
+        and not can_promote_unclear_pairwise_position
+        and not explicit_pairwise_uncertainty_revision
         and not _revision_is_explicit(
             user_input=user_input,
             response_text=response_value,
@@ -849,6 +1039,13 @@ def record_opinion_if_needed(
         "count": subject.get(
             "count"
         ),
+        "left": subject.get(
+            "left"
+        ),
+        "right": subject.get(
+            "right"
+        ),
+        "position": new_pairwise_position,
         "stance_text": response_value,
         "created_at": previous_created,
         "last_updated": now,

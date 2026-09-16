@@ -202,10 +202,13 @@ def build_answer_contract(
             in {
                 "conversation",
                 "subjective",
-                "stable_model_knowledge",
-                # Backward-compatible legacy mode for older tests/serialized
-                # contracts. New factual routing no longer emits this mode.
                 "classify_then_verify",
+
+                # Phase 10.7.10 — stable explanatory/definition questions are
+                # intentionally answered from local model knowledge. This mode
+                # must permit the model to state factual content; otherwise the
+                # Answer Contract contradicts the epistemic route.
+                "stable_model_knowledge",
             }
         ),
         allow_follow_up_question=(
@@ -222,6 +225,46 @@ def build_answer_contract(
         ),
     )
 
+    if turn.intent == "consequential_advice":
+        contract.allow_recommendations = True
+        contract.allow_new_factual_claims = False
+        contract.allow_follow_up_question = False
+
+        contract.metadata[
+            "seriousness"
+        ] = str(
+            turn.entities.get(
+                "seriousness",
+                "high",
+            )
+            or "high"
+        )
+
+        contract.metadata[
+            "consequence_domain"
+        ] = str(
+            turn.entities.get(
+                "consequence_domain",
+                "",
+            )
+            or ""
+        )
+
+        contract.forbidden_behaviours.extend([
+            "Give useful verified immediate actions before requesting extra details.",
+            "Do not roast, tease, blame, shame, scold, or make a joke about the incident.",
+            "Do not tell Oliver to calm down, stop panicking, take a breath, or otherwise "
+            "manage his emotions.",
+            "Do not guarantee recovery, reversal, reimbursement, restoration, or another "
+            "outcome unless verified evidence establishes it.",
+            "Do not invent provider-specific, jurisdiction-specific, legal, financial, "
+            "security, or official procedures.",
+            "Do not use prior assistant prose or model memory as authority for what Oliver "
+            "should do in this incident.",
+            "Do not stall the first useful response on a clarifying question when verified "
+            "generally applicable steps are available.",
+        ])
+
     if turn.intent == "order_status":
         contract.allow_recommendations = False
         contract.allow_new_factual_claims = False
@@ -237,32 +280,94 @@ def build_answer_contract(
     if turn.intent == "factual_question":
         contract.allow_recommendations = False
         contract.forbidden_behaviours.extend([
-            "Answer the current factual question directly and truthfully before doing anything conversational.",
-            "Do not intentionally give a fake/joke factual answer first and then retract or correct it.",
-            "A very short personality line may follow the answer only when it is directly about the current question, does not contradict the answer, and adds no unsupported Oliver/Mairon history.",
+            "Answer the current factual question before doing anything conversational.",
             "Do not append callbacks to unrelated prior topics after the factual answer.",
             "Do not revive an old product, device, trip, joke, or assistant phrase merely "
             "because it appears in conversation history.",
+            "If a concise factual answer fully resolves the question, stop there.",
+
+            # Phase 6.8.10 — factual answers must not intentionally lead with
+            # a knowingly false/joke answer and correct it afterwards. Banter
+            # can sit around a fact, but the factual payload itself must be
+            # truthful from the first answer.
+            "Do not intentionally give a fake/joke factual answer first, even if you "
+            "correct it immediately afterward.",
+            "A very short personality line may follow the answer, but it must not delay, "
+            "replace, contradict, or weaken the truthful factual answer.",
+
+            # Phase 10.7.12 — a verified/current fact is not evidence for a
+            # prediction about what happens next. Personality must not smuggle
+            # a future-world claim onto the end of an otherwise grounded answer.
+            "Do not extrapolate a verified current fact into a prediction about future "
+            "continuity, permanence, likely tenure, intent, or what happens next unless "
+            "Oliver explicitly asked for a forecast.",
+            "Do not turn unverified predictions or future outcomes into personality filler; "
+            "phrases such as likely to stay, expected to remain, not going anywhere, "
+            "anytime soon, or for the foreseeable future are still factual claims.",
         ])
 
-        if route.mode == "stable_model_knowledge":
+    if turn.intent == "share_opinion":
+        contract.allow_recommendations = False
+
+        debate_continuation = str(
+            turn.entities.get(
+                "_debate_continuation",
+                "",
+            )
+            or ""
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+        pairwise_left = str(
+            turn.entities.get(
+                "_pairwise_left",
+                "",
+            )
+            or ""
+        ).strip()
+
+        pairwise_right = str(
+            turn.entities.get(
+                "_pairwise_right",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if (
+            pairwise_left
+            and pairwise_right
+        ):
+            contract.metadata[
+                "opinion_frame"
+            ] = "pairwise_comparison"
+
             contract.forbidden_behaviours.extend([
-                "Use model knowledge only for durable general explanations or definitions.",
-                "Do not invent or volunteer current prices, availability, leadership roles, "
-                "release status, schedules, laws, versions, recent events, or other changing facts.",
-                "If the answer would require a specific changing public-world fact, omit that "
-                "detail rather than pretending model memory is current.",
+                "Do not interpret comparative slang literally when Core has already "
+                "resolved the pairwise comparison in this turn.",
+                "Oliver's stated preference is not an instruction to agree; Mairon may "
+                "agree, disagree, or qualify it.",
+                "Do not invent concrete canon/events/credits merely to make a subjective "
+                "take sound more informed.",
             ])
 
-        if route.mode == "public_source_verified":
-            contract.allow_new_factual_claims = False
+        if debate_continuation:
+            contract.metadata[
+                "debate_continuation"
+            ] = "true"
+
             contract.forbidden_behaviours.extend([
-                "Specific external-world factual claims must come from Core's retrieved public evidence.",
-                "Do not use model training memory to fill gaps in the public evidence packet.",
-                "Do not extrapolate a verified current fact into a prediction about what will probably, likely, "
-                "or definitely happen next unless Oliver explicitly asked for a forecast and Core evidence supports it.",
-                "Do not turn continuity, permanence, likely tenure, future intent, or future outcomes into personality filler.",
-                "If Core cannot verify the requested fact, fail closed rather than bluffing.",
+                "Treat this as a continuation of the active opinion/debate subject rather "
+                "than a new argument about Oliver's tone or wording.",
+                "Defend, revise, or explicitly withdraw Mairon's actual established stance. "
+                "Do not dodge an explicit request for reasons with a bare concession such "
+                "as 'Fair.' or a generic acknowledgement.",
+                "Prior Mairon wording may establish Mairon's previous subjective stance, "
+                "but factual claims inside that wording are not evidence and must not be "
+                "reused as facts without independent grounding.",
             ])
 
     if turn.intent == "share_context":

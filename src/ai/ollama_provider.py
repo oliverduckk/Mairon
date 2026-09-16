@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -56,10 +57,38 @@ from research.public_factual_research import (
     gather_public_factual_research,
 )
 
+from research.research_jobs import (
+    create_research_job,
+    find_active_research_job,
+)
+
 from research.public_factual_grounding import (
+    build_failed_public_advice_fallback,
     build_failed_public_factual_fallback,
+    build_failed_public_opinion_fallback,
     build_public_factual_retry_instruction,
     verify_public_factual_draft,
+)
+
+from core.conversational_research import (
+    build_background_research_offer_text,
+    build_background_research_queued_text,
+    build_contextual_opinion_research_query,
+    build_pairwise_background_research_opportunity,
+    classify_research_permission_reply,
+    extract_explicit_background_research_request,
+)
+from core.debate_state import (
+    build_pairwise_opinion_fallback,
+    build_pairwise_semantic_instruction,
+    find_pairwise_opinion_integrity_violations,
+    looks_like_debate_continuation,
+)
+from core.seriousness import (
+    assess_consequential_advice,
+    build_consequential_advice_instruction,
+    build_consequential_research_query,
+    find_consequential_tone_violations,
 )
 
 from personality.opinion_ledger import (
@@ -640,6 +669,7 @@ def _current_turn_needs_recent_assistant_dialogue_context(
         "share_context",
         "acknowledge",
         "casual_conversation",
+        "share_opinion",
     }:
         return False
 
@@ -659,6 +689,10 @@ def _current_turn_needs_recent_assistant_dialogue_context(
         r"\b(?:you're|you\s+are)\s+(?:right|wrong)\b",
         r"\b(?:that|this)(?:\s+is|'s)\s+(?:right|wrong)\b",
         r"^\s*(?:that'?s|that\s+was)\s+(?:a\s+)?(?:good|great|solid|banger|fair|wild|crazy|interesting|valid|reasonable)\b",
+        r"\bdefend\s+(?:your|that|the)\s+(?:take|opinion|pick|choice|stance|ranking)\b",
+        r"\b(?:back|justify)\s+(?:that|your\s+(?:take|opinion|stance))\s+up\b",
+        r"\bmake\s+your\s+case\b",
+        r"\bconvince\s+me\b",
     )
 
     return any(
@@ -1325,6 +1359,7 @@ def build_direct_think_setting(
         "conversation_recall",
         "factual_question",
         "share_opinion",
+        "consequential_advice",
     }:
         return None
 
@@ -7364,6 +7399,396 @@ def find_core_answer_contract_violations(
     return violations
 
 
+def _latest_user_authored_message(
+    conversation,
+):
+    """
+    Return the most recent prior USER message from provider history.
+
+    At direct-conversation entry the current user message has not yet been
+    appended, so this is the immediate antecedent needed for contextual
+    research query construction.
+    """
+
+    for message in reversed(
+        list(
+            conversation
+            or []
+        )
+    ):
+        if isinstance(
+            message,
+            dict,
+        ):
+            role = message.get(
+                "role"
+            )
+            content = message.get(
+                "content"
+            )
+        else:
+            role = getattr(
+                message,
+                "role",
+                None,
+            )
+            content = getattr(
+                message,
+                "content",
+                None,
+            )
+
+        if role != "user":
+            continue
+
+        value = re.sub(
+            r"\s+",
+            " ",
+            str(
+                content
+                or ""
+            ).strip(),
+        )
+
+        if value:
+            return value
+
+    return None
+
+
+def _build_grounded_opinion_instruction():
+    return (
+        "CORE GROUNDED CONVERSATIONAL OPINION MODE:\n"
+        "- Oliver asked for Mairon's judgement about an external/public subject.\n"
+        "- Core retrieved public evidence because the live conversation alone did "
+        "not establish enough factual substrate for a detailed take.\n"
+        "- Use the evidence to understand what actually happened, then answer the "
+        "ORIGINAL conversational question naturally.\n"
+        "- Do not merely dump a source summary. Form a clear opinion when the "
+        "evidence supports one.\n"
+        "- Oliver's reaction is evidence of Oliver's reaction only; it does not "
+        "prove external events or motives.\n"
+        "- Every literal external-world premise must be supported by Core's public "
+        "evidence packet. Subjective judgement, humour, and disagreement are allowed "
+        "when they add no unsupported factual premise.\n"
+        "- If the evidence is too thin, say you do not know enough to give a proper "
+        "take rather than bluffing.\n"
+        "- Do not mention internal routing, verification, evidence packets, or model "
+        "memory unless Oliver explicitly asks."
+    )
+
+
+# --------------------------------------------------
+# Background research permission / queue markers
+# --------------------------------------------------
+
+PENDING_RESEARCH_PROPOSAL_PREFIX = (
+    "MAIRON_PENDING_RESEARCH_PROPOSAL:"
+)
+
+RESOLVED_RESEARCH_PROPOSAL_PREFIX = (
+    "MAIRON_RESOLVED_RESEARCH_PROPOSAL:"
+)
+
+
+def _research_marker_payload(
+    content,
+    prefix,
+):
+    value = str(
+        content
+        or ""
+    )
+
+    if not value.startswith(
+        prefix
+    ):
+        return None
+
+    payload_text = value[
+        len(
+            prefix
+        ):
+    ].strip()
+
+    try:
+        payload = json.loads(
+            payload_text
+        )
+    except Exception:
+        return None
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        return None
+
+    return payload
+
+
+def get_pending_research_proposal(
+    conversation,
+):
+    """
+    Return the newest unresolved research proposal in THIS conversation.
+
+    Pending permission is deliberately conversation-scoped so a stale proposal
+    in another chat cannot make a short "yeah" launch research unexpectedly.
+    """
+
+    resolved_ids = set()
+
+    for message in reversed(
+        list(
+            conversation
+            or []
+        )
+    ):
+        if get_message_role(
+            message
+        ) != "system":
+            continue
+
+        content = get_message_content(
+            message
+        )
+
+        resolved = _research_marker_payload(
+            content,
+            RESOLVED_RESEARCH_PROPOSAL_PREFIX,
+        )
+
+        if resolved:
+            resolved_id = str(
+                resolved.get(
+                    "proposal_id"
+                )
+                or ""
+            ).strip()
+
+            if resolved_id:
+                resolved_ids.add(
+                    resolved_id
+                )
+
+            continue
+
+        pending = _research_marker_payload(
+            content,
+            PENDING_RESEARCH_PROPOSAL_PREFIX,
+        )
+
+        if not pending:
+            continue
+
+        proposal_id = str(
+            pending.get(
+                "proposal_id"
+            )
+            or ""
+        ).strip()
+
+        if (
+            proposal_id
+            and proposal_id not in resolved_ids
+        ):
+            return pending
+
+    return None
+
+
+def _build_research_marker_result(
+    *,
+    conversation,
+    user_input,
+    answer,
+    marker_prefix=None,
+    marker_payload=None,
+):
+    working_conversation = list(
+        conversation
+    )
+
+    working_conversation.append({
+        "role": "system",
+        "content": get_runtime_context(),
+    })
+
+    working_conversation.append({
+        "role": "user",
+        "content": user_input,
+    })
+
+    if (
+        marker_prefix
+        and marker_payload
+    ):
+        working_conversation.append({
+            "role": "system",
+            "content": (
+                marker_prefix
+                + json.dumps(
+                    marker_payload,
+                    ensure_ascii=False,
+                )
+            ),
+        })
+
+    working_conversation.append({
+        "role": "assistant",
+        "content": answer,
+    })
+
+    return (
+        answer,
+        working_conversation,
+        None,
+        None,
+    )
+
+
+def handle_pending_research_permission_reply(
+    *,
+    user_input,
+    conversation,
+    pending,
+):
+    decision = classify_research_permission_reply(
+        user_input
+    )
+
+    if decision is None:
+        return None
+
+    proposal_id = str(
+        pending.get(
+            "proposal_id"
+        )
+        or ""
+    ).strip()
+
+    if decision == "decline":
+        answer = (
+            "No worries. I won't queue that research."
+        )
+
+        return _build_research_marker_result(
+            conversation=conversation,
+            user_input=user_input,
+            answer=answer,
+            marker_prefix=(
+                RESOLVED_RESEARCH_PROPOSAL_PREFIX
+            ),
+            marker_payload={
+                "proposal_id": proposal_id,
+                "resolution": "declined",
+            },
+        )
+
+    job = create_research_job(
+        topic=pending.get(
+            "topic"
+        ),
+        goal=pending.get(
+            "goal"
+        ),
+        original_request=pending.get(
+            "original_request"
+        ),
+        source="approved_offer",
+        priority=pending.get(
+            "priority"
+        )
+        or "background",
+        depth=pending.get(
+            "depth"
+        )
+        or "deep",
+        metadata=pending.get(
+            "metadata"
+        )
+        or {},
+    )
+
+    answer = (
+        build_background_research_queued_text(
+            job
+        )
+    )
+
+    return _build_research_marker_result(
+        conversation=conversation,
+        user_input=user_input,
+        answer=answer,
+        marker_prefix=(
+            RESOLVED_RESEARCH_PROPOSAL_PREFIX
+        ),
+        marker_payload={
+            "proposal_id": proposal_id,
+            "resolution": "approved",
+            "research_job_id": job.get(
+                "id"
+            ),
+        },
+    )
+
+
+def handle_explicit_background_research_request(
+    *,
+    user_input,
+    conversation,
+):
+    request = (
+        extract_explicit_background_research_request(
+            user_input
+        )
+    )
+
+    if not request:
+        return None
+
+    job = create_research_job(
+        topic=request.get(
+            "topic"
+        ),
+        goal=request.get(
+            "goal"
+        ),
+        original_request=request.get(
+            "original_request"
+        ),
+        source=request.get(
+            "source"
+        )
+        or "explicit_request",
+        priority=request.get(
+            "priority"
+        )
+        or "background",
+        depth=request.get(
+            "depth"
+        )
+        or "deep",
+        metadata=request.get(
+            "metadata"
+        )
+        or {},
+    )
+
+    answer = (
+        build_background_research_queued_text(
+            job
+        )
+    )
+
+    return _build_research_marker_result(
+        conversation=conversation,
+        user_input=user_input,
+        answer=answer,
+    )
+
+
 # --------------------------------------------------
 # Personality / direct-conversation workflow
 # --------------------------------------------------
@@ -7396,6 +7821,37 @@ def handle_direct_conversation(
         "Intent",
     )
 
+    core_epistemic_mode = _core_contract_value(
+        core_answer_contract,
+        "Epistemic mode",
+    )
+
+    core_is_grounded_opinion = (
+        core_intent == "share_opinion"
+        and core_epistemic_mode
+        == "public_source_verified_opinion"
+    )
+
+    core_is_consequential_advice = (
+        core_intent == "consequential_advice"
+        and core_epistemic_mode
+        == "public_source_verified_advice"
+    )
+
+    consequential_assessment = (
+        assess_consequential_advice(
+            user_input
+        )
+        if core_is_consequential_advice
+        else None
+    )
+
+    consequential_domain = (
+        consequential_assessment.domain
+        if consequential_assessment
+        else None
+    )
+
     core_is_micro_act = (
         core_intent
         in {
@@ -7416,19 +7872,32 @@ def handle_direct_conversation(
             core_intent,
             user_input=user_input,
         )
+        or core_is_grounded_opinion
+        or core_is_consequential_advice
     )
 
-    relationship_context = (
-        prepare_relationship_turn(
-            user_input
-        )
-    )
+    if core_is_consequential_advice:
+        # Core owns the seriousness gate. Relationship reciprocity, grievances,
+        # callbacks and banter state do not participate in this turn.
+        relationship_context = None
+        conversation_policy = {}
 
-    conversation_policy = (
-        classify_conversation_policy(
-            user_input
+        print(
+            "[Core] Consequential-advice seriousness gate active."
         )
-    )
+
+    else:
+        relationship_context = (
+            prepare_relationship_turn(
+                user_input
+            )
+        )
+
+        conversation_policy = (
+            classify_conversation_policy(
+                user_input
+            )
+        )
 
     spoiler_context = (
         prepare_spoiler_context(
@@ -7524,10 +7993,11 @@ def handle_direct_conversation(
             "content": core_spoiler_response
         })
 
-        record_accepted_relationship_response(
-            response_text=core_spoiler_response,
-            relationship_context=relationship_context,
-        )
+        if not core_is_consequential_advice:
+            record_accepted_relationship_response(
+                response_text=core_spoiler_response,
+                relationship_context=relationship_context,
+            )
 
         return (
             core_spoiler_response,
@@ -7546,14 +8016,52 @@ def handle_direct_conversation(
         else None
     )
 
+    core_subject_hint = str(
+        _core_contract_value(
+            core_answer_contract,
+            "Subject",
+        )
+        or ""
+    ).strip()
+
+    if (
+        not core_subject_hint
+        or core_subject_hint.lower()
+        == "none"
+    ):
+        core_subject_hint = None
+
+    # Opinion Ledger subjects are structured dictionaries produced by
+    # classify_opinion_subject(). Core may supply a compact pairwise subject
+    # label ("A vs B") on a later debate-continuation turn. That label is
+    # conversation/persona state only; it does not make prior assistant facts
+    # authoritative.
     opinion_subject = (
         classify_opinion_subject(
             user_input=user_input,
             media_title=spoiler_context.get(
                 "title"
             ),
+            subject_hint=(
+                core_subject_hint
+                if core_intent == "share_opinion"
+                else None
+            ),
         )
+        if not core_is_consequential_advice
+        else None
     )
+
+    # Keep the Core-resolved conversational subject (plain string) separate
+    # from Opinion Ledger subjects (structured dictionaries). This explicit
+    # initialization preserves the Phase 11.2.3 type-boundary invariant while
+    # still allowing Phase 11.4 debate continuation to reuse Core's subject.
+    grounded_opinion_subject = None
+
+    if core_is_grounded_opinion:
+        grounded_opinion_subject = (
+            core_subject_hint
+        )
 
     opinion_entry = (
         get_or_recover_opinion_entry(
@@ -7572,6 +8080,97 @@ def handle_direct_conversation(
         else None
     )
 
+    core_is_debate_continuation = bool(
+        core_intent == "share_opinion"
+        and opinion_subject
+        and opinion_subject.get(
+            "kind"
+        )
+        == "pairwise_comparison"
+        and looks_like_debate_continuation(
+            user_input
+        )
+    )
+
+    pairwise_position = (
+        str(
+            opinion_entry.get(
+                "position"
+            )
+            or "unclear"
+        ).strip().lower()
+        if opinion_entry
+        else None
+    )
+
+    background_research_opportunity = (
+        build_pairwise_background_research_opportunity(
+            opinion_subject=opinion_subject,
+            opinion_entry=opinion_entry,
+            user_input=user_input,
+            intent=core_intent,
+        )
+    )
+
+    if background_research_opportunity:
+        active_research_job = (
+            find_active_research_job(
+                background_research_opportunity.get(
+                    "topic"
+                )
+            )
+        )
+
+        pending_research_proposal = (
+            get_pending_research_proposal(
+                conversation
+            )
+        )
+
+        if (
+            active_research_job is None
+            and pending_research_proposal is None
+        ):
+            proposal = {
+                **background_research_opportunity,
+                "proposal_id": str(
+                    uuid.uuid4()
+                ),
+            }
+
+            answer = (
+                build_background_research_offer_text(
+                    proposal
+                )
+            )
+
+            print(
+                "[Research] Mairon lacks an established pairwise stance; "
+                "requesting permission for background research."
+            )
+
+            return _build_research_marker_result(
+                conversation=conversation,
+                user_input=user_input,
+                answer=answer,
+                marker_prefix=(
+                    PENDING_RESEARCH_PROPOSAL_PREFIX
+                ),
+                marker_payload=proposal,
+            )
+
+    pairwise_opinion_instruction = (
+        build_pairwise_semantic_instruction(
+            opinion_subject,
+            debate_continuation=(
+                core_is_debate_continuation
+            ),
+            position=pairwise_position,
+        )
+        if opinion_subject
+        else None
+    )
+
     if opinion_entry:
         print(
             "[Opinion] Established Mairon stance loaded: "
@@ -7583,11 +8182,21 @@ def handle_direct_conversation(
             + "."
         )
 
+    if pairwise_opinion_instruction:
+        if core_is_debate_continuation:
+            print(
+                "[Opinion] Active pairwise debate continuation loaded."
+            )
+
+        else:
+            print(
+                "[Opinion] Pairwise comparison semantics resolved by Core."
+            )
+
     research_evidence = None
 
-    factual_epistemic_mode = _core_contract_value(
-        core_answer_contract,
-        "Epistemic mode",
+    factual_epistemic_mode = (
+        core_epistemic_mode
     )
 
     if (
@@ -7632,19 +8241,75 @@ def handle_direct_conversation(
     public_factual_evidence = None
     public_factual_research_success = False
 
-    if (
-        core_intent == "factual_question"
-        and not research_evidence
-        and factual_epistemic_mode == "public_source_verified"
-    ):
-        print(
-            "[Research] Core requires public verification for this factual question."
+    public_research_requested = (
+        (
+            core_intent == "factual_question"
+            and factual_epistemic_mode
+            == "public_source_verified"
         )
+        or core_is_grounded_opinion
+        or core_is_consequential_advice
+    )
+
+    if (
+        public_research_requested
+        and not research_evidence
+    ):
+        if core_is_consequential_advice:
+            print(
+                "[Research] Grounding consequential advice from public sources."
+            )
+
+            public_research_input = (
+                build_consequential_research_query(
+                    user_input
+                )
+            )
+
+        elif core_is_grounded_opinion:
+            print(
+                "[Research] Grounding conversational opinion from public sources."
+            )
+
+            public_research_input = (
+                build_contextual_opinion_research_query(
+                    user_input=user_input,
+                    previous_user_text=(
+                        _latest_user_authored_message(
+                            conversation
+                        )
+                    ),
+                    subject=grounded_opinion_subject,
+                )
+            )
+
+        else:
+            print(
+                "[Research] Core requires public verification for this factual question."
+            )
+
+            public_research_input = (
+                user_input
+            )
 
         public_research_result = (
             gather_public_factual_research(
-                user_input=user_input,
-                max_reads=2,
+                user_input=public_research_input,
+                max_reads=(
+                    3
+                    if core_is_consequential_advice
+                    else 2
+                ),
+            )
+        )
+
+        print(
+            "[Research] Query: "
+            + repr(
+                public_research_result.get(
+                    "query",
+                    "",
+                )
             )
         )
 
@@ -7789,6 +8454,12 @@ def handle_direct_conversation(
             print(
                 "[Context] Standalone factual context isolated from prior conversation."
             )
+
+        elif core_is_consequential_advice:
+            print(
+                "[Context] Consequential advice isolated from prior assistant/social context."
+            )
+
         else:
             print(
                 "[Context] Restricted generation context isolated from prior assistant turns."
@@ -7832,7 +8503,10 @@ def handle_direct_conversation(
             intent=core_intent,
             conversation=conversation,
         )
-        if core_uses_restricted_generation_context
+        if (
+            core_uses_restricted_generation_context
+            and not core_is_consequential_advice
+        )
         else None
     )
 
@@ -7955,6 +8629,12 @@ def handle_direct_conversation(
             "content": opinion_context
         })
 
+    if pairwise_opinion_instruction:
+        base_messages.append({
+            "role": "system",
+            "content": pairwise_opinion_instruction,
+        })
+
     if research_evidence:
         base_messages.append({
             "role": "system",
@@ -7967,6 +8647,24 @@ def handle_direct_conversation(
             "content": public_factual_evidence
         })
 
+        if core_is_grounded_opinion:
+            base_messages.append({
+                "role": "system",
+                "content": (
+                    _build_grounded_opinion_instruction()
+                ),
+            })
+
+        if core_is_consequential_advice:
+            base_messages.append({
+                "role": "system",
+                "content": (
+                    build_consequential_advice_instruction(
+                        domain=consequential_domain,
+                    )
+                ),
+            })
+
     if media_domain_active:
         base_messages.append({
             "role": "system",
@@ -7975,19 +8673,20 @@ def handle_direct_conversation(
             )
         })
 
-    base_messages.append({
-        "role": "system",
-        "content": build_conversation_policy_text(
-            conversation_policy
-        )
-    })
+    if not core_is_consequential_advice:
+        base_messages.append({
+            "role": "system",
+            "content": build_conversation_policy_text(
+                conversation_policy
+            )
+        })
 
-    base_messages.append({
-        "role": "system",
-        "content": build_runtime_personality_instruction(
-            relationship_context=relationship_context
-        )
-    })
+        base_messages.append({
+            "role": "system",
+            "content": build_runtime_personality_instruction(
+                relationship_context=relationship_context
+            )
+        })
 
     # Mairon's identity/capability boundary applies to ALL direct-conversation
     # lanes, not only social micro-acts or media-specific prompts.
@@ -8029,20 +8728,33 @@ def handle_direct_conversation(
             })
 
     if core_intent == "share_opinion":
+        opinion_lane_lines = [
+            "OPINION-LANE RESPONSE MODE:",
+            "- Give the subjective opinion Oliver actually asked for.",
+            "- Be concise when the request is simple, but use whatever length is "
+            "needed to finish the requested answer cleanly.",
+            "- Do not turn a resolved opinion question into recommendation intake "
+            "or append a generic follow-up question unless clarification is needed.",
+            "- Do not invent concrete public-world credits, creator names, "
+            "authorship, direction, production roles, or named creative-era/history "
+            "labels. If such a factual detail is not supplied by Oliver/Core and is "
+            "not necessary to answer the opinion request, omit it.",
+            "- Personality is welcome; fabricated credits are not.",
+        ]
+
+        if core_is_debate_continuation:
+            opinion_lane_lines.extend([
+                "- Oliver explicitly asked Mairon to defend/explain its own active take.",
+                "- Give actual reasons for the position. Do not answer only with 'Fair', "
+                "'yeah', a generic concession, or an argument about Oliver's tone.",
+                "- If the prior stance cannot be defended honestly, revise or withdraw it "
+                "explicitly instead of inventing evidence.",
+            ])
+
         base_messages.append({
             "role": "system",
-            "content": (
-                "OPINION-LANE RESPONSE MODE:\n"
-                "- Give the subjective opinion Oliver actually asked for.\n"
-                "- Be concise when the request is simple, but use whatever length is "
-                "needed to finish the requested answer cleanly.\n"
-                "- Do not turn a resolved opinion question into recommendation intake "
-                "or append a generic follow-up question unless clarification is needed.\n"
-                "- Do not invent concrete public-world credits, creator names, "
-                "authorship, direction, production roles, or named creative-era/history "
-                "labels. If such a factual detail is not supplied by Oliver/Core and is "
-                "not necessary to answer the opinion request, omit it.\n"
-                "- Personality is welcome; fabricated credits are not."
+            "content": "\n".join(
+                opinion_lane_lines
             ),
         })
 
@@ -8115,6 +8827,7 @@ def handle_direct_conversation(
     if (
         allow_cloud_escalation
         and not grounded_research_evidence
+        and not core_is_consequential_advice
     ):
         conversation_tools.append(
             CLOUD_ESCALATION_TOOL
@@ -8198,10 +8911,11 @@ def handle_direct_conversation(
             "content": final_response_text
         })
 
-        record_accepted_relationship_response(
-            response_text=final_response_text,
-            relationship_context=relationship_context,
-        )
+        if not core_is_consequential_advice:
+            record_accepted_relationship_response(
+                response_text=final_response_text,
+                relationship_context=relationship_context,
+            )
 
         return (
             final_response_text,
@@ -8249,6 +8963,13 @@ def handle_direct_conversation(
                 candidate_text
             )
         )
+
+        if core_is_consequential_advice:
+            candidate_violations.extend(
+                find_consequential_tone_violations(
+                    candidate_text
+                )
+            )
 
         candidate_violations.extend(
             find_mairon_agency_modality_violations(
@@ -9005,6 +9726,28 @@ def handle_direct_conversation(
             )
         )
 
+        if opinion_subject:
+            violations.extend(
+                find_pairwise_opinion_integrity_violations(
+                    opinion_subject,
+                    user_input=user_input,
+                    response_text=draft_text,
+                    debate_continuation=(
+                        core_is_debate_continuation
+                    ),
+                    established_position=(
+                        pairwise_position
+                    ),
+                )
+            )
+
+        if core_is_consequential_advice:
+            violations.extend(
+                find_consequential_tone_violations(
+                    draft_text
+                )
+            )
+
         # Core owns what Mairon can/do/will do. This validator is deliberately
         # domain-independent and runs on every direct-conversation draft.
         violations.extend(
@@ -9300,12 +10043,25 @@ def handle_direct_conversation(
             )
 
         elif public_factual_evidence:
-            final_response_text = (
-                build_failed_public_factual_fallback()
-            )
+            if core_is_consequential_advice:
+                final_response_text = (
+                    build_failed_public_advice_fallback(
+                        domain=consequential_domain,
+                    )
+                )
+
+            elif core_is_grounded_opinion:
+                final_response_text = (
+                    build_failed_public_opinion_fallback()
+                )
+
+            else:
+                final_response_text = (
+                    build_failed_public_factual_fallback()
+                )
 
             print(
-                "[Research] Public factual drafts remained insufficiently grounded; "
+                "[Research] Public-source drafts remained insufficiently grounded; "
                 "Core used a fail-closed response."
             )
 
@@ -9316,6 +10072,28 @@ def handle_direct_conversation(
             )
 
             if (
+                opinion_subject
+                and opinion_subject.get(
+                    "kind"
+                )
+                == "pairwise_comparison"
+            ):
+                final_response_text = (
+                    build_pairwise_opinion_fallback(
+                        opinion_subject,
+                        position=pairwise_position,
+                        debate_continuation=(
+                            core_is_debate_continuation
+                        ),
+                    )
+                )
+
+                print(
+                    "[Opinion] Pairwise drafts remained invalid; Core used a "
+                    "persona-safe debate fallback."
+                )
+
+            elif (
                 core_grounding_failed
                 or core_intent
                 in {
@@ -9393,10 +10171,11 @@ def handle_direct_conversation(
         "content": final_response_text
     })
 
-    record_accepted_relationship_response(
-        response_text=final_response_text,
-        relationship_context=relationship_context,
-    )
+    if not core_is_consequential_advice:
+        record_accepted_relationship_response(
+            response_text=final_response_text,
+            relationship_context=relationship_context,
+        )
 
     if opinion_subject:
         record_opinion_if_needed(
@@ -9405,7 +10184,7 @@ def handle_direct_conversation(
             existing_entry=opinion_entry,
             user_input=user_input,
             research_used=bool(
-                research_evidence
+                grounded_research_evidence
             ),
         )
 
@@ -9483,6 +10262,45 @@ def get_response(
 
         if pending_result is not None:
             return pending_result
+
+    # --------------------------------------------------
+    # Resolve an explicit reply to Mairon's background-research permission
+    # question before ordinary conversation. Unrelated turns do not consume the
+    # proposal and continue normally.
+    # --------------------------------------------------
+
+    pending_research_proposal = (
+        get_pending_research_proposal(
+            conversation
+        )
+    )
+
+    if pending_research_proposal:
+        research_permission_result = (
+            handle_pending_research_permission_reply(
+                user_input=user_input,
+                conversation=conversation,
+                pending=pending_research_proposal,
+            )
+        )
+
+        if research_permission_result is not None:
+            return research_permission_result
+
+    # --------------------------------------------------
+    # Oliver may also create a background research job directly. An explicit
+    # instruction is already permission, so no extra confirmation is required.
+    # --------------------------------------------------
+
+    explicit_research_result = (
+        handle_explicit_background_research_request(
+            user_input=user_input,
+            conversation=conversation,
+        )
+    )
+
+    if explicit_research_result is not None:
+        return explicit_research_result
 
     # --------------------------------------------------
     # Ordinary weather questions use the dedicated weather

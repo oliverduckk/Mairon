@@ -3,13 +3,302 @@ from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
+from core.conversational_research import (
+    looks_like_public_external_context,
+)
+from core.debate_state import (
+    extract_pairwise_comparison,
+    looks_like_debate_continuation,
+    pairwise_subject_from_hint,
+)
+
 from core.turn_state import TurnState
 
 
 PRONOUN_PATTERN = re.compile(
-    r"\b(it|that|this|they|them|those|these)\b",
+    r"\b("
+    r"it|its|that|this|"
+    r"they|them|their|theirs|those|these|"
+    r"he|him|his|she|her|hers"
+    r")\b",
     flags=re.IGNORECASE,
 )
+
+
+CONTEXTUAL_CONNECTIVE_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"and|but|so|then|"
+    r"what\s+about|how\s+about|"
+    r"same|the\s+same|"
+    r"do\s+you\s+think|would\s+you\s+say|"
+    r"what\s+do\s+you\s+think"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+
+TOPIC_BOUNDARY_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"anyway|moving\s+on|different\s+topic|"
+    r"unrelated(?:ly)?|side\s+note"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+
+CONTEXTUAL_OPINION_PATTERN = re.compile(
+    r"(?:"
+    r"^\s*what\s+do\s+you\s+think\b|"
+    r"\b(?:do|would)\s+you\s+(?:think|reckon|say)\b"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
+CONTEXTUAL_EVALUATION_PATTERN = re.compile(
+    r"\b(?:"
+    r"well|good|bad|better|worse|best|worst|"
+    r"right|wrong|fair|unfair|worth|"
+    r"effective|ineffective|handled|handling|"
+    r"like|prefer|preferred|"
+    r"overrated|underrated|"
+    r"stronger|weaker|smart|stupid|"
+    r"reasonable|unreasonable|justified"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _infer_immediate_user_subject(
+    text: str,
+) -> Optional[str]:
+    """
+    Extract a conservative subject hint from a user-authored possessive phrase.
+
+    This is intentionally tiny and generic. It is not named-entity recognition
+    and it never calls the model. Its purpose is to preserve obvious discourse
+    anchors such as:
+
+        "Horikita's handling ..." -> "Horikita"
+        "Walter White's decision ..." -> "Walter White"
+
+    Personal/determiner-led phrases such as "my monitor's ..." are not promoted
+    into a named subject by this helper.
+    """
+
+    raw = str(
+        text
+        or ""
+    ).strip()
+
+    if not raw:
+        return None
+
+    comparison = extract_pairwise_comparison(
+        raw
+    )
+
+    if comparison:
+        return comparison[
+            "label"
+        ]
+
+    match = re.match(
+        r"^\s*("
+        r"[A-Za-z][A-Za-z0-9_.-]*"
+        r"(?:\s+[A-Za-z][A-Za-z0-9_.-]*){0,3}"
+        r")[’']s\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        match.group(1).strip(),
+    )
+
+    first = (
+        value.split(
+            " ",
+            1,
+        )[
+            0
+        ].lower()
+    )
+
+    if first in {
+        "my",
+        "our",
+        "your",
+        "his",
+        "her",
+        "its",
+        "their",
+        "the",
+        "this",
+        "that",
+    }:
+        return None
+
+    return value[:120] or None
+
+
+def _looks_like_contextual_opinion_question(
+    text: str,
+) -> bool:
+    """
+    Distinguish an evaluative conversational follow-up from a factual lookup.
+
+    "Do you think she handled it well?" is an opinion/judgement continuation.
+    "How old is he?" remains factual and can still require public authority.
+    """
+
+    value = str(
+        text
+        or ""
+    ).strip()
+
+    if not value:
+        return False
+
+    if re.match(
+        r"^\s*what\s+do\s+you\s+think\s*[?.!]*\s*$",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return bool(
+        CONTEXTUAL_OPINION_PATTERN.search(
+            value
+        )
+        and CONTEXTUAL_EVALUATION_PATTERN.search(
+            value
+        )
+    )
+
+
+def build_live_user_continuity_instruction(
+    turn: TurnState,
+) -> Optional[str]:
+    """
+    Build a compact user-authored context packet for the current model turn.
+
+    The packet is interpretation context, not independent public evidence. It
+    contains no prior assistant prose and therefore cannot make an old Mairon
+    hallucination authoritative.
+    """
+
+    if turn is None:
+        return None
+
+    entities = (
+        getattr(
+            turn,
+            "entities",
+            {},
+        )
+        or {}
+    )
+
+    previous_text = str(
+        entities.get(
+            "_conversation_context_user_text",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if not previous_text:
+        return None
+
+    previous_text = previous_text[
+        :1800
+    ]
+
+    previous_intent = str(
+        entities.get(
+            "_conversation_context_intent",
+            "",
+        )
+        or ""
+    ).strip()
+
+    referents = (
+        getattr(
+            turn,
+            "resolved_referents",
+            {},
+        )
+        or {}
+    )
+
+    referent_lines = []
+
+    for key, value in referents.items():
+        key_value = str(
+            key
+            or ""
+        ).strip()
+
+        referent_value = str(
+            value
+            or ""
+        ).strip()
+
+        if (
+            not key_value
+            or not referent_value
+        ):
+            continue
+
+        referent_lines.append(
+            "- "
+            + key_value
+            + " -> "
+            + referent_value[
+                :240
+            ]
+        )
+
+    lines = [
+        "CORE LIVE USER CONTINUITY:",
+        "- Oliver's current message depends on the immediately preceding "
+        "USER-authored turn below.",
+        "- Use it to resolve pronouns, shorthand, preferences, constraints, "
+        "and the conversational topic.",
+        "- It is authoritative only for what Oliver said, not for external "
+        "facts about the world.",
+        "- Do not invent missing details and do not treat prior Mairon prose "
+        "as evidence.",
+        "- If the current turn asks for a recommendation, preserve relevant "
+        "constraints Oliver stated in that previous turn.",
+        "",
+        "PREVIOUS OLIVER TURN:",
+        previous_text,
+    ]
+
+    if previous_intent:
+        lines.extend([
+            "",
+            "PREVIOUS TURN INTENT:",
+            previous_intent,
+        ])
+
+    if referent_lines:
+        lines.extend([
+            "",
+            "CORE-RESOLVED REFERENTS:",
+            *referent_lines,
+        ])
+
+    return "\n".join(
+        lines
+    )
 
 
 def _normalise_email_referent_text(
@@ -57,6 +346,17 @@ class ConversationState:
     pending_question: Optional[str] = None
     pending_action: Optional[str] = None
     recent_subjects: List[str] = field(default_factory=list)
+
+    # Phase 11.2.1 — bounded USER-authored immediate discourse state.
+    #
+    # This is not long-term memory and contains no assistant prose. It exists so
+    # a new turn can be interpreted against what Oliver literally just said
+    # before epistemic routing decides whether web/tool authority is required.
+    recent_user_turns: List[
+        Dict[str, Any]
+    ] = field(
+        default_factory=list
+    )
 
     # Domain-specific short-lived Gmail working state.
     #
@@ -127,10 +427,214 @@ class ConversationState:
             self.recent_subjects[:8]
         )
 
+    def latest_user_turn(
+        self,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.recent_user_turns:
+            return None
+
+        return dict(
+            self.recent_user_turns[
+                -1
+            ]
+        )
+
+    def remember_user_turn(
+        self,
+        turn: TurnState,
+    ) -> None:
+        """
+        Preserve a compact record of Oliver's immediately recent turns.
+
+        Only user-authored wording plus Core classification metadata is stored.
+        Assistant answers are deliberately excluded.
+        """
+
+        if turn is None:
+            return
+
+        raw_text = str(
+            getattr(
+                turn,
+                "raw_text",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if not raw_text:
+            return
+
+        raw_text = raw_text[
+            :1800
+        ]
+
+        subject = str(
+            getattr(
+                turn,
+                "subject",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if not subject:
+            subject = (
+                _infer_immediate_user_subject(
+                    raw_text
+                )
+                or ""
+            )
+
+        item = {
+            "text": raw_text,
+            "intent": str(
+                getattr(
+                    turn,
+                    "intent",
+                    "",
+                )
+                or ""
+            ).strip(),
+            "speech_act": str(
+                getattr(
+                    turn,
+                    "speech_act",
+                    "",
+                )
+                or ""
+            ).strip(),
+            "subject": subject[
+                :120
+            ],
+        }
+
+        self.recent_user_turns.append(
+            item
+        )
+
+        self.recent_user_turns = (
+            self.recent_user_turns[
+                -8:
+            ]
+        )
+
+    def _generic_turn_depends_on_immediate_user_context(
+        self,
+        turn: TurnState,
+        pronouns: List[str],
+    ) -> bool:
+        if turn is None:
+            return False
+
+        if getattr(
+            turn,
+            "intent",
+            None,
+        ) not in {
+            "factual_question",
+            "share_opinion",
+            "share_context",
+            "casual_conversation",
+            "recommendation_request",
+            "acknowledge",
+            "correct_mairon",
+            "self_correction",
+        }:
+            return False
+
+        if not self.recent_user_turns:
+            return False
+
+        text = str(
+            getattr(
+                turn,
+                "raw_text",
+                "",
+            )
+            or ""
+        )
+
+        # An explicit pronoun/deictic still wins because it necessarily points
+        # somewhere, even if Oliver starts with "anyway". But a bare discourse
+        # reset such as "anyway why does my monitor flicker?" is a topic break,
+        # not permission to inject the previous anime/media turn.
+        if pronouns:
+            return True
+
+        if TOPIC_BOUNDARY_PATTERN.search(
+            text
+        ):
+            return False
+
+        # Explicit debate challenges such as "defend your take" point back to
+        # the active comparison even when they contain no pronoun or connective.
+        # This is discourse continuity, not factual authority.
+        if (
+            looks_like_debate_continuation(
+                text
+            )
+            and (
+                pairwise_subject_from_hint(
+                    self.active_subject
+                )
+                or extract_pairwise_comparison(
+                    (
+                        self.latest_user_turn()
+                        or {}
+                    ).get(
+                        "text",
+                        "",
+                    )
+                )
+            )
+        ):
+            return True
+
+        if CONTEXTUAL_CONNECTIVE_PATTERN.search(
+            text
+        ):
+            return True
+
+        # "what should I watch then?" and similar recommendation continuations
+        # may contain the backward pointer later in the sentence.
+        if (
+            getattr(
+                turn,
+                "intent",
+                None,
+            )
+            == "recommendation_request"
+            and re.search(
+                r"\b(?:then|instead|one|ones|that|those|this|these)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ):
+            return True
+
+        return False
+
     def update_from_turn(self, turn: TurnState) -> None:
-        if turn.subject:
+        subject = str(
+            turn.subject
+            or ""
+        ).strip()
+
+        if not subject:
+            subject = (
+                _infer_immediate_user_subject(
+                    turn.raw_text
+                )
+                or ""
+            )
+
+            if subject:
+                turn.subject = subject
+
+        if subject:
             self.remember_subject(
-                turn.subject
+                subject
             )
 
         if turn.intent:
@@ -145,8 +649,20 @@ class ConversationState:
                 if value is None:
                     continue
 
+                key_value = str(
+                    key
+                )
+
+                # Underscore-prefixed entities are ephemeral interpretation
+                # context for the current turn. Do not promote them into the
+                # generic active entity store or persisted referent authority.
+                if key_value.startswith(
+                    "_"
+                ):
+                    continue
+
                 self.active_entities[
-                    str(key)
+                    key_value
                 ] = str(value)
 
         if turn.requested_action:
@@ -238,6 +754,10 @@ class ConversationState:
                 )
                 or ""
             ).strip() or None
+
+        self.remember_user_turn(
+            turn
+        )
 
     def resolve_email_message_selection(
         self,
@@ -1082,7 +1602,18 @@ class ConversationState:
         return result
 
     def resolve_follow_up(self, turn: TurnState) -> TurnState:
-        text = turn.raw_text
+        """
+        Resolve immediate conversational dependence BEFORE epistemic routing.
+
+        Phase 11.2.1 deliberately uses only Core-owned state derived from
+        Oliver's own previous turn. Prior assistant prose is never promoted into
+        factual authority here.
+        """
+
+        text = str(
+            turn.raw_text
+            or ""
+        )
 
         pronouns = [
             match.group(1).lower()
@@ -1093,32 +1624,266 @@ class ConversationState:
             )
         ]
 
-        if not pronouns:
-            return turn
+        previous = (
+            self.latest_user_turn()
+        )
 
-        if not self.active_subject:
-            turn.unresolved_referents.extend(
-                pronouns
+        depends_on_previous = (
+            self._generic_turn_depends_on_immediate_user_context(
+                turn,
+                pronouns,
             )
+        )
+
+        if (
+            depends_on_previous
+            and previous
+        ):
+            previous_text = str(
+                previous.get(
+                    "text",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            previous_subject = str(
+                previous.get(
+                    "subject",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if previous_text:
+                turn.entities[
+                    "_conversation_context_user_text"
+                ] = previous_text
+
+                turn.entities[
+                    "_conversation_context_intent"
+                ] = str(
+                    previous.get(
+                        "intent",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+            if pronouns:
+                referent = (
+                    previous_subject
+                    or previous_text
+                )
+
+                if referent:
+                    for pronoun in pronouns:
+                        turn.resolved_referents[
+                            pronoun
+                        ] = referent
+
+            if (
+                previous_subject
+                and not turn.subject
+            ):
+                turn.subject = (
+                    previous_subject
+                )
+
+            turn.is_follow_up = True
 
             turn.add_reason(
-                "follow-up pronoun present but no active subject exists"
+                "resolved immediate conversational dependence from the "
+                "previous user-authored turn before epistemic routing"
             )
 
-            return turn
+            debate_continuation = (
+                looks_like_debate_continuation(
+                    text
+                )
+            )
 
-        for pronoun in pronouns:
-            turn.resolved_referents[
-                pronoun
-            ] = self.active_subject
+            if debate_continuation:
+                debate_subject = (
+                    extract_pairwise_comparison(
+                        previous_text
+                    )
+                    or pairwise_subject_from_hint(
+                        previous_subject
+                    )
+                    or pairwise_subject_from_hint(
+                        self.active_subject
+                    )
+                )
 
-        turn.is_follow_up = True
+                if debate_subject:
+                    turn.speech_act = "opinion_challenge"
+                    turn.intent = "share_opinion"
+                    turn.subject = debate_subject[
+                        "label"
+                    ]
+                    turn.factuality = "subjective"
+                    turn.preferred_authority = None
+                    turn.requires_private_data = False
+                    turn.requires_live_data = False
+                    turn.should_use_tools = False
+                    turn.should_answer_directly = True
+                    turn.should_recommend = False
+                    turn.should_continue_conversation = True
+                    turn.confidence = max(
+                        float(
+                            turn.confidence
+                            or 0.0
+                        ),
+                        0.97,
+                    )
 
-        if not turn.subject:
-            turn.subject = (
+                    turn.entities[
+                        "_debate_continuation"
+                    ] = "true"
+
+                    turn.entities[
+                        "_debate_subject_key"
+                    ] = debate_subject[
+                        "key"
+                    ]
+
+                    turn.entities[
+                        "_pairwise_left"
+                    ] = debate_subject[
+                        "left"
+                    ]
+
+                    turn.entities[
+                        "_pairwise_right"
+                    ] = debate_subject[
+                        "right"
+                    ]
+
+                    turn.entities[
+                        "_pairwise_asserted_side"
+                    ] = debate_subject.get(
+                        "asserted_side",
+                        "left",
+                    )
+
+                    turn.entities[
+                        "_pairwise_relation"
+                    ] = debate_subject.get(
+                        "relation",
+                        "",
+                    )
+
+                    turn.add_reason(
+                        "resolved explicit debate challenge against the active "
+                        "pairwise comparison before epistemic routing"
+                    )
+
+                    # Existing privacy-aware public-context detection still owns
+                    # whether external research is appropriate. Bare personal
+                    # names are never auto-promoted to public web research merely
+                    # because they appear in a comparison.
+                    if looks_like_public_external_context(
+                        previous_text
+                    ):
+                        turn.entities[
+                            "_conversation_public_grounding_required"
+                        ] = "true"
+
+                        turn.add_reason(
+                            "active debate has an explicit public/external context "
+                            "signal and may use factual grounding before judgement"
+                        )
+
+            # A contextual evaluative question asks for Mairon's judgement, not
+            # a fresh standalone public-world lookup. This prevents a phrase
+            # such as "do you think she handled it well?" from being searched
+            # on the web without its antecedent.
+            if (
+                turn.intent
+                == "factual_question"
+                and _looks_like_contextual_opinion_question(
+                    text
+                )
+            ):
+                turn.speech_act = "question"
+                turn.intent = "share_opinion"
+                turn.factuality = "subjective"
+                turn.preferred_authority = None
+                turn.requires_private_data = False
+                turn.requires_live_data = False
+                turn.should_use_tools = False
+                turn.should_answer_directly = True
+                turn.should_recommend = False
+                turn.should_continue_conversation = True
+                turn.confidence = max(
+                    float(
+                        turn.confidence
+                        or 0.0
+                    ),
+                    0.9,
+                )
+
+                turn.add_reason(
+                    "contextual evaluative question asks for conversational "
+                    "judgement rather than standalone factual lookup"
+                )
+
+                if looks_like_public_external_context(
+                    previous_text
+                ):
+                    turn.entities[
+                        "_conversation_public_grounding_required"
+                    ] = "true"
+
+                    turn.add_reason(
+                        "contextual opinion concerns a clearly public/external "
+                        "subject and needs factual grounding before judgement"
+                    )
+
+        elif pronouns:
+            # Preserve the pre-11.2 generic active-subject contract for
+            # deterministic/domain workflows that already established an
+            # authoritative subject (for example an order-status referent).
+            # Immediate USER context above takes precedence when available.
+            active_subject = str(
                 self.active_subject
-            )
+                or ""
+            ).strip()
 
+            if active_subject:
+                for pronoun in pronouns:
+                    turn.resolved_referents[
+                        pronoun
+                    ] = active_subject
+
+                turn.is_follow_up = True
+
+                if not turn.subject:
+                    turn.subject = (
+                        active_subject
+                    )
+
+                turn.add_reason(
+                    "resolved follow-up pronoun against the existing "
+                    "Core-owned active subject"
+                )
+
+            else:
+                turn.unresolved_referents.extend(
+                    pronoun
+                    for pronoun in pronouns
+                    if pronoun not in (
+                        turn.unresolved_referents
+                    )
+                )
+
+                turn.add_reason(
+                    "follow-up pronoun present but no safe immediate "
+                    "user-authored or Core-owned referent exists"
+                )
+
+        # Existing deterministic order-status inheritance remains intact.
         if (
             turn.intent == "email_search"
             and self.active_intent

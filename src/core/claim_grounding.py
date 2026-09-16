@@ -143,6 +143,29 @@ def contract_intent(
     )
 
 
+def contract_epistemic_mode(
+    core_answer_contract,
+) -> Optional[str]:
+    runtime = (
+        coerce_answer_contract_runtime(
+            core_answer_contract
+        )
+    )
+
+    if runtime is None:
+        return None
+
+    value = str(
+        runtime.epistemic_mode
+        or ""
+    ).strip().lower()
+
+    return (
+        value
+        or None
+    )
+
+
 def _message_role_and_content(
     message: Any,
 ):
@@ -1775,6 +1798,30 @@ def should_verify_core_grounding(
     intent = contract_intent(
         core_answer_contract
     )
+
+    epistemic_mode = (
+        contract_epistemic_mode(
+            core_answer_contract
+        )
+    )
+
+    if (
+        (
+            intent == "share_opinion"
+            and epistemic_mode
+            == "public_source_verified_opinion"
+        )
+        or (
+            intent == "consequential_advice"
+            and epistemic_mode
+            == "public_source_verified_advice"
+        )
+    ):
+        # Evidence-backed conversational opinions and consequential advice are
+        # verified against the dedicated public-source packet later in the
+        # provider. The ordinary Core verifier does not receive that packet and
+        # would therefore falsely reject supported external facts/procedures.
+        return False
 
     if intent in {
         "acknowledge",

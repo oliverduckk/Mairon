@@ -29,6 +29,7 @@ from core.desktop_agent_protocol import (
     DEFAULT_AGENT_PORT,
     MAX_REQUEST_BYTES,
     TOKEN_HEADER,
+    build_desktop_node_descriptor,
     decode_json,
     encode_json,
     error_response,
@@ -64,6 +65,13 @@ def execute_approved_agent_action(
             "success": True,
             "status": "pong",
             "agent": "windows_desktop",
+        }
+
+    if action == "describe_node":
+        return {
+            "success": True,
+            "status": "node_ready",
+            "node": build_desktop_node_descriptor(),
         }
 
     if action == "launch_application":
@@ -240,7 +248,7 @@ def execute_approved_agent_action(
 class DesktopAgentRequestHandler(
     BaseHTTPRequestHandler
 ):
-    server_version = "MaironDesktopAgent/0.1"
+    server_version = "MaironDesktopAgent/0.2"
     protocol_version = "HTTP/1.1"
 
     def log_message(
@@ -601,7 +609,7 @@ def create_desktop_agent_server(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Mairon Windows Desktop Agent v0.1"
+            "Mairon Windows Desktop Agent v0.2"
         )
     )
 
@@ -628,7 +636,7 @@ def main():
     )
 
     print(
-        "Mairon Windows Desktop Agent v0.1 starting..."
+        "Mairon Windows Desktop Agent v0.2 starting..."
     )
 
     print(
@@ -640,7 +648,7 @@ def main():
     )
 
     print(
-        "Approved actions: ping, launch_application, "
+        "Approved actions: ping, describe_node, launch_application, "
         "close_application, focus_application, "
         "open_trusted_browser_site, search_approved_local_files, "
         "open_approved_local_path, open_trusted_folder, "

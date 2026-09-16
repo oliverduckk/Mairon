@@ -209,7 +209,18 @@ def verify_public_factual_draft(
         "- Do not require citation formatting in the user-facing answer unless Oliver asked for it.\n"
         "- Assess EVERY numbered sentence independently. If a sentence mixes a supported fact "
         "with an unsupported detail, mark the whole sentence unsupported rather than rewriting it.\n"
-        "- Humour or personality does not require evidence only when it adds no factual premise.\n\n"
+        "- Humour or personality does not require evidence only when it adds no factual premise.\n"
+        "- If Oliver explicitly asks for Mairon's opinion or judgement, a clearly subjective "
+        "conclusion is allowed without being literally stated by a source, PROVIDED every "
+        "external-world premise used to justify that conclusion is supported by the packet. "
+        "Do not mark 'I think that was handled badly' unsupported merely because the source "
+        "does not itself express that opinion; DO mark any unsupported scene/event detail "
+        "inside the same sentence unsupported.\n"
+        "- For consequential advice, an action recommendation is supported only when the "
+        "evidence packet supports that action or procedure. Do not require a source to use "
+        "Mairon's exact wording, but reject invented deadlines, guarantees, reversibility, "
+        "provider powers, legal rights, recovery odds, or procedural steps that are not "
+        "established by the packet.\n\n"
         "Return JSON ONLY in this shape:\n"
         "{\n"
         '  "supported": true,\n'
@@ -366,8 +377,56 @@ def build_public_factual_retry_instruction(violations):
         + details
         + "\n\nRewrite the answer using ONLY the supplied Core public factual evidence. "
         "Remove unsupported details instead of replacing them with different guesses. "
+        "If Oliver asked for an opinion, you may still give a clearly subjective judgement "
+        "based on supported facts, but do not invent new factual premises. "
         "A shorter answer is correct when the evidence is narrow. Do not mention the internal "
         "verification process unless Oliver explicitly asks about it."
+    )
+
+
+def build_failed_public_opinion_fallback():
+    return (
+        "I couldn't verify enough of what actually happened there to give you "
+        "a proper take without bullshitting it."
+    )
+
+
+def build_failed_public_advice_fallback(
+    domain=None,
+):
+    domain_value = str(
+        domain
+        or ""
+    ).strip().lower()
+
+    if domain_value == "financial":
+        return (
+            "Because this could have real financial consequences, I don't want "
+            "to guess at the exact recovery process. Contact your bank or payment "
+            "provider through its official support channel now, tell them exactly "
+            "what happened, and follow their documented mistaken-payment process."
+        )
+
+    if domain_value == "account_security":
+        return (
+            "Because this could affect account security, I don't want to guess at "
+            "provider-specific recovery steps. Use the service's official security "
+            "or account-recovery channel now and avoid relying on links or contact "
+            "details from unsolicited messages."
+        )
+
+    if domain_value == "identity_document":
+        return (
+            "Because this involves an identity document, I don't want to guess at "
+            "the exact replacement or reporting process. Contact the document's "
+            "official issuing authority and follow its current lost-or-stolen "
+            "document procedure."
+        )
+
+    return (
+        "Because this could have real consequences, I don't want to guess at the "
+        "exact procedure. Use the relevant official authority or provider's current "
+        "support process rather than acting on an unverified assumption."
     )
 
 

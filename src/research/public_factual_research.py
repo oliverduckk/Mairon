@@ -4,6 +4,10 @@ from urllib.parse import urlparse
 
 from tools.tool_registry import execute_tool
 
+from core.conversational_research import (
+    normalise_public_research_query,
+)
+
 
 CURRENT_DAY_PATTERNS = [
     r"\btoday\b",
@@ -318,13 +322,25 @@ def _compact_evidence_text(value, max_characters=3600):
 def gather_public_factual_research(user_input, max_reads=2):
     """Gather bounded public-source evidence for a non-media factual turn."""
 
-    query = _normalise(user_input)
-    time_range = _time_range_for_question(user_input)
-    freshness_sensitive = _question_is_freshness_sensitive(
+    original_query = _normalise(
         user_input
     )
+
+    query = (
+        normalise_public_research_query(
+            original_query
+        )
+        or original_query
+    )
+
+    time_range = _time_range_for_question(
+        original_query
+    )
+    freshness_sensitive = _question_is_freshness_sensitive(
+        original_query
+    )
     forecast_requested = _question_requests_forecast(
-        user_input
+        original_query
     )
 
     search_result = execute_tool(
@@ -393,6 +409,7 @@ def gather_public_factual_research(user_input, max_reads=2):
         failure_reason = "No selected webpage could be read successfully."
 
     return {
+        "original_query": original_query,
         "query": query,
         "time_range": time_range,
         "freshness_sensitive": freshness_sensitive,

@@ -3,6 +3,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 from core.turn_state import TurnState
+from core.conversational_research import (
+    contextual_opinion_requires_public_grounding,
+)
 
 
 @dataclass
@@ -169,6 +172,21 @@ def route_epistemic_authority(
             ),
         )
 
+    if turn.intent == "consequential_advice":
+        return EpistemicRoute(
+            authority="public_web",
+            mode="public_source_verified_advice",
+            verification_required=True,
+            allow_model_memory=False,
+            live_data_required=True,
+            private_data_required=False,
+            reason=(
+                "Consequential real-world guidance requires current public "
+                "evidence; model memory and casual conversation are not "
+                "authoritative enough."
+            ),
+        )
+
     if turn.intent == "order_status":
         return EpistemicRoute(
             authority="gmail",
@@ -197,6 +215,27 @@ def route_epistemic_authority(
             reason=(
                 "Email existence and contents must come from verified Gmail "
                 "data, not model memory or prior assistant prose."
+            ),
+        )
+
+    if (
+        turn.intent == "share_opinion"
+        and contextual_opinion_requires_public_grounding(
+            turn
+        )
+    ):
+        return EpistemicRoute(
+            authority="public_web",
+            mode="public_source_verified_opinion",
+            verification_required=True,
+            allow_model_memory=False,
+            live_data_required=False,
+            private_data_required=False,
+            reason=(
+                "Oliver asked for Mairon's judgement about a clearly public or "
+                "external subject, but the live conversation does not establish "
+                "enough factual substrate for a detailed opinion. Core requires "
+                "bounded public evidence before the personality layer answers."
             ),
         )
 

@@ -15,6 +15,11 @@ from core.action_manager import (
 from core.conversation_state import (
     ConversationState,
     append_visible_turn_to_model_history,
+    build_live_user_continuity_instruction,
+)
+from core.conversation_claim_boundary import (
+    apply_conversational_claim_boundary,
+    build_conversational_claim_boundary_instruction,
 )
 from core.orchestrator import (
     MaironCore,
@@ -855,6 +860,31 @@ class MaironApplication:
                     agent_action=agent_action,
                 )
 
+            conversational_claim_mode = (
+                apply_conversational_claim_boundary(
+                    turn=turn,
+                    route=route,
+                    contract=(
+                        core_decision
+                        .answer_contract
+                    ),
+                )
+            )
+
+            if conversational_claim_mode:
+                label = (
+                    "social claim ceiling"
+                    if conversational_claim_mode
+                    == "social_claim_ceiling"
+                    else "recommendation detail ceiling"
+                )
+
+                self._emit_event(
+                    "[Grounding] Conversational "
+                    + label
+                    + " active."
+                )
+
             turn_instructions = (
                 self.instructions
                 + "\n\n"
@@ -864,6 +894,37 @@ class MaironApplication:
                     .to_model_instruction()
                 )
             )
+
+            claim_boundary_instruction = (
+                build_conversational_claim_boundary_instruction(
+                    turn=turn,
+                    route=route,
+                    mode=conversational_claim_mode,
+                )
+            )
+
+            if claim_boundary_instruction:
+                turn_instructions += (
+                    "\n\n"
+                    + claim_boundary_instruction
+                )
+
+            continuity_instruction = (
+                build_live_user_continuity_instruction(
+                    turn
+                )
+            )
+
+            if continuity_instruction:
+                turn_instructions += (
+                    "\n\n"
+                    + continuity_instruction
+                )
+
+                self._emit_event(
+                    "[Context] Immediate prior Oliver turn supplied "
+                    "for live continuity."
+                )
 
         else:
             turn_instructions = (
