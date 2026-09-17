@@ -1213,6 +1213,104 @@ def planner_query_grounding_violations(
     return violations
 
 
+def _ground_planner_notes(
+    job: dict,
+    result: dict,
+    plan: dict,
+) -> dict:
+    """
+    Apply the same evidence-grounding rule to planner-authored notes that are
+    later persisted in durable research state.
+
+    Search-query grounding alone is insufficient: an invented product/person/
+    version inside knowledge_gaps or reason could otherwise survive in
+    planner_history/checkpoints and later be mistaken for researched context by
+    final synthesis.
+    """
+
+    grounded_plan = dict(
+        plan
+    )
+
+    grounded_gaps = []
+    rejected_fields = set()
+
+    for gap in (
+        plan.get(
+            "knowledge_gaps"
+        )
+        or []
+    ):
+        value = _normalise_space(
+            gap
+        )
+
+        if not value:
+            continue
+
+        violations = (
+            planner_query_grounding_violations(
+                job,
+                result,
+                value,
+            )
+        )
+
+        if violations:
+            rejected_fields.add(
+                "knowledge_gaps"
+            )
+            continue
+
+        grounded_gaps.append(
+            value
+        )
+
+    grounded_plan[
+        "knowledge_gaps"
+    ] = grounded_gaps[
+        :8
+    ]
+
+    reason = _normalise_space(
+        plan.get(
+            "reason"
+        )
+    )
+
+    if reason:
+        reason_violations = (
+            planner_query_grounding_violations(
+                job,
+                result,
+                reason,
+            )
+        )
+
+        if reason_violations:
+            rejected_fields.add(
+                "reason"
+            )
+
+            reason = (
+                "Core removed unsupported specific identities from the "
+                "planner explanation. Continue from grounded retrieved "
+                "evidence and accepted research queries only."
+            )
+
+    grounded_plan[
+        "reason"
+    ] = reason
+
+    grounded_plan[
+        "rejected_planner_note_fields"
+    ] = sorted(
+        rejected_fields
+    )
+
+    return grounded_plan
+
+
 def ground_planner_search_queries(
     job: dict,
     result: dict,
@@ -1270,8 +1368,10 @@ def ground_planner_search_queries(
             value
         )
 
-    grounded_plan = dict(
-        plan
+    grounded_plan = _ground_planner_notes(
+        job,
+        result,
+        plan,
     )
 
     grounded_plan[
@@ -1310,6 +1410,13 @@ def ground_planner_search_queries(
     fallback[
         "rejected_search_queries"
     ] = rejected
+
+    fallback[
+        "rejected_planner_note_fields"
+    ] = grounded_plan.get(
+        "rejected_planner_note_fields",
+        [],
+    )
 
     fallback[
         "reason"
@@ -1377,11 +1484,12 @@ def plan_next_deep_research_round(
         "or fan analysis and avoid inventing plot details.\n"
         "- Search queries should target the most important remaining gaps and should "
         "not merely repeat queries already used.\n"
-        "- CRITICAL QUERY-GROUNDING RULE: never introduce a specific product model, "
-        "person, character, organisation, version, date, or named entity into a search "
-        "query unless that exact identity already appears in Oliver's request/topic or "
-        "in Core-retrieved evidence. If you suspect an unknown/new identity exists, "
-        "search generically for the current lineup/releases/official catalogue first.\n"
+        "- CRITICAL PLANNER-GROUNDING RULE: never introduce a specific product model, "
+        "person, character, organisation, version, date, or named entity into ANY returned "
+        "field (search_queries, knowledge_gaps, or reason) unless that exact identity already "
+        "appears in Oliver's request/topic or in Core-retrieved evidence. If you suspect an "
+        "unknown/new identity exists, describe the gap generically and search generically for "
+        "the current lineup/releases/official catalogue first.\n"
         f"- RUNTIME DATE LOCK: today is {runtime_research_date()} in "
         f"{_runtime_timezone_name()}. For current/latest research, do not fall back to "
         "an older model-training year. Prefer the actual runtime year or no year at all "
