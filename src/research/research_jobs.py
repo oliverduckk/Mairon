@@ -6,7 +6,7 @@ import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -160,6 +160,106 @@ def _connect():
         connection.close()
 
 
+
+def _table_columns(
+    connection: sqlite3.Connection,
+    table_name: str,
+) -> set[str]:
+    rows = connection.execute(
+        "PRAGMA table_info("
+        + str(
+            table_name
+        )
+        + ")"
+    ).fetchall()
+
+    return {
+        str(
+            row[
+                "name"
+            ]
+        )
+        for row in rows
+    }
+
+
+def _ensure_research_job_schema_columns(
+    connection: sqlite3.Connection,
+) -> None:
+    """
+    Forward-only additive migration for the persistent research queue.
+
+    Phase 11.5.1 databases already exist in user installs. CREATE TABLE IF NOT
+    EXISTS does not add new columns, so lease fields must be migrated explicitly
+    without deleting or recreating the queue.
+    """
+
+    columns = _table_columns(
+        connection,
+        "research_jobs",
+    )
+
+    additions = {
+        "lease_owner": "TEXT",
+        "lease_expires_at": "TEXT",
+        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "resume_automatically": "INTEGER NOT NULL DEFAULT 0",
+    }
+
+    for column_name, declaration in additions.items():
+        if column_name in columns:
+            continue
+
+        connection.execute(
+            "ALTER TABLE research_jobs ADD COLUMN "
+            + column_name
+            + " "
+            + declaration
+        )
+
+    # Phase 11.5.2 intentionally paused deep/normal jobs after the initial
+    # evidence pass. When 11.5.3 first opens that database, make those known
+    # iterative checkpoints resumable without requiring Oliver to recreate them.
+    paused_rows = connection.execute(
+        """
+        SELECT id, checkpoint_json
+        FROM research_jobs
+        WHERE status = 'paused'
+          AND COALESCE(resume_automatically, 0) = 0
+        """
+    ).fetchall()
+
+    for row in paused_rows:
+        checkpoint = _decode_json(
+            row[
+                "checkpoint_json"
+            ]
+        )
+
+        if (
+            isinstance(
+                checkpoint,
+                dict,
+            )
+            and checkpoint.get(
+                "next_stage"
+            )
+            == "iterative_deep_research"
+        ):
+            connection.execute(
+                """
+                UPDATE research_jobs
+                SET resume_automatically = 1
+                WHERE id = ?
+                """,
+                (
+                    row[
+                        "id"
+                    ],
+                ),
+            )
+
+
 def initialise_research_job_store() -> None:
     with _connect() as connection:
         connection.execute(
@@ -206,6 +306,21 @@ def initialise_research_job_store() -> None:
             """
         )
 
+        _ensure_research_job_schema_columns(
+            connection
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                research_jobs_lease
+            ON research_jobs (
+                status,
+                lease_expires_at
+            )
+            """
+        )
+
 
 def _row_to_job(
     row: sqlite3.Row,
@@ -232,6 +347,15 @@ def _row_to_job(
             row["metadata_json"]
         ),
         "error": row["error_text"],
+        "lease_owner": row["lease_owner"],
+        "lease_expires_at": row["lease_expires_at"],
+        "attempt_count": int(
+            row["attempt_count"]
+            or 0
+        ),
+        "resume_automatically": bool(
+            row["resume_automatically"]
+        ),
     }
 
 
@@ -398,9 +522,13 @@ def create_research_job(
                 checkpoint_json,
                 result_json,
                 metadata_json,
-                error_text
+                error_text,
+                lease_owner,
+                lease_expires_at,
+                attempt_count,
+                resume_automatically
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -431,6 +559,10 @@ def create_research_job(
                     job_metadata
                 ),
                 None,
+                None,
+                None,
+                0,
+                0,
             ),
         )
 
@@ -526,6 +658,7 @@ def update_research_job(
     checkpoint: Optional[dict] = None,
     result: Optional[dict] = None,
     error: Optional[str] = None,
+    resume_automatically: Optional[bool] = None,
 ) -> dict:
     current = get_research_job(
         job_id
@@ -567,6 +700,20 @@ def update_research_job(
         else current["result"]
     )
 
+    if resume_automatically is None:
+        next_resume_automatically = bool(
+            current.get(
+                "resume_automatically"
+            )
+        )
+    else:
+        next_resume_automatically = bool(
+            resume_automatically
+        )
+
+    if next_status != "paused":
+        next_resume_automatically = False
+
     with _connect() as connection:
         connection.execute(
             """
@@ -575,7 +722,16 @@ def update_research_job(
                 status = ?,
                 checkpoint_json = ?,
                 result_json = ?,
-                error_text = ?
+                error_text = ?,
+                lease_owner = CASE
+                    WHEN ? = 'running' THEN lease_owner
+                    ELSE NULL
+                END,
+                lease_expires_at = CASE
+                    WHEN ? = 'running' THEN lease_expires_at
+                    ELSE NULL
+                END,
+                resume_automatically = ?
             WHERE id = ?
             """,
             (
@@ -594,6 +750,11 @@ def update_research_job(
                     if error is not None
                     else current["error"]
                 ),
+                next_status,
+                next_status,
+                1
+                if next_resume_automatically
+                else 0,
                 str(
                     current["id"]
                 ),
@@ -602,6 +763,363 @@ def update_research_job(
 
     updated = get_research_job(
         current["id"]
+    )
+
+    if updated is None:
+        raise RuntimeError(
+            "research job update could not be read back"
+        )
+
+    return updated
+
+
+def _lease_expiry_iso(
+    lease_seconds: int,
+) -> str:
+    try:
+        seconds = max(
+            30,
+            int(
+                lease_seconds
+                or 0
+            ),
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        seconds = 300
+
+    return (
+        datetime.now(
+            timezone.utc
+        )
+        + timedelta(
+            seconds=seconds
+        )
+    ).isoformat()
+
+
+def claim_next_research_job(
+    *,
+    worker_id: Any,
+    lease_seconds: int = 300,
+) -> Optional[dict]:
+    """
+    Atomically claim the oldest available background job.
+
+    A queued job is eligible immediately. A previously-running job becomes
+    eligible again only after its lease expires, which lets a new worker recover
+    work after a crash/restart without two live workers owning it at once.
+    """
+
+    worker = _normalise_space(
+        worker_id
+    )
+
+    if not worker:
+        raise ValueError(
+            "worker_id is required"
+        )
+
+    initialise_research_job_store()
+
+    now = _now_iso()
+    lease_expires_at = _lease_expiry_iso(
+        lease_seconds
+    )
+
+    with _connect() as connection:
+        connection.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        row = connection.execute(
+            """
+            SELECT *
+            FROM research_jobs
+            WHERE priority = 'background'
+              AND (
+                    status = 'queued'
+                    OR (
+                        status = 'paused'
+                        AND COALESCE(resume_automatically, 0) = 1
+                    )
+                    OR (
+                        status = 'running'
+                        AND (
+                            lease_expires_at IS NULL
+                            OR lease_expires_at <= ?
+                        )
+                    )
+                  )
+            ORDER BY
+                CASE status
+                    WHEN 'queued' THEN 0
+                    WHEN 'paused' THEN 1
+                    ELSE 2
+                END,
+                updated_at ASC,
+                created_at ASC
+            LIMIT 1
+            """,
+            (
+                now,
+            ),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        job_id = str(
+            row[
+                "id"
+            ]
+        )
+
+        connection.execute(
+            """
+            UPDATE research_jobs
+            SET updated_at = ?,
+                status = 'running',
+                lease_owner = ?,
+                lease_expires_at = ?,
+                attempt_count = COALESCE(attempt_count, 0) + 1,
+                error_text = NULL,
+                resume_automatically = 0
+            WHERE id = ?
+            """,
+            (
+                now,
+                worker,
+                lease_expires_at,
+                job_id,
+            ),
+        )
+
+        claimed_row = connection.execute(
+            """
+            SELECT *
+            FROM research_jobs
+            WHERE id = ?
+            """,
+            (
+                job_id,
+            ),
+        ).fetchone()
+
+    if claimed_row is None:
+        return None
+
+    return _row_to_job(
+        claimed_row
+    )
+
+
+def renew_research_job_lease(
+    job_id: Any,
+    *,
+    worker_id: Any,
+    lease_seconds: int = 300,
+) -> bool:
+    job_value = _normalise_space(
+        job_id
+    )
+
+    worker = _normalise_space(
+        worker_id
+    )
+
+    if not job_value or not worker:
+        return False
+
+    initialise_research_job_store()
+
+    with _connect() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE research_jobs
+            SET updated_at = ?,
+                lease_expires_at = ?
+            WHERE id = ?
+              AND status = 'running'
+              AND lease_owner = ?
+            """,
+            (
+                _now_iso(),
+                _lease_expiry_iso(
+                    lease_seconds
+                ),
+                job_value,
+                worker,
+            ),
+        )
+
+        return cursor.rowcount == 1
+
+
+def update_claimed_research_job(
+    job_id: Any,
+    *,
+    worker_id: Any,
+    status: Optional[str] = None,
+    checkpoint: Optional[dict] = None,
+    result: Optional[dict] = None,
+    error: Optional[str] = None,
+    lease_seconds: int = 300,
+    resume_automatically: bool = False,
+) -> dict:
+    """
+    Update a job only when the caller still owns its active lease.
+
+    This is the worker-safe counterpart to update_research_job(). Terminal,
+    queued, and paused transitions release the lease automatically.
+    """
+
+    job_value = _normalise_space(
+        job_id
+    )
+
+    worker = _normalise_space(
+        worker_id
+    )
+
+    if not job_value or not worker:
+        raise ValueError(
+            "job_id and worker_id are required"
+        )
+
+    initialise_research_job_store()
+
+    current = get_research_job(
+        job_value
+    )
+
+    if current is None:
+        raise KeyError(
+            "research job not found"
+        )
+
+    if (
+        current.get(
+            "status"
+        )
+        != "running"
+        or current.get(
+            "lease_owner"
+        )
+        != worker
+    ):
+        raise RuntimeError(
+            "research job lease is not owned by this worker"
+        )
+
+    next_status = (
+        _normalise_space(
+            status
+        ).lower()
+        if status is not None
+        else "running"
+    )
+
+    allowed_statuses = (
+        ACTIVE_RESEARCH_JOB_STATUSES
+        | TERMINAL_RESEARCH_JOB_STATUSES
+    )
+
+    if next_status not in allowed_statuses:
+        raise ValueError(
+            "unsupported research job status: "
+            + next_status
+        )
+
+    next_checkpoint = (
+        checkpoint
+        if checkpoint is not None
+        else current.get(
+            "checkpoint"
+        )
+        or {}
+    )
+
+    next_result = (
+        result
+        if result is not None
+        else current.get(
+            "result"
+        )
+        or {}
+    )
+
+    lease_owner = (
+        worker
+        if next_status == "running"
+        else None
+    )
+
+    lease_expires_at = (
+        _lease_expiry_iso(
+            lease_seconds
+        )
+        if next_status == "running"
+        else None
+    )
+
+    next_resume_automatically = bool(
+        resume_automatically
+    ) and next_status == "paused"
+
+    with _connect() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE research_jobs
+            SET updated_at = ?,
+                status = ?,
+                checkpoint_json = ?,
+                result_json = ?,
+                error_text = ?,
+                lease_owner = ?,
+                lease_expires_at = ?,
+                resume_automatically = ?
+            WHERE id = ?
+              AND status = 'running'
+              AND lease_owner = ?
+            """,
+            (
+                _now_iso(),
+                next_status,
+                _encode_json(
+                    next_checkpoint
+                ),
+                _encode_json(
+                    next_result
+                ),
+                (
+                    str(
+                        error
+                    )
+                    if error is not None
+                    else current.get(
+                        "error"
+                    )
+                ),
+                lease_owner,
+                lease_expires_at,
+                1
+                if next_resume_automatically
+                else 0,
+                job_value,
+                worker,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "research job lease changed before the update completed"
+            )
+
+    updated = get_research_job(
+        job_value
     )
 
     if updated is None:

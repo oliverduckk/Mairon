@@ -336,8 +336,11 @@ _BACKGROUND_RESEARCH_DIRECT_PATTERN = re.compile(
 _BACKGROUND_RESEARCH_SUFFIX_PATTERN = re.compile(
     r"\s+(?:"
     r"in\s+the\s+background|"
-    r"while\s+i(?:'m| am)?\s+(?:sleep(?:ing)?|asleep|out|away|busy)|"
-    r"overnight"
+    r"overnight|"
+    r"(?:while|when)\s+i(?:'m|m| am)?\s+"
+    r"(?:sleep(?:ing)?|asleep|out|away|busy|at\s+work)|"
+    r"(?:while|when)\s+i\s+(?:sleep|go\s+to\s+sleep)|"
+    r"before\s+i\s+(?:wake\s+up|get\s+back|come\s+back|get\s+home)"
     r")\s*$",
     flags=re.IGNORECASE,
 )
@@ -438,18 +441,31 @@ def extract_explicit_background_research_request(
     if not match:
         return None
 
-    topic = re.sub(
-        _BACKGROUND_RESEARCH_SUFFIX_PATTERN,
-        "",
-        str(
-            match.group(
-                "topic"
-            )
-            or ""
-        ).strip(),
-    ).strip(
+    topic = str(
+        match.group(
+            "topic"
+        )
+        or ""
+    ).strip()
+
+    # Execution timing belongs to job policy, not topic identity. Strip terminal
+    # punctuation first so phrases such as "in the background." still match.
+    topic = topic.strip(
         " \t\r\n?!.,;:"
     )
+
+    previous = None
+
+    while topic and topic != previous:
+        previous = topic
+
+        topic = re.sub(
+            _BACKGROUND_RESEARCH_SUFFIX_PATTERN,
+            "",
+            topic,
+        ).strip(
+            " \t\r\n?!.,;:"
+        )
 
     if not topic:
         return None

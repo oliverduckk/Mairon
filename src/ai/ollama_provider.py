@@ -62,6 +62,12 @@ from research.research_jobs import (
     find_active_research_job,
 )
 
+from research.research_worker import (
+    begin_interactive_turn,
+    end_interactive_turn,
+    ensure_background_research_worker_started,
+)
+
 from research.public_factual_grounding import (
     build_failed_public_advice_fallback,
     build_failed_public_factual_fallback,
@@ -3695,6 +3701,335 @@ def resolve_overview_date(
     }
 
 
+def _normalise_space(
+    value,
+):
+    return re.sub(
+        r"\s+",
+        " ",
+        str(
+            value
+            or ""
+        ).strip(),
+    )
+
+
+def build_safe_day_overview_fallback(
+    *,
+    relative_name,
+    date_string,
+    routine_result,
+    calendar_result,
+    alarm_result,
+):
+    """
+    Deterministic Core fallback for a day-overview request.
+
+    A structured private-data workflow must never return an empty answer merely
+    because the local language model produced blank content. This formatter is
+    deliberately conservative and only uses fields present in the retrieved
+    routine, calendar, and alarm payloads.
+    """
+
+    parts = []
+
+    routine = (
+        routine_result
+        if isinstance(
+            routine_result,
+            dict,
+        )
+        else {}
+    )
+
+    weekday = _normalise_space(
+        routine.get(
+            "weekday"
+        )
+    )
+
+    day_type = _normalise_space(
+        routine.get(
+            "day_type"
+        )
+    ).lower()
+
+    work_location = _normalise_space(
+        routine.get(
+            "work_location"
+        )
+    ).lower()
+
+    if day_type == "work":
+        sentence = (
+            relative_name.capitalize()
+            + " is"
+        )
+
+        if weekday:
+            sentence += (
+                " "
+                + weekday
+            )
+
+        sentence += " and is a workday"
+
+        if work_location == "home":
+            sentence += " from home"
+
+        elif work_location == "office":
+            sentence += " in the office"
+
+        sentence += "."
+
+        parts.append(
+            sentence
+        )
+
+    elif day_type == "university":
+        sentence = (
+            relative_name.capitalize()
+            + " is"
+        )
+
+        if weekday:
+            sentence += (
+                " "
+                + weekday
+            )
+
+        sentence += " and is a university day."
+
+        parts.append(
+            sentence
+        )
+
+    elif weekday:
+        parts.append(
+            relative_name.capitalize()
+            + " is "
+            + weekday
+            + "."
+        )
+
+    routine_context = (
+        routine.get(
+            "routine_context"
+        )
+        or {}
+    )
+
+    routine_rules = (
+        routine_context.get(
+            "routine"
+        )
+        if isinstance(
+            routine_context,
+            dict,
+        )
+        else []
+    )
+
+    if isinstance(
+        routine_rules,
+        list,
+    ) and routine_rules:
+        first_rule = (
+            routine_rules[
+                0
+            ]
+            if isinstance(
+                routine_rules[
+                    0
+                ],
+                dict,
+            )
+            else {}
+        )
+
+        start_time = _normalise_space(
+            first_rule.get(
+                "start_time"
+            )
+        )
+
+        end_time = _normalise_space(
+            first_rule.get(
+                "end_time"
+            )
+        )
+
+        if (
+            start_time
+            and end_time
+        ):
+            parts.append(
+                "The routine runs "
+                + start_time
+                + "–"
+                + end_time
+                + "."
+            )
+
+    alarm = (
+        alarm_result
+        if isinstance(
+            alarm_result,
+            dict,
+        )
+        else {}
+    )
+
+    alarm_record = (
+        alarm.get(
+            "alarm"
+        )
+        if isinstance(
+            alarm.get(
+                "alarm"
+            ),
+            dict,
+        )
+        else alarm
+    )
+
+    if bool(
+        alarm_record.get(
+            "exists"
+        )
+    ):
+        if bool(
+            alarm_record.get(
+                "enabled"
+            )
+        ):
+            alarm_time = _normalise_space(
+                alarm_record.get(
+                    "time"
+                )
+                or alarm_record.get(
+                    "wake_time"
+                )
+            )
+
+            if alarm_time:
+                parts.append(
+                    "Your stored wake alarm is "
+                    + alarm_time
+                    + "."
+                )
+
+        else:
+            parts.append(
+                "There is no active wake alarm."
+            )
+
+    events = []
+
+    if isinstance(
+        calendar_result,
+        dict,
+    ):
+        candidate_events = calendar_result.get(
+            "events"
+        )
+
+        if isinstance(
+            candidate_events,
+            list,
+        ):
+            events = candidate_events
+
+    event_parts = []
+
+    for event in events[
+        :5
+    ]:
+        if not isinstance(
+            event,
+            dict,
+        ):
+            continue
+
+        summary = _normalise_space(
+            event.get(
+                "summary"
+            )
+            or event.get(
+                "title"
+            )
+            or "Calendar event"
+        )
+
+        start_value = (
+            event.get(
+                "start"
+            )
+            or event.get(
+                "start_time"
+            )
+            or event.get(
+                "start_datetime"
+            )
+        )
+
+        if isinstance(
+            start_value,
+            dict,
+        ):
+            start_value = (
+                start_value.get(
+                    "dateTime"
+                )
+                or start_value.get(
+                    "date"
+                )
+            )
+
+        start_text = _normalise_space(
+            start_value
+        )
+
+        if start_text:
+            event_parts.append(
+                summary
+                + " ("
+                + start_text
+                + ")"
+            )
+        elif summary:
+            event_parts.append(
+                summary
+            )
+
+    if event_parts:
+        parts.append(
+            "Calendar: "
+            + "; ".join(
+                event_parts
+            )
+            + "."
+        )
+    else:
+        parts.append(
+            "There are no specific Calendar events returned for "
+            + relative_name
+            + "."
+        )
+
+    if not parts:
+        return (
+            "I retrieved the day context for "
+            + date_string
+            + ", but the structured sources did not contain enough detail "
+            "to build a useful overview."
+        )
+
+    return " ".join(
+        parts
+    )
+
+
 def handle_day_overview_request(
     client,
     user_input,
@@ -3827,15 +4162,44 @@ def handle_day_overview_request(
 
     response = client.chat(
         model=get_local_model_name(),
-        messages=working_conversation
+        messages=working_conversation,
+        think=False,
     )
 
-    working_conversation.append(
-        response.message
+    content = _normalise_space(
+        getattr(
+            response.message,
+            "content",
+            "",
+        )
     )
+
+    if not content:
+        print(
+            "[Core] Day overview model returned blank; "
+            "using deterministic Core fallback."
+        )
+
+        content = build_safe_day_overview_fallback(
+            relative_name=relative_name,
+            date_string=date_string,
+            routine_result=routine_result,
+            calendar_result=calendar_result,
+            alarm_result=alarm_result,
+        )
+
+        working_conversation.append({
+            "role": "assistant",
+            "content": content,
+        })
+
+    else:
+        working_conversation.append(
+            response.message
+        )
 
     return (
-        response.message.content,
+        content,
         working_conversation,
         None,
         None
@@ -7711,6 +8075,8 @@ def handle_pending_research_permission_reply(
         or {},
     )
 
+    ensure_background_research_worker_started()
+
     answer = (
         build_background_research_queued_text(
             job
@@ -7775,6 +8141,8 @@ def handle_explicit_background_research_request(
         )
         or {},
     )
+
+    ensure_background_research_worker_started()
 
     answer = (
         build_background_research_queued_text(
@@ -10200,13 +10568,19 @@ def handle_direct_conversation(
 # Main local provider
 # --------------------------------------------------
 
-def get_response(
+def _get_response_impl(
     client,
     user_input,
     instructions,
     conversation=None,
     allow_cloud_escalation=False
 ):
+    # Start the lightweight daemon even when this turn is not creating a new
+    # job. That lets durable paused/expired work from an earlier Mairon process
+    # resume after Oliver's first interaction, without making the desktop a
+    # prerequisite for keeping the job state alive.
+    ensure_background_research_worker_started()
+
     (
         static_instructions,
         core_answer_contract_text,
@@ -11160,3 +11534,36 @@ def get_response(
                     None,
                     None
                 )
+
+
+def get_response(
+    client,
+    user_input,
+    instructions,
+    conversation=None,
+    allow_cloud_escalation=False,
+):
+    """
+    Public provider entrypoint.
+
+    Hold a foreground-interaction lease for the ENTIRE turn, not merely for a
+    timestamp at turn start. A long Calendar/Gmail/tool/Qwen workflow therefore
+    cannot be mistaken for user idleness and overlapped by background Ollama
+    planning. The post-response idle grace begins only after this function
+    returns (or raises).
+    """
+
+    begin_interactive_turn()
+
+    try:
+        return _get_response_impl(
+            client=client,
+            user_input=user_input,
+            instructions=instructions,
+            conversation=conversation,
+            allow_cloud_escalation=allow_cloud_escalation,
+        )
+
+    finally:
+        end_interactive_turn()
+
