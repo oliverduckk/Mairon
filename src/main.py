@@ -85,7 +85,7 @@ if api_key:
 # Startup
 # --------------------------------------------------
 
-print("Mairon v0.1 starting...")
+print("Mairon v0.2-dev starting...")
 print(
     f"Default AI: Local {local_model_name}"
 )

@@ -2954,7 +2954,7 @@ class MaironDesktopApp:
 
         tk.Label(
             sidebar_footer,
-            text="v0.1 • Phase 10",
+            text="v0.2-dev",
             bg=self.theme[
                 "surface"
             ],
