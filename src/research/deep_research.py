@@ -252,9 +252,11 @@ def research_quality_requirements(
     """
     Deterministic minimum evidence floors.
 
-    These are NOT completion rules by themselves. The planner must still say
-    the important knowledge gaps are resolved. Floors merely prevent a local
-    model from declaring victory after one shallow search.
+    Before the safety cap, the planner still decides whether important gaps remain.
+    At the hard research cap, however, a satisfied deterministic floor is enough to
+    hand the evidence to grounded final synthesis. That avoids an indefinitely
+    cautious planner vetoing completion after substantial evidence has accumulated;
+    unsupported claims are still blocked by the synthesis verifier.
     """
 
     depth = _normalise_space(
@@ -847,8 +849,7 @@ _QUERY_GENERIC_CAPITALISED_WORDS = {
     "sensor",
     "sensors",
     "accuracy",
-    "durability",
-    "problems",
+    "durability","problems",
     "issues",
     "strengths",
     "weaknesses",
@@ -1655,13 +1656,28 @@ def research_collection_decision(
     if quality.get(
         "maximum_rounds_reached"
     ):
+        if quality.get(
+            "minimum_floor_met"
+        ):
+            return {
+                "state": "evidence_collection_complete",
+                "quality": quality,
+                "completion_mode": "safety_cap_floor_met",
+                "reason": (
+                    "The deep-research safety cap was reached after the "
+                    "deterministic evidence floor was satisfied. Proceed to "
+                    "grounded final synthesis rather than allowing an indefinitely "
+                    "cautious planner to extend research forever. Any unresolved "
+                    "planner gaps remain non-authoritative and are not evidence."
+                ),
+            }
+
         return {
             "state": "review_required",
             "quality": quality,
             "reason": (
-                "The deep-research safety cap was reached before both the "
-                "planner and deterministic evidence floors agreed that the "
-                "important knowledge gaps were resolved."
+                "The deep-research safety cap was reached before the deterministic "
+                "minimum evidence floor was satisfied."
             ),
         }
 

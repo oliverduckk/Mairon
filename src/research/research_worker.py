@@ -17,6 +17,10 @@ from research.deep_research import (
     research_collection_decision,
     research_quality_snapshot,
 )
+from research.final_synthesis import (
+    generate_grounded_final_synthesis,
+    verify_grounded_final_synthesis,
+)
 from research.public_factual_research import (
     build_internal_public_factual_packet,
     gather_public_factual_research,
@@ -1122,7 +1126,7 @@ def _handle_iterative_deep_stage(
                 checkpoint=complete_checkpoint,
                 result=accumulated,
                 error=None,
-                resume_automatically=False,
+                resume_automatically=True,
             )
 
         if decision[
@@ -1324,6 +1328,20 @@ def _handle_iterative_deep_stage(
         "quality"
     ] = quality
 
+    if quality.get(
+        "maximum_rounds_reached"
+    ):
+        # The maximum round count is a hard cap, not merely a signal checked at
+        # the next planner boundary. Drop any still-pending queries so the next
+        # bounded worker pass resolves the cap immediately instead of overshooting
+        # it by executing the rest of a previously planned batch.
+        remaining_queries = []
+
+        print(
+            "[Research] Deep-research round cap reached; "
+            "discarding remaining planned queries before completion review."
+        )
+
     updated_checkpoint = {
         **checkpoint,
         "stage": "iterative_deep_research_checkpoint",
@@ -1374,12 +1392,477 @@ def _handle_iterative_deep_stage(
     )
 
 
+def _handle_final_synthesis_stage(
+    *,
+    job: dict,
+    worker_id: str,
+    synthesis_fn: Callable,
+    respect_interactive_preemption: bool,
+) -> dict:
+    checkpoint = dict(
+        job.get(
+            "checkpoint"
+        )
+        or {}
+    )
+
+    accumulated = dict(
+        job.get(
+            "result"
+        )
+        or {}
+    )
+
+    if (
+        respect_interactive_preemption
+        and not background_research_can_run()
+    ):
+        print(
+            "[Research] Interactive activity detected; final synthesis yielded."
+        )
+
+        return _pause_for_next_deep_stage(
+            job=job,
+            worker_id=worker_id,
+            checkpoint={
+                **checkpoint,
+                "stage": "final_synthesis_deferred",
+                "next_stage": "final_synthesis",
+                "user_ready": False,
+            },
+            result=accumulated,
+        )
+
+    started_at = _now_iso()
+
+    started_checkpoint = {
+        **checkpoint,
+        "stage": "final_synthesis",
+        "stage_started_at": started_at,
+        "next_stage": "final_synthesis",
+        "user_ready": False,
+    }
+
+    job = update_claimed_research_job(
+        job[
+            "id"
+        ],
+        worker_id=worker_id,
+        status="running",
+        checkpoint=started_checkpoint,
+        result=accumulated,
+    )
+
+    print(
+        "[Research] Grounded final synthesis started: "
+        + canonical_research_topic(
+            job
+        )
+    )
+
+    synthesis = synthesis_fn(
+        job,
+        accumulated,
+    )
+
+    if isinstance(
+        synthesis,
+        str,
+    ):
+        synthesis = {
+            "success": bool(
+                synthesis.strip()
+            ),
+            "report_text": synthesis,
+            "uncertainties": [],
+            "source_urls": [],
+        }
+
+    if not isinstance(
+        synthesis,
+        dict,
+    ):
+        raise RuntimeError(
+            "final synthesis function returned an invalid result"
+        )
+
+    if not synthesis.get(
+        "success"
+    ):
+        raise RuntimeError(
+            _normalise_space(
+                synthesis.get(
+                    "failure_reason"
+                )
+            )
+            or "final synthesis failed"
+        )
+
+    report_text = str(
+        synthesis.get(
+            "report_text"
+        )
+        or ""
+    ).strip()
+
+    if not report_text:
+        raise RuntimeError(
+            "final synthesis returned an empty report"
+        )
+
+    synthesis_record = {
+        "report_text": report_text,
+        "generated_at": _now_iso(),
+        "model": synthesis.get(
+            "model"
+        ),
+        "uncertainties": list(
+            synthesis.get(
+                "uncertainties"
+            )
+            or []
+        )[
+            :8
+        ],
+        "source_urls": list(
+            synthesis.get(
+                "source_urls"
+            )
+            or []
+        ),
+    }
+
+    updated_result = {
+        **accumulated,
+        "research_phase": "final_synthesis_draft_complete",
+        "user_ready": False,
+        "final_synthesis": synthesis_record,
+        "final_report_verified": False,
+    }
+
+    completed_checkpoint = {
+        **started_checkpoint,
+        "stage": "final_synthesis_draft_complete",
+        "stage_finished_at": _now_iso(),
+        "next_stage": "final_synthesis_verification",
+        "user_ready": False,
+    }
+
+    print(
+        "[Research] Final synthesis draft checkpoint saved; verification is next."
+    )
+
+    return update_claimed_research_job(
+        job[
+            "id"
+        ],
+        worker_id=worker_id,
+        status="paused",
+        checkpoint=completed_checkpoint,
+        result=updated_result,
+        error=None,
+        resume_automatically=True,
+    )
+
+
+def _handle_final_synthesis_verification_stage(
+    *,
+    job: dict,
+    worker_id: str,
+    synthesis_verifier_fn: Callable,
+    respect_interactive_preemption: bool,
+) -> dict:
+    checkpoint = dict(
+        job.get(
+            "checkpoint"
+        )
+        or {}
+    )
+
+    accumulated = dict(
+        job.get(
+            "result"
+        )
+        or {}
+    )
+
+    synthesis_record = accumulated.get(
+        "final_synthesis"
+    )
+
+    if not isinstance(
+        synthesis_record,
+        dict,
+    ):
+        raise RuntimeError(
+            "final synthesis verification has no persisted draft"
+        )
+
+    report_text = str(
+        synthesis_record.get(
+            "report_text"
+        )
+        or ""
+    ).strip()
+
+    if not report_text:
+        raise RuntimeError(
+            "final synthesis verification has an empty persisted draft"
+        )
+
+    if (
+        respect_interactive_preemption
+        and not background_research_can_run()
+    ):
+        print(
+            "[Research] Interactive activity detected; synthesis verification yielded."
+        )
+
+        return _pause_for_next_deep_stage(
+            job=job,
+            worker_id=worker_id,
+            checkpoint={
+                **checkpoint,
+                "stage": "final_synthesis_verification_deferred",
+                "next_stage": "final_synthesis_verification",
+                "user_ready": False,
+            },
+            result=accumulated,
+        )
+
+    started_checkpoint = {
+        **checkpoint,
+        "stage": "final_synthesis_verification",
+        "stage_started_at": _now_iso(),
+        "next_stage": "final_synthesis_verification",
+        "user_ready": False,
+    }
+
+    job = update_claimed_research_job(
+        job[
+            "id"
+        ],
+        worker_id=worker_id,
+        status="running",
+        checkpoint=started_checkpoint,
+        result=accumulated,
+    )
+
+    print(
+        "[Research] Verifying final synthesis against stored evidence."
+    )
+
+    verification = synthesis_verifier_fn(
+        job,
+        accumulated,
+        report_text,
+    )
+
+    if isinstance(
+        verification,
+        list,
+    ):
+        verification = {
+            "supported": len(
+                verification
+            ) == 0,
+            "violations": list(
+                verification
+            ),
+        }
+
+    if not isinstance(
+        verification,
+        dict,
+    ):
+        raise RuntimeError(
+            "final synthesis verifier returned an invalid result"
+        )
+
+    supported = (
+        verification.get(
+            "supported"
+        )
+        is True
+    )
+
+    violations = [
+        _normalise_space(
+            item
+        )
+        for item in (
+            verification.get(
+                "violations"
+            )
+            or []
+        )
+        if _normalise_space(
+            item
+        )
+    ][
+        :8
+    ]
+
+    verified_at = _now_iso()
+
+    synthesis_record = {
+        **synthesis_record,
+        "verification": {
+            "supported": supported,
+            "violations": violations,
+            "verified_at": verified_at,
+            "model": verification.get(
+                "model"
+            ),
+            "sentence_assessments": list(
+                verification.get(
+                    "sentence_assessments"
+                )
+                or []
+            ),
+        },
+    }
+
+    if not supported:
+        review_reason = (
+            violations[
+                0
+            ]
+            if violations
+            else (
+                "The final synthesis could not be verified against the stored evidence."
+            )
+        )
+
+        review_result = {
+            **accumulated,
+            "research_phase": "final_synthesis_review_required",
+            "user_ready": False,
+            "final_synthesis": synthesis_record,
+            "final_report_verified": False,
+        }
+
+        review_checkpoint = {
+            **started_checkpoint,
+            "stage": "final_synthesis_review_required",
+            "stage_finished_at": verified_at,
+            "next_stage": "synthesis_review_required",
+            "user_ready": False,
+            "review_reason": review_reason,
+        }
+
+        print(
+            "[Research] Final synthesis was not fully grounded; paused for review."
+        )
+
+        return update_claimed_research_job(
+            job[
+                "id"
+            ],
+            worker_id=worker_id,
+            status="paused",
+            checkpoint=review_checkpoint,
+            result=review_result,
+            error=None,
+            resume_automatically=False,
+        )
+
+    source_index = list(
+        accumulated.get(
+            "source_index"
+        )
+        or []
+    )
+
+    source_urls = []
+    seen_urls = set()
+
+    for source in source_index:
+        if not isinstance(
+            source,
+            dict,
+        ):
+            continue
+
+        url = _normalise_space(
+            source.get(
+                "url"
+            )
+        )
+
+        if (
+            not url
+            or url in seen_urls
+        ):
+            continue
+
+        seen_urls.add(
+            url
+        )
+        source_urls.append(
+            url
+        )
+
+    final_report = {
+        "text": report_text,
+        "verified": True,
+        "verified_at": verified_at,
+        "source_urls": source_urls,
+        "source_index": source_index,
+        "uncertainties": list(
+            synthesis_record.get(
+                "uncertainties"
+            )
+            or []
+        )[
+            :8
+        ],
+    }
+
+    completed_result = {
+        **accumulated,
+        "research_phase": "final_synthesis_complete",
+        "user_ready": True,
+        "final_synthesis": synthesis_record,
+        "final_report": final_report,
+        "final_report_text": report_text,
+        "final_report_verified": True,
+    }
+
+    completed_checkpoint = {
+        **started_checkpoint,
+        "stage": "final_synthesis_complete",
+        "stage_finished_at": verified_at,
+        "next_stage": "delivery",
+        "user_ready": True,
+        "final_report_verified": True,
+    }
+
+    print(
+        "[Research] Grounded final report verified and ready for delivery."
+    )
+
+    return update_claimed_research_job(
+        job[
+            "id"
+        ],
+        worker_id=worker_id,
+        status="completed",
+        checkpoint=completed_checkpoint,
+        result=completed_result,
+        error=None,
+        resume_automatically=False,
+    )
+
+
 def run_one_research_job(
     *,
     worker_id: Optional[str] = None,
     research_fn: Callable = gather_public_factual_research,
     packet_builder: Callable = build_internal_public_factual_packet,
     planner_fn: Callable = plan_next_deep_research_round,
+    synthesis_fn: Callable = generate_grounded_final_synthesis,
+    synthesis_verifier_fn: Callable = verify_grounded_final_synthesis,
     lease_seconds: int = 900,
     respect_interactive_preemption: bool = False,
 ) -> Optional[dict]:
@@ -1440,6 +1923,26 @@ def run_one_research_job(
     ).lower()
 
     try:
+        if next_stage == "final_synthesis":
+            return _handle_final_synthesis_stage(
+                job=job,
+                worker_id=owner,
+                synthesis_fn=synthesis_fn,
+                respect_interactive_preemption=(
+                    respect_interactive_preemption
+                ),
+            )
+
+        if next_stage == "final_synthesis_verification":
+            return _handle_final_synthesis_verification_stage(
+                job=job,
+                worker_id=owner,
+                synthesis_verifier_fn=synthesis_verifier_fn,
+                respect_interactive_preemption=(
+                    respect_interactive_preemption
+                ),
+            )
+
         if next_stage in {
             "iterative_deep_research",
         }:

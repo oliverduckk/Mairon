@@ -217,12 +217,12 @@ def _ensure_research_job_schema_columns(
             + declaration
         )
 
-    # Phase 11.5.2 intentionally paused deep/normal jobs after the initial
-    # evidence pass. When 11.5.3 first opens that database, make those known
-    # iterative checkpoints resumable without requiring Oliver to recreate them.
+    # Older phases intentionally paused resumable research work between bounded
+    # stages. When a newer worker first opens that database, make known automatic
+    # stages resumable without requiring Oliver to recreate the job.
     paused_rows = connection.execute(
         """
-        SELECT id, checkpoint_json
+        SELECT id, checkpoint_json, result_json
         FROM research_jobs
         WHERE status = 'paused'
           AND COALESCE(resume_automatically, 0) = 0
@@ -236,16 +236,27 @@ def _ensure_research_job_schema_columns(
             ]
         )
 
-        if (
-            isinstance(
-                checkpoint,
-                dict,
-            )
-            and checkpoint.get(
-                "next_stage"
-            )
-            == "iterative_deep_research"
+        result = _decode_json(
+            row[
+                "result_json"
+            ]
+        )
+
+        if not isinstance(
+            checkpoint,
+            dict,
         ):
+            continue
+
+        next_stage = checkpoint.get(
+            "next_stage"
+        )
+
+        if next_stage in {
+            "iterative_deep_research",
+            "final_synthesis",
+            "final_synthesis_verification",
+        }:
             connection.execute(
                 """
                 UPDATE research_jobs
@@ -258,6 +269,211 @@ def _ensure_research_job_schema_columns(
                     ],
                 ),
             )
+            continue
+
+        # Phase 11.5.3 treated a max-round planner disagreement as requiring
+        # human review even when the deterministic evidence floor had already
+        # been satisfied. Phase 11.5.4 can safely hand that accumulated evidence
+        # to grounded synthesis instead. Only migrate the exact old safety-cap
+        # state; unrelated review-required jobs remain deliberately paused.
+        quality = (
+            checkpoint.get(
+                "quality"
+            )
+            or {}
+        )
+
+        old_cap_review = bool(
+            next_stage == "research_review_required"
+            and checkpoint.get(
+                "stage"
+            )
+            == "deep_research_review_required"
+            and isinstance(
+                quality,
+                dict,
+            )
+            and quality.get(
+                "minimum_floor_met"
+            )
+            is True
+            and quality.get(
+                "maximum_rounds_reached"
+            )
+            is True
+            and "safety cap was reached"
+            in str(
+                checkpoint.get(
+                    "review_reason"
+                )
+                or ""
+            ).lower()
+        )
+
+        # Phase 11.5.4 initially reused the conversational factual verifier's
+        # fixed 320-token response budget. Long final reports require one JSON
+        # sentence assessment per verification unit, so an otherwise valid
+        # verifier response could be truncated before the JSON object closed.
+        # Retry only that exact protocol/transport-style failure once after the
+        # verifier implementation is upgraded. Genuine unsupported-claim review
+        # states remain paused for human inspection.
+        synthesis_record = (
+            result.get(
+                "final_synthesis"
+            )
+            if isinstance(
+                result,
+                dict,
+            )
+            else None
+        )
+
+        verifier_protocol_retry_count = int(
+            checkpoint.get(
+                "verifier_protocol_retry_count"
+            )
+            or 0
+        )
+
+        old_verifier_protocol_failure = bool(
+            next_stage == "synthesis_review_required"
+            and checkpoint.get(
+                "stage"
+            )
+            == "final_synthesis_review_required"
+            and verifier_protocol_retry_count < 1
+            and "public factual-support verifier could not validate the draft"
+            in str(
+                checkpoint.get(
+                    "review_reason"
+                )
+                or ""
+            ).lower()
+            and isinstance(
+                synthesis_record,
+                dict,
+            )
+            and str(
+                synthesis_record.get(
+                    "report_text"
+                )
+                or ""
+            ).strip()
+        )
+
+        if old_verifier_protocol_failure:
+            migrated_checkpoint = {
+                **checkpoint,
+                "stage": "final_synthesis_draft_complete",
+                "next_stage": "final_synthesis_verification",
+                "user_ready": False,
+                "verifier_protocol_retry_count": (
+                    verifier_protocol_retry_count
+                    + 1
+                ),
+            }
+            migrated_checkpoint.pop(
+                "review_reason",
+                None,
+            )
+
+            migrated_result = dict(
+                result
+            )
+            migrated_result[
+                "research_phase"
+            ] = "final_synthesis_draft_complete"
+            migrated_result[
+                "user_ready"
+            ] = False
+            migrated_result[
+                "final_report_verified"
+            ] = False
+
+            connection.execute(
+                """
+                UPDATE research_jobs
+                SET checkpoint_json = ?,
+                    result_json = ?,
+                    resume_automatically = 1
+                WHERE id = ?
+                """,
+                (
+                    _encode_json(
+                        migrated_checkpoint
+                    ),
+                    _encode_json(
+                        migrated_result
+                    ),
+                    row[
+                        "id"
+                    ],
+                ),
+            )
+            continue
+
+        if not old_cap_review:
+            continue
+
+        migrated_checkpoint = {
+            **checkpoint,
+            "stage": "deep_evidence_collection_complete",
+            "next_stage": "final_synthesis",
+            "user_ready": False,
+            "pending_queries": [],
+            "completion_reason": (
+                "Migrated from the older max-round review policy: the deterministic "
+                "evidence floor was already satisfied, so grounded final synthesis "
+                "may now proceed."
+            ),
+        }
+        migrated_checkpoint.pop(
+            "review_reason",
+            None,
+        )
+
+        migrated_result = (
+            dict(
+                result
+            )
+            if isinstance(
+                result,
+                dict,
+            )
+            else {}
+        )
+        migrated_result[
+            "research_phase"
+        ] = "deep_evidence_collection_complete"
+        migrated_result[
+            "user_ready"
+        ] = False
+        migrated_result[
+            "quality"
+        ] = dict(
+            quality
+        )
+
+        connection.execute(
+            """
+            UPDATE research_jobs
+            SET checkpoint_json = ?,
+                result_json = ?,
+                resume_automatically = 1
+            WHERE id = ?
+            """,
+            (
+                _encode_json(
+                    migrated_checkpoint
+                ),
+                _encode_json(
+                    migrated_result
+                ),
+                row[
+                    "id"
+                ],
+            ),
+        )
 
 
 def initialise_research_job_store() -> None:
@@ -997,7 +1213,7 @@ def update_claimed_research_job(
 
     if current is None:
         raise KeyError(
-            "research job not found"
+            "research job not found""research job not found"
         )
 
     if (

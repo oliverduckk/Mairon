@@ -245,13 +245,29 @@ def verify_public_factual_draft(
         },
     ]
 
+    # The verifier must emit one structured assessment for EVERY draft sentence.
+    # A fixed 320-token output budget was enough for normal conversational answers
+    # but can truncate long final-research reports before the JSON object closes.
+    # Scale the output allowance with the number of required assessments while
+    # retaining the old 320-token floor for ordinary short responses.
+    verifier_num_predict = min(
+        2400,
+        max(
+            320,
+            160 + (
+                len(draft_sentences)
+                * 24
+            ),
+        ),
+    )
+
     verifier_kwargs = {
         "model": model,
         "messages": messages,
         "format": PUBLIC_FACTUAL_VERIFIER_RESPONSE_SCHEMA,
         "options": {
             "temperature": 0,
-            "num_predict": 320,
+            "num_predict": verifier_num_predict,
             "num_ctx": 12288,
         },
     }
