@@ -30,6 +30,9 @@ from mairon_theme import (
     FONT_PREFERENCES,
     MAIRON_THEME,
 )
+from research.research_delivery import (
+    is_research_delivery_turn,
+)
 from voice.gui_voice import (
     VoiceRuntime,
 )
@@ -2337,6 +2340,7 @@ class MaironDesktopApp:
         self.thinking_visible = False
         self.thinking_step = 0
         self.thinking_after_id = None
+        self._research_delivery_after_id = None
 
         self.sidebar_width = (
             _load_sidebar_width()
@@ -5286,15 +5290,18 @@ class MaironDesktopApp:
             "turns",
             [],
         ):
-            self._append_user_message(
-                str(
-                    turn.get(
-                        "user_text",
-                        "",
+            if not is_research_delivery_turn(
+                turn
+            ):
+                self._append_user_message(
+                    str(
+                        turn.get(
+                            "user_text",
+                            "",
+                        )
+                        or ""
                     )
-                    or ""
                 )
-            )
 
             self._append_mairon_message(
                 str(
@@ -5823,6 +5830,51 @@ class MaironDesktopApp:
             self._poll_events,
         )
 
+    def _poll_research_deliveries(
+        self,
+    ) -> None:
+        self._research_delivery_after_id = None
+
+        try:
+            can_deliver = bool(
+                self.application is not None
+                and not self.busy
+                and not self.pending_approval
+                and not self.voice_recording
+                and not self.speaking
+            )
+
+            if can_deliver:
+                result = (
+                    self.application
+                    .poll_research_delivery()
+                )
+
+                if result is not None:
+                    self._handle_turn_result(
+                        result
+                    )
+
+        except Exception as exc:
+            self._record_diagnostic_event(
+                "[Research] Delivery poll failed: "
+                + str(
+                    exc
+                )
+            )
+
+        finally:
+            try:
+                self._research_delivery_after_id = (
+                    self.root.after(
+                        1000,
+                        self._poll_research_deliveries,
+                    )
+                )
+
+            except tk.TclError:
+                self._research_delivery_after_id = None
+
     def _handle_event(
         self,
         event,
@@ -5932,6 +5984,14 @@ class MaironDesktopApp:
 
             self._refresh_recent_chats()
             self.input.focus_set()
+
+            if self._research_delivery_after_id is None:
+                self._research_delivery_after_id = (
+                    self.root.after(
+                        350,
+                        self._poll_research_deliveries,
+                    )
+                )
 
         elif kind == "bootstrap_error":
             self._hide_thinking()
@@ -6572,6 +6632,17 @@ class MaironDesktopApp:
         self,
     ) -> None:
         self._hide_thinking()
+
+        if self._research_delivery_after_id is not None:
+            try:
+                self.root.after_cancel(
+                    self._research_delivery_after_id
+                )
+
+            except Exception:
+                pass
+
+            self._research_delivery_after_id = None
 
         try:
             _save_sidebar_width(

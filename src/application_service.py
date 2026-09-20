@@ -58,6 +58,18 @@ from memory.preference_store import (
     build_user_preference_recall_response,
     capture_user_preference,
 )
+from research.research_delivery import (
+    append_research_delivery_to_model_history,
+    build_research_delivery_text,
+    is_research_delivery_turn,
+    research_delivery_turn_marker,
+)
+from research.research_jobs import (
+    claim_next_research_delivery,
+    complete_research_delivery,
+    release_research_delivery,
+    research_request_context,
+)
 
 
 PROJECT_ROOT = Path(
@@ -76,6 +88,7 @@ class ApplicationTurn:
       - cloud_approval_required
       - action_approval_required
       - pending_approval_exists
+      - research_delivery
       - error
     """
 
@@ -237,6 +250,15 @@ class MaironApplication:
             new_session_id()
         )
 
+        self._research_delivery_consumer_id = (
+            "application-"
+            + str(
+                os.getpid()
+            )
+            + "-"
+            + self.session_id
+        )
+
         self._pending: Optional[
             _PendingApproval
         ] = None
@@ -284,6 +306,206 @@ class MaironApplication:
             ),
         }
 
+    def poll_research_delivery(
+        self,
+    ) -> Optional[ApplicationTurn]:
+        """
+        Claim and persist at most one verified background-research report.
+
+        The delivery claim is durable and separate from the research-worker
+        lease. A hidden per-job marker in the chat store makes retry after a
+        process crash idempotent: if the message was already persisted before
+        the research DB could be marked delivered, the retry does not add it
+        twice.
+        """
+
+        if self._pending is not None:
+            return None
+
+        consumer_id = (
+            self._research_delivery_consumer_id
+        )
+
+        job = claim_next_research_delivery(
+            consumer_id=consumer_id,
+            lease_seconds=120,
+        )
+
+        if job is None:
+            return None
+
+        try:
+            answer = build_research_delivery_text(
+                job
+            )
+
+            if not answer:
+                release_research_delivery(
+                    job[
+                        "id"
+                    ],
+                    consumer_id=consumer_id,
+                )
+                return None
+
+            marker = research_delivery_turn_marker(
+                job[
+                    "id"
+                ]
+            )
+
+            existing_session = load_chat_session(
+                self.session_id
+            )
+
+            existing_turns = (
+                existing_session.get(
+                    "turns",
+                    [],
+                )
+                if isinstance(
+                    existing_session,
+                    dict,
+                )
+                else []
+            )
+
+            already_persisted = bool(
+                any(
+                    str(
+                        turn.get(
+                            "user_text",
+                            "",
+                        )
+                        or ""
+                    )
+                    == marker
+                    for turn in existing_turns
+                    if isinstance(
+                        turn,
+                        dict,
+                    )
+                )
+            )
+
+            session_was_empty = (
+                len(
+                    existing_turns
+                )
+                == 0
+            )
+
+            if not already_persisted:
+                record_chat_turn(
+                    session_id=self.session_id,
+                    user_text=marker,
+                    assistant_text=answer,
+                    channel="research",
+                    response_seconds=0.0,
+                    core_state=(
+                        self.core
+                        .conversation_state
+                    ),
+                )
+
+                if session_was_empty:
+                    topic = str(
+                        job.get(
+                            "topic"
+                        )
+                        or "Background research"
+                    ).strip()
+
+                    rename_chat_session(
+                        self.session_id,
+                        (
+                            "Research: "
+                            + topic
+                        )[
+                            :72
+                        ],
+                    )
+
+            self.local_state = (
+                append_research_delivery_to_model_history(
+                    current_state=(
+                        self.local_state
+                    ),
+                    assistant_text=answer,
+                    system_instructions=(
+                        self.instructions
+                    ),
+                )
+            )
+
+            self.cloud_state = (
+                list(
+                    self.local_state
+                )
+                if self.local_state
+                is not None
+                else None
+            )
+
+            completed = complete_research_delivery(
+                job[
+                    "id"
+                ],
+                consumer_id=consumer_id,
+                delivered_session_id=(
+                    self.session_id
+                ),
+            )
+
+            self.last_assistant_answer = answer
+
+            self._emit_event(
+                "[Research] Delivered verified report: "
+                + str(
+                    completed.get(
+                        "topic"
+                    )
+                    or job.get(
+                        "topic"
+                    )
+                    or "background research"
+                )
+            )
+
+            return ApplicationTurn(
+                status="research_delivery",
+                user_text="",
+                answer=answer,
+                response_seconds=0.0,
+                intent="background_research_delivery",
+                authority="research",
+                channel="research",
+                diagnostics=self._build_turn_diagnostics(
+                    intent="background_research_delivery",
+                    authority="research",
+                    route_mode="delivery",
+                    workflow="background_research",
+                    model_used="Core verified report",
+                    status="research_delivery",
+                    channel="research",
+                    response_seconds=0.0,
+                ),
+            )
+
+        except Exception:
+            try:
+                release_research_delivery(
+                    job[
+                        "id"
+                    ],
+                    consumer_id=consumer_id,
+                )
+
+            except Exception:
+                pass
+
+            raise
+
     # --------------------------------------------------
     # Chat sessions
     # --------------------------------------------------
@@ -314,6 +536,15 @@ class MaironApplication:
 
         self.session_id = (
             new_session_id()
+        )
+
+        self._research_delivery_consumer_id = (
+            "application-"
+            + str(
+                os.getpid()
+            )
+            + "-"
+            + self.session_id
         )
 
         self._emit_event(
@@ -487,6 +718,23 @@ class MaironApplication:
             "turns",
             [],
         ):
+            if is_research_delivery_turn(
+                turn
+            ):
+                rebuilt_state = (
+                    append_research_delivery_to_model_history(
+                        current_state=rebuilt_state,
+                        assistant_text=turn.get(
+                            "assistant_text",
+                            "",
+                        ),
+                        system_instructions=(
+                            self.instructions
+                        ),
+                    )
+                )
+                continue
+
             rebuilt_state = (
                 append_visible_turn_to_model_history(
                     current_state=rebuilt_state,
@@ -528,14 +776,6 @@ class MaironApplication:
                 -1
             ]
 
-            self.last_user_input = str(
-                last_turn.get(
-                    "user_text",
-                    "",
-                )
-                or ""
-            )
-
             self.last_assistant_answer = str(
                 last_turn.get(
                     "assistant_text",
@@ -543,6 +783,30 @@ class MaironApplication:
                 )
                 or ""
             )
+
+            self.last_user_input = None
+
+            for prior_turn in reversed(
+                turns
+            ):
+                if is_research_delivery_turn(
+                    prior_turn
+                ):
+                    continue
+
+                candidate_user = str(
+                    prior_turn.get(
+                        "user_text",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                if candidate_user:
+                    self.last_user_input = (
+                        candidate_user
+                    )
+                    break
 
         else:
             self.last_user_input = None
@@ -552,6 +816,15 @@ class MaironApplication:
             session[
                 "session_id"
             ]
+        )
+
+        self._research_delivery_consumer_id = (
+            "application-"
+            + str(
+                os.getpid()
+            )
+            + "-"
+            + self.session_id
         )
 
         self._emit_event(
@@ -950,14 +1223,19 @@ class MaironApplication:
             )
 
         try:
-            result = route_message(
-                self.local_ai,
-                self.cloud_ai,
-                text,
-                turn_instructions,
-                self.local_state,
-                self.cloud_state,
-            )
+            with research_request_context(
+                session_id=self.session_id,
+                channel=channel_value,
+                client="application",
+            ):
+                result = route_message(
+                    self.local_ai,
+                    self.cloud_ai,
+                    text,
+                    turn_instructions,
+                    self.local_state,
+                    self.cloud_state,
+                )
 
         except Exception as exc:
             return self._finalize_error(

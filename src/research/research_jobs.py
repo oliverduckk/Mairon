@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -22,6 +23,64 @@ TERMINAL_RESEARCH_JOB_STATUSES = {
     "cancelled",
     "failed",
 }
+
+
+RESEARCH_DELIVERY_PENDING = "pending"
+RESEARCH_DELIVERY_CLAIMED = "claimed"
+RESEARCH_DELIVERY_DELIVERED = "delivered"
+RESEARCH_DELIVERY_NOT_READY = "not_ready"
+
+_RESEARCH_REQUEST_CONTEXT = contextvars.ContextVar(
+    "mairon_research_request_context",
+    default=None,
+)
+
+
+@contextmanager
+def research_request_context(
+    *,
+    session_id: Optional[str] = None,
+    channel: Optional[str] = None,
+    client: Optional[str] = None,
+):
+    """
+    Attach UI/session provenance to research jobs created inside this call.
+
+    The provider remains UI-neutral. Application/terminal entrypoints set this
+    context before invoking it, and create_research_job() copies the small
+    delivery-routing metadata into the durable job.
+    """
+
+    payload = {
+        "origin_session_id": _normalise_space(
+            session_id
+        ),
+        "origin_channel": _normalise_space(
+            channel
+        ),
+        "origin_client": _normalise_space(
+            client
+        ),
+    }
+
+    payload = {
+        key: value
+        for key, value in payload.items()
+        if value
+    }
+
+    token = _RESEARCH_REQUEST_CONTEXT.set(
+        payload
+        or None
+    )
+
+    try:
+        yield
+
+    finally:
+        _RESEARCH_REQUEST_CONTEXT.reset(
+            token
+        )
 
 
 def _project_root() -> Path:
@@ -183,6 +242,134 @@ def _table_columns(
     }
 
 
+def _deliverable_report_text(
+    result: Any,
+) -> str:
+    if not isinstance(
+        result,
+        dict,
+    ):
+        return ""
+
+    verified = (
+        result.get(
+            "final_report_verified"
+        )
+        is True
+    )
+
+    if not verified:
+        return ""
+
+    # Phase 11.5.4's canonical presentation string. Prefer this over the
+    # structured final_report metadata object so delivery-readiness checks
+    # validate the text Oliver will actually see.
+    report_text = str(
+        result.get(
+            "final_report_text"
+        )
+        or ""
+    ).strip()
+
+    if report_text:
+        return report_text
+
+    final_report = result.get(
+        "final_report"
+    )
+
+    if isinstance(
+        final_report,
+        dict,
+    ):
+        report_text = str(
+            final_report.get(
+                "text"
+            )
+            or final_report.get(
+                "report_text"
+            )
+            or ""
+        ).strip()
+
+        if report_text:
+            return report_text
+
+    elif isinstance(
+        final_report,
+        str,
+    ):
+        report_text = final_report.strip()
+
+        if report_text:
+            return report_text
+
+    synthesis = result.get(
+        "final_synthesis"
+    )
+
+    if not isinstance(
+        synthesis,
+        dict,
+    ):
+        return ""
+
+    return str(
+        synthesis.get(
+            "report_text"
+        )
+        or ""
+    ).strip()
+
+
+def _research_job_is_delivery_ready(
+    *,
+    status: Any,
+    checkpoint: Any,
+    result: Any,
+) -> bool:
+    if _normalise_space(
+        status
+    ).lower() != "completed":
+        return False
+
+    if not isinstance(
+        checkpoint,
+        dict,
+    ):
+        return False
+
+    if (
+        _normalise_space(
+            checkpoint.get(
+                "next_stage"
+            )
+        ).lower()
+        != "delivery"
+    ):
+        return False
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+        return False
+
+    if (
+        result.get(
+            "user_ready"
+        )
+        is not True
+    ):
+        return False
+
+    return bool(
+        _deliverable_report_text(
+            result
+        )
+    )
+
+
 def _ensure_research_job_schema_columns(
     connection: sqlite3.Connection,
 ) -> None:
@@ -204,6 +391,12 @@ def _ensure_research_job_schema_columns(
         "lease_expires_at": "TEXT",
         "attempt_count": "INTEGER NOT NULL DEFAULT 0",
         "resume_automatically": "INTEGER NOT NULL DEFAULT 0",
+        "delivery_status": "TEXT NOT NULL DEFAULT 'not_ready'",
+        "delivery_claim_owner": "TEXT",
+        "delivery_claim_expires_at": "TEXT",
+        "delivery_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "delivered_at": "TEXT",
+        "delivered_session_id": "TEXT",
     }
 
     for column_name, declaration in additions.items():
@@ -475,6 +668,66 @@ def _ensure_research_job_schema_columns(
             ),
         )
 
+    # Phase 11.5.5 adds a durable delivery lifecycle. Older completed jobs had
+    # no delivery columns, so verified reports that already ended at
+    # next_stage=delivery must become pending exactly once after upgrade.
+    completed_rows = connection.execute(
+        """
+        SELECT id, status, checkpoint_json, result_json, delivery_status
+        FROM research_jobs
+        WHERE status = 'completed'
+          AND COALESCE(delivery_status, 'not_ready') != 'delivered'
+        """
+    ).fetchall()
+
+    for row in completed_rows:
+        checkpoint = _decode_json(
+            row[
+                "checkpoint_json"
+            ]
+        )
+
+        result = _decode_json(
+            row[
+                "result_json"
+            ]
+        )
+
+        if not _research_job_is_delivery_ready(
+            status=row[
+                "status"
+            ],
+            checkpoint=checkpoint,
+            result=result,
+        ):
+            continue
+
+        if str(
+            row[
+                "delivery_status"
+            ]
+            or ""
+        ).strip().lower() == RESEARCH_DELIVERY_CLAIMED:
+            # Preserve a live claim. claim_next_research_delivery() itself
+            # handles stale-lease recovery.
+            continue
+
+        connection.execute(
+            """
+            UPDATE research_jobs
+            SET delivery_status = 'pending',
+                delivery_claim_owner = NULL,
+                delivery_claim_expires_at = NULL
+            WHERE id = ?
+              AND COALESCE(delivery_status, 'not_ready') != 'delivered'
+            """,
+            (
+                row[
+                    "id"
+                ],
+            ),
+        )
+
 
 def initialise_research_job_store() -> None:
     with _connect() as connection:
@@ -537,6 +790,18 @@ def initialise_research_job_store() -> None:
             """
         )
 
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                research_jobs_delivery
+            ON research_jobs (
+                delivery_status,
+                delivery_claim_expires_at,
+                updated_at
+            )
+            """
+        )
+
 
 def _row_to_job(
     row: sqlite3.Row,
@@ -572,6 +837,28 @@ def _row_to_job(
         "resume_automatically": bool(
             row["resume_automatically"]
         ),
+        "delivery_status": str(
+            row["delivery_status"]
+            or RESEARCH_DELIVERY_NOT_READY
+        ),
+        "delivery_claim_owner": row[
+            "delivery_claim_owner"
+        ],
+        "delivery_claim_expires_at": row[
+            "delivery_claim_expires_at"
+        ],
+        "delivery_attempt_count": int(
+            row[
+                "delivery_attempt_count"
+            ]
+            or 0
+        ),
+        "delivered_at": row[
+            "delivered_at"
+        ],
+        "delivered_session_id": row[
+            "delivered_session_id"
+        ],
     }
 
 
@@ -709,6 +996,26 @@ def create_research_job(
         metadata
         or {}
     )
+
+    request_context = (
+        _RESEARCH_REQUEST_CONTEXT.get()
+        or {}
+    )
+
+    if isinstance(
+        request_context,
+        dict,
+    ):
+        for key, value in request_context.items():
+            cleaned_value = _normalise_space(
+                value
+            )
+
+            if cleaned_value:
+                job_metadata.setdefault(
+                    key,
+                    cleaned_value,
+                )
 
     job_metadata.setdefault(
         "execution_policy",
@@ -976,6 +1283,40 @@ def update_research_job(
                 ),
             ),
         )
+
+        if _research_job_is_delivery_ready(
+            status=next_status,
+            checkpoint=next_checkpoint,
+            result=next_result,
+        ):
+            connection.execute(
+                """
+                UPDATE research_jobs
+                SET delivery_status = CASE
+                        WHEN delivery_status = 'delivered'
+                            THEN 'delivered'
+                        ELSE 'pending'
+                    END,
+                    delivery_claim_owner = CASE
+                        WHEN delivery_status = 'delivered'
+                            THEN delivery_claim_owner
+                        ELSE NULL
+                    END,
+                    delivery_claim_expires_at = CASE
+                        WHEN delivery_status = 'delivered'
+                            THEN delivery_claim_expires_at
+                        ELSE NULL
+                    END
+                WHERE id = ?
+                """,
+                (
+                    str(
+                        current[
+                            "id"
+                        ]
+                    ),
+                ),
+            )
 
     updated = get_research_job(
         current["id"]
@@ -1334,6 +1675,36 @@ def update_claimed_research_job(
                 "research job lease changed before the update completed"
             )
 
+        if _research_job_is_delivery_ready(
+            status=next_status,
+            checkpoint=next_checkpoint,
+            result=next_result,
+        ):
+            connection.execute(
+                """
+                UPDATE research_jobs
+                SET delivery_status = CASE
+                        WHEN delivery_status = 'delivered'
+                            THEN 'delivered'
+                        ELSE 'pending'
+                    END,
+                    delivery_claim_owner = CASE
+                        WHEN delivery_status = 'delivered'
+                            THEN delivery_claim_owner
+                        ELSE NULL
+                    END,
+                    delivery_claim_expires_at = CASE
+                        WHEN delivery_status = 'delivered'
+                            THEN delivery_claim_expires_at
+                        ELSE NULL
+                    END
+                WHERE id = ?
+                """,
+                (
+                    job_value,
+                ),
+            )
+
     updated = get_research_job(
         job_value
     )
@@ -1341,6 +1712,272 @@ def update_claimed_research_job(
     if updated is None:
         raise RuntimeError(
             "research job update could not be read back"
+        )
+
+    return updated
+# ------------------------------------------------------------------
+# Phase 11.5.5 — durable research delivery
+# ------------------------------------------------------------------
+
+def claim_next_research_delivery(
+    *,
+    consumer_id: Any,
+    lease_seconds: int = 120,
+) -> Optional[dict]:
+    """
+    Atomically claim the oldest verified report waiting to be shown to Oliver.
+
+    Delivery claims are intentionally separate from research-worker leases.
+    Research may already be completed while desktop/terminal clients come and go.
+    A stale delivery claim becomes available again after its short lease expires.
+    """
+
+    consumer = _normalise_space(
+        consumer_id
+    )
+
+    if not consumer:
+        raise ValueError(
+            "consumer_id is required"
+        )
+
+    initialise_research_job_store()
+
+    now = _now_iso()
+    claim_expires_at = _lease_expiry_iso(
+        lease_seconds
+    )
+
+    with _connect() as connection:
+        connection.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM research_jobs
+            WHERE status = 'completed'
+              AND (
+                    delivery_status = 'pending'
+                    OR (
+                        delivery_status = 'claimed'
+                        AND (
+                            delivery_claim_expires_at IS NULL
+                            OR delivery_claim_expires_at <= ?
+                        )
+                    )
+                  )
+            ORDER BY updated_at ASC, created_at ASC
+            LIMIT 25
+            """,
+            (
+                now,
+            ),
+        ).fetchall()
+
+        selected = None
+
+        for row in rows:
+            checkpoint = _decode_json(
+                row[
+                    "checkpoint_json"
+                ]
+            )
+
+            result = _decode_json(
+                row[
+                    "result_json"
+                ]
+            )
+
+            if _research_job_is_delivery_ready(
+                status=row[
+                    "status"
+                ],
+                checkpoint=checkpoint,
+                result=result,
+            ):
+                selected = row
+                break
+
+        if selected is None:
+            return None
+
+        job_id = str(
+            selected[
+                "id"
+            ]
+        )
+
+        cursor = connection.execute(
+            """
+            UPDATE research_jobs
+            SET delivery_status = 'claimed',
+                delivery_claim_owner = ?,
+                delivery_claim_expires_at = ?,
+                delivery_attempt_count = COALESCE(delivery_attempt_count, 0) + 1
+            WHERE id = ?
+              AND status = 'completed'
+              AND (
+                    delivery_status = 'pending'
+                    OR (
+                        delivery_status = 'claimed'
+                        AND (
+                            delivery_claim_expires_at IS NULL
+                            OR delivery_claim_expires_at <= ?
+                        )
+                    )
+                  )
+            """,
+            (
+                consumer,
+                claim_expires_at,
+                job_id,
+                now,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            return None
+
+        claimed_row = connection.execute(
+            """
+            SELECT *
+            FROM research_jobs
+            WHERE id = ?
+            """,
+            (
+                job_id,
+            ),
+        ).fetchone()
+
+    if claimed_row is None:
+        return None
+
+    return _row_to_job(
+        claimed_row
+    )
+
+
+def complete_research_delivery(
+    job_id: Any,
+    *,
+    consumer_id: Any,
+    delivered_session_id: Optional[str] = None,
+) -> dict:
+    job_value = _normalise_space(
+        job_id
+    )
+
+    consumer = _normalise_space(
+        consumer_id
+    )
+
+    if not job_value or not consumer:
+        raise ValueError(
+            "job_id and consumer_id are required"
+        )
+
+    initialise_research_job_store()
+
+    with _connect() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE research_jobs
+            SET delivery_status = 'delivered',
+                delivered_at = ?,
+                delivered_session_id = ?,
+                delivery_claim_owner = NULL,
+                delivery_claim_expires_at = NULL
+            WHERE id = ?
+              AND delivery_status = 'claimed'
+              AND delivery_claim_owner = ?
+            """,
+            (
+                _now_iso(),
+                (
+                    _normalise_space(
+                        delivered_session_id
+                    )
+                    or None
+                ),
+                job_value,
+                consumer,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "research delivery claim is not owned by this consumer"
+            )
+
+    updated = get_research_job(
+        job_value
+    )
+
+    if updated is None:
+        raise RuntimeError(
+            "delivered research job could not be read back"
+        )
+
+    return updated
+
+
+def release_research_delivery(
+    job_id: Any,
+    *,
+    consumer_id: Any,
+) -> dict:
+    """
+    Return a claimed delivery to the pending queue after a presentation/persist
+    failure. Already-delivered jobs are never reopened by this helper.
+    """
+
+    job_value = _normalise_space(
+        job_id
+    )
+
+    consumer = _normalise_space(
+        consumer_id
+    )
+
+    if not job_value or not consumer:
+        raise ValueError(
+            "job_id and consumer_id are required"
+        )
+
+    initialise_research_job_store()
+
+    with _connect() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE research_jobs
+            SET delivery_status = 'pending',
+                delivery_claim_owner = NULL,
+                delivery_claim_expires_at = NULL
+            WHERE id = ?
+              AND delivery_status = 'claimed'
+              AND delivery_claim_owner = ?
+            """,
+            (
+                job_value,
+                consumer,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "research delivery claim is not owned by this consumer"
+            )
+
+    updated = get_research_job(
+        job_value
+    )
+
+    if updated is None:
+        raise RuntimeError(
+            "released research job could not be read back"
         )
 
     return updated

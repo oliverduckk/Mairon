@@ -50,10 +50,11 @@ def run() -> None:
     assert 'self.model_label = tk.Label(\n            sidebar_footer,' in method
     assert 'self._build_diagnostics_toggle(\n            sidebar_footer\n        )' in method
     assert 'self._sidebar_item(\n            sidebar_footer,\n            "⚙  Themes"' in method
-    assert 'tk.Label(\n            sidebar_footer,\n            text="v0.1 • Phase 10"' in method
+    assert 'tk.Label(\n            sidebar_footer,\n            text="v0.2-dev"' in method
 
     print("Mairon Phase 10.9.1 responsive sidebar footer tests: PASS")
 
 
 if __name__ == "__main__":
     run()
+

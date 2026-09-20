@@ -30,6 +30,16 @@ from memory.preference_store import (
     build_user_preference_recall_response,
     capture_user_preference,
 )
+from research.research_delivery import (
+    append_research_delivery_to_model_history,
+    build_research_delivery_text,
+)
+from research.research_jobs import (
+    claim_next_research_delivery,
+    complete_research_delivery,
+    release_research_delivery,
+    research_request_context,
+)
 
 
 # --------------------------------------------------
@@ -48,6 +58,20 @@ local_model_name = str(
     )
     or "qwen3.5:9b"
 ).strip()
+
+TERMINAL_SESSION_ID = (
+    "terminal-"
+    + str(
+        os.getpid()
+    )
+)
+
+TERMINAL_DELIVERY_CONSUMER_ID = (
+    "terminal-delivery-"
+    + str(
+        os.getpid()
+    )
+)
 
 
 # --------------------------------------------------
@@ -516,6 +540,114 @@ last_assistant_answer = None
 mairon_core = MaironCore()
 
 
+def deliver_pending_research_results():
+    """
+    Surface completed verified background research before the next terminal turn.
+
+    input() is intentionally left blocking, so a report that finishes while the
+    terminal is idle appears at the next loop boundary rather than printing
+    through the middle of Oliver's prompt.
+    """
+
+    global local_state
+    global cloud_state
+    global last_assistant_answer
+
+    delivered_count = 0
+
+    while delivered_count < 3:
+        job = claim_next_research_delivery(
+            consumer_id=(
+                TERMINAL_DELIVERY_CONSUMER_ID
+            ),
+            lease_seconds=120,
+        )
+
+        if job is None:
+            return delivered_count
+
+        try:
+            answer = build_research_delivery_text(
+                job
+            )
+
+            if not answer:
+                release_research_delivery(
+                    job[
+                        "id"
+                    ],
+                    consumer_id=(
+                        TERMINAL_DELIVERY_CONSUMER_ID
+                    ),
+                )
+                return delivered_count
+
+            print(
+                f"Mairon: {answer}"
+            )
+            print()
+
+            local_state = (
+                append_research_delivery_to_model_history(
+                    current_state=local_state,
+                    assistant_text=answer,
+                    system_instructions=(
+                        mairon_instructions
+                    ),
+                )
+            )
+
+            cloud_state = (
+                list(
+                    local_state
+                )
+                if local_state
+                is not None
+                else None
+            )
+
+            last_assistant_answer = answer
+
+            complete_research_delivery(
+                job[
+                    "id"
+                ],
+                consumer_id=(
+                    TERMINAL_DELIVERY_CONSUMER_ID
+                ),
+                delivered_session_id=(
+                    TERMINAL_SESSION_ID
+                ),
+            )
+
+            delivered_count += 1
+
+        except Exception as error:
+            try:
+                release_research_delivery(
+                    job[
+                        "id"
+                    ],
+                    consumer_id=(
+                        TERMINAL_DELIVERY_CONSUMER_ID
+                    ),
+                )
+
+            except Exception:
+                pass
+
+            print(
+                "[Research] Delivery failed: "
+                + str(
+                    error
+                )
+            )
+            print()
+            return delivered_count
+
+    return delivered_count
+
+
 def emit_final_response(
     user_input,
     answer,
@@ -701,6 +833,8 @@ def print_response_timing_report():
 # --------------------------------------------------
 
 while True:
+    deliver_pending_research_results()
+
     try:
         user_input = get_user_input()
 
@@ -933,14 +1067,23 @@ while True:
     # Existing provider/router path
     # --------------------------------------------------
 
-    result = route_message(
-        local_ai,
-        cloud_ai,
-        user_input,
-        turn_instructions,
-        local_state,
-        cloud_state
-    )
+    with research_request_context(
+        session_id=TERMINAL_SESSION_ID,
+        channel=(
+            "voice"
+            if speak_next_response
+            else "text"
+        ),
+        client="terminal",
+    ):
+        result = route_message(
+            local_ai,
+            cloud_ai,
+            user_input,
+            turn_instructions,
+            local_state,
+            cloud_state
+        )
 
     local_state = result.local_state
     cloud_state = result.cloud_state
