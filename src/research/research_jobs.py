@@ -370,6 +370,166 @@ def _research_job_is_delivery_ready(
     )
 
 
+
+def _draft_verification_units(
+    draft: Any,
+) -> list[str]:
+    value = re.sub(
+        r"[ \t]+",
+        " ",
+        str(
+            draft
+            or ""
+        ).strip(),
+    )
+
+    if not value:
+        return []
+
+    return [
+        piece.strip()
+        for piece in re.split(
+            r"(?<=[.!?])\s+|\n+",
+            value,
+        )
+        if piece.strip()
+    ]
+
+
+MIN_REPAIR_ASSESSMENT_COVERAGE = 0.90
+MAX_REPAIR_MISSING_ASSESSMENTS = 5
+
+
+def _normalise_stored_synthesis_feedback_for_repair(
+    synthesis_record: Any,
+) -> Optional[dict]:
+    """
+    Convert old near-complete verifier feedback into repair-safe feedback.
+
+    Missing tail assessments are pessimistically marked unsupported only when the
+    parsed verifier map is already at least 90% complete and misses no more than
+    five units. This can unlock one conservative repair, never final acceptance.
+    The repaired report still has to pass a fresh verifier run before delivery.
+    """
+
+    if not isinstance(synthesis_record, dict):
+        return None
+
+    if int(synthesis_record.get("repair_attempt_count") or 0) >= 1:
+        return None
+
+    report_text = str(synthesis_record.get("report_text") or "").strip()
+    verification = synthesis_record.get("verification")
+
+    if not report_text or not isinstance(verification, dict):
+        return None
+
+    if verification.get("supported") is True:
+        return None
+
+    violations = [
+        str(item).strip().lower()
+        for item in (verification.get("violations") or [])
+        if str(item).strip()
+    ]
+
+    if any(
+        "could not validate the draft" in item
+        for item in violations
+    ):
+        return None
+
+    units = _draft_verification_units(report_text)
+    if not units:
+        return None
+
+    assessments = verification.get("sentence_assessments")
+    if not isinstance(assessments, list):
+        return None
+
+    by_index = {}
+    has_failure = False
+
+    for assessment in assessments:
+        if not isinstance(assessment, dict):
+            continue
+
+        try:
+            index = int(assessment.get("index"))
+        except (TypeError, ValueError):
+            continue
+
+        if not (1 <= index <= len(units)):
+            continue
+
+        supported = assessment.get("supported") is True
+        by_index[index] = {
+            "index": index,
+            "supported": supported,
+        }
+
+        if not supported:
+            has_failure = True
+
+    expected = set(range(1, len(units) + 1))
+    indexes = set(by_index)
+    missing = sorted(expected - indexes)
+
+    if not has_failure and not violations:
+        return None
+
+    if missing:
+        coverage = len(indexes) / len(expected)
+
+        if (
+            coverage < MIN_REPAIR_ASSESSMENT_COVERAGE
+            or len(missing) > MAX_REPAIR_MISSING_ASSESSMENTS
+        ):
+            return None
+
+        for index in missing:
+            by_index[index] = {
+                "index": index,
+                "supported": False,
+            }
+
+        verification = {
+            **verification,
+            "sentence_assessments": [
+                by_index[index]
+                for index in sorted(by_index)
+            ],
+            "repair_feedback_completed_by_core": True,
+            "repair_feedback_missing_indexes": missing,
+            "repair_feedback_coverage": coverage,
+        }
+    else:
+        verification = {
+            **verification,
+            "sentence_assessments": [
+                by_index[index]
+                for index in sorted(by_index)
+            ],
+        }
+
+    return {
+        **synthesis_record,
+        "verification": verification,
+    }
+
+
+def _stored_synthesis_feedback_is_repairable(
+    synthesis_record: Any,
+) -> bool:
+    return (
+        _normalise_stored_synthesis_feedback_for_repair(
+            synthesis_record
+        )
+        is not None
+    )
+
+
+
 def _ensure_research_job_schema_columns(
     connection: sqlite3.Connection,
 ) -> None:
@@ -449,6 +609,7 @@ def _ensure_research_job_schema_columns(
             "iterative_deep_research",
             "final_synthesis",
             "final_synthesis_verification",
+            "final_synthesis_repair",
         }:
             connection.execute(
                 """
@@ -508,8 +669,10 @@ def _ensure_research_job_schema_columns(
         # sentence assessment per verification unit, so an otherwise valid
         # verifier response could be truncated before the JSON object closed.
         # Retry only that exact protocol/transport-style failure once after the
-        # verifier implementation is upgraded. Genuine unsupported-claim review
-        # states remain paused for human inspection.
+        # verifier implementation is upgraded. A Phase 11.5.7 repaired draft is
+        # NEVER eligible for this legacy retry: after its one fresh verification,
+        # any failure must remain paused for review. Genuine unsupported-claim
+        # review states likewise remain paused for human inspection.
         synthesis_record = (
             result.get(
                 "final_synthesis"
@@ -528,6 +691,20 @@ def _ensure_research_job_schema_columns(
             or 0
         )
 
+        repair_attempt_count = int(
+            (
+                synthesis_record.get(
+                    "repair_attempt_count"
+                )
+                if isinstance(
+                    synthesis_record,
+                    dict,
+                )
+                else 0
+            )
+            or 0
+        )
+
         old_verifier_protocol_failure = bool(
             next_stage == "synthesis_review_required"
             and checkpoint.get(
@@ -535,6 +712,7 @@ def _ensure_research_job_schema_columns(
             )
             == "final_synthesis_review_required"
             and verifier_protocol_retry_count < 1
+            and repair_attempt_count < 1
             and "public factual-support verifier could not validate the draft"
             in str(
                 checkpoint.get(
@@ -576,6 +754,77 @@ def _ensure_research_job_schema_columns(
             migrated_result[
                 "research_phase"
             ] = "final_synthesis_draft_complete"
+            migrated_result[
+                "user_ready"
+            ] = False
+            migrated_result[
+                "final_report_verified"
+            ] = False
+
+            connection.execute(
+                """
+                UPDATE research_jobs
+                SET checkpoint_json = ?,
+                    result_json = ?,
+                    resume_automatically = 1
+                WHERE id = ?
+                """,
+                (
+                    _encode_json(
+                        migrated_checkpoint
+                    ),
+                    _encode_json(
+                        migrated_result
+                    ),
+                    row[
+                        "id"
+                    ],
+                ),
+            )
+            continue
+
+        # Phase 11.5.7 adds one conservative, evidence-grounded rewrite after a
+        # genuine verifier rejection. Existing 11.5.4/11.5.6 review states can
+        # resume automatically only when they already contain a COMPLETE
+        # sentence-assessment map. Partial/protocol failures remain fail-closed.
+        migrated_synthesis_record = (
+            _normalise_stored_synthesis_feedback_for_repair(
+                synthesis_record
+            )
+            if (
+                next_stage == "synthesis_review_required"
+                and checkpoint.get("stage")
+                == "final_synthesis_review_required"
+            )
+            else None
+        )
+
+        old_grounded_repair_candidate = (
+            migrated_synthesis_record is not None
+        )
+
+        if old_grounded_repair_candidate:
+            migrated_checkpoint = {
+                **checkpoint,
+                "stage": "final_synthesis_repair_pending",
+                "next_stage": "final_synthesis_repair",
+                "user_ready": False,
+                "phase_11_5_7_repair_migration": True,
+            }
+            migrated_checkpoint.pop(
+                "review_reason",
+                None,
+            )
+
+            migrated_result = dict(
+                result
+            )
+            migrated_result[
+                "final_synthesis"
+            ] = migrated_synthesis_record
+            migrated_result[
+                "research_phase"
+            ] = "final_synthesis_repair_pending"
             migrated_result[
                 "user_ready"
             ] = False

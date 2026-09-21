@@ -250,13 +250,11 @@ def research_quality_requirements(
     job: dict,
 ) -> dict:
     """
-    Deterministic minimum evidence floors.
+    Deterministic minimum evidence floors with goal-aware authority requirements.
 
-    Before the safety cap, the planner still decides whether important gaps remain.
-    At the hard research cap, however, a satisfied deterministic floor is enough to
-    hand the evidence to grounded final synthesis. That avoids an indefinitely
-    cautious planner vetoing completion after substantial evidence has accumulated;
-    unsupported claims are still blocked by the synthesis verifier.
+    Relevance is necessary but not sufficient. Narrow catalogue/current-lineup
+    research must contain primary/official authority plus independent corroboration;
+    weak/community/retailer sources cannot satisfy the quality floor by volume alone.
     """
 
     depth = _normalise_space(
@@ -265,11 +263,57 @@ def research_quality_requirements(
         )
     ).lower()
 
+    goal_scope = classify_research_goal_scope(
+        job
+    )
+
+    if goal_scope == "catalogue_lookup":
+        if depth == "normal":
+            return {
+                "minimum_rounds": 2,
+                "minimum_sources": 5,
+                "minimum_unique_hosts": 3,
+                "minimum_primary_sources": 1,
+                "minimum_independent_sources": 1,
+                "maximum_rounds": 5,
+            }
+
+        return {
+            "minimum_rounds": 2,
+            "minimum_sources": 6,
+            "minimum_unique_hosts": 3,
+            "minimum_primary_sources": 1,
+            "minimum_independent_sources": 2,
+            "maximum_rounds": 6,
+        }
+
+    if goal_scope == "purchase_decision":
+        if depth == "normal":
+            return {
+                "minimum_rounds": 2,
+                "minimum_sources": 7,
+                "minimum_unique_hosts": 3,
+                "minimum_primary_sources": 1,
+                "minimum_independent_sources": 2,
+                "maximum_rounds": 6,
+            }
+
+        return {
+            "minimum_rounds": 3,
+            "minimum_sources": 10,
+            "minimum_unique_hosts": 5,
+            "minimum_primary_sources": 1,
+            "minimum_independent_sources": 3,
+            "maximum_rounds": 9,
+        }
+
     if depth == "normal":
         return {
             "minimum_rounds": 2,
             "minimum_sources": 7,
             "minimum_unique_hosts": 3,
+            "minimum_primary_sources": 0,
+            "minimum_independent_sources": 0,
             "maximum_rounds": 6,
         }
 
@@ -278,21 +322,82 @@ def research_quality_requirements(
         "minimum_rounds": 3,
         "minimum_sources": 12,
         "minimum_unique_hosts": 5,
+        "minimum_primary_sources": 0,
+        "minimum_independent_sources": 0,
         "maximum_rounds": 10,
     }
 
 
+def _source_counts_as_relevant_evidence(
+    source: Any,
+) -> bool:
+    if not isinstance(
+        source,
+        dict,
+    ):
+        return False
+
+    if source.get(
+        "read_success"
+    ) is False:
+        return False
+
+    if source.get(
+        "accepted_as_evidence"
+    ) is False:
+        return False
+
+    if _normalise_space(
+        source.get(
+            "relevance_status"
+        )
+    ).lower() == "rejected":
+        return False
+
+    return True
+
+
+def _source_authority_tier(
+    source: dict,
+) -> str:
+    return _normalise_space(
+        source.get(
+            "authority_tier"
+        )
+    ).lower() or "legacy_curated"
+
+
+def _source_counts_toward_quality_floor(
+    source: Any,
+) -> bool:
+    if not _source_counts_as_relevant_evidence(
+        source
+    ):
+        return False
+
+    if source.get(
+        "quality_eligible"
+    ) is False:
+        return False
+
+    tier = _source_authority_tier(
+        source
+    )
+
+    return tier not in {
+        "weak_community_or_social",
+        "secondary_retailer_or_marketplace",
+        "secondary_reference_or_aggregation",
+        "unclassified",
+    }
+
+
 def _unique_source_hosts(
-    result: dict,
+    sources: list[dict],
 ) -> set[str]:
     hosts = set()
 
-    for source in (
-        result.get(
-            "source_index"
-        )
-        or []
-    ):
+    for source in sources:
         if not isinstance(
             source,
             dict,
@@ -330,17 +435,89 @@ def research_quality_snapshot(
         or []
     )
 
-    sources = list(
-        result.get(
-            "source_index"
+    relevant_sources = [
+        source
+        for source in (
+            result.get(
+                "source_index"
+            )
+            or []
         )
-        or []
+        if _source_counts_as_relevant_evidence(
+            source
+        )
+    ]
+
+    quality_sources = [
+        source
+        for source in relevant_sources
+        if _source_counts_toward_quality_floor(
+            source
+        )
+    ]
+
+    primary_sources = [
+        source
+        for source in quality_sources
+        if _source_authority_tier(
+            source
+        ) in {
+            "primary_official",
+            "primary_institutional",
+        }
+    ]
+
+    independent_sources = [
+        source
+        for source in quality_sources
+        if _source_authority_tier(
+            source
+        ) == "independent_editorial"
+    ]
+
+    secondary_sources = [
+        source
+        for source in relevant_sources
+        if _source_authority_tier(
+            source
+        ).startswith(
+            "secondary_"
+        )
+    ]
+
+    weak_sources = [
+        source
+        for source in relevant_sources
+        if _source_authority_tier(
+            source
+        ).startswith(
+            "weak_"
+        )
+    ]
+
+    modern_authority_sources = [
+        source
+        for source in relevant_sources
+        if _source_authority_tier(
+            source
+        ) not in {
+            "legacy_curated",
+            "unclassified",
+        }
+    ]
+
+    # Pre-11.5.6 persisted jobs and injected regression research functions do
+    # not carry authority metadata. Keep those states resumable without
+    # retroactively pretending Core can classify evidence it no longer has.
+    authority_enforcement_active = bool(
+        modern_authority_sources
     )
 
-    unique_hosts = (
-        _unique_source_hosts(
-            result
-        )
+    quality_hosts = _unique_source_hosts(
+        quality_sources
+    )
+    relevant_hosts = _unique_source_hosts(
+        relevant_sources
     )
 
     snapshot = {
@@ -348,13 +525,67 @@ def research_quality_snapshot(
         "round_count": len(
             rounds
         ),
+        # Historical keys now intentionally mean evidence that is both relevant
+        # and strong enough to count toward deterministic completion.
         "source_count": len(
-            sources
+            quality_sources
         ),
         "unique_host_count": len(
-            unique_hosts
+            quality_hosts
+        ),
+        "accepted_relevant_source_count": len(
+            relevant_sources
+        ),
+        "accepted_relevant_unique_host_count": len(
+            relevant_hosts
+        ),
+        "primary_source_count": len(
+            primary_sources
+        ),
+        "independent_source_count": len(
+            independent_sources
+        ),
+        "secondary_source_count": len(
+            secondary_sources
+        ),
+        "weak_source_count": len(
+            weak_sources
+        ),
+        "authority_enforcement_active": authority_enforcement_active,
+        "rejected_source_count": int(
+            result.get(
+                "rejected_source_count"
+            )
+            or len(
+                result.get(
+                    "rejected_sources"
+                )
+                or []
+            )
         ),
     }
+
+    authority_floor_met = True
+
+    if authority_enforcement_active:
+        authority_floor_met = bool(
+            snapshot[
+                "primary_source_count"
+            ]
+            >= snapshot[
+                "minimum_primary_sources"
+            ]
+            and snapshot[
+                "independent_source_count"
+            ]
+            >= snapshot[
+                "minimum_independent_sources"
+            ]
+        )
+
+    snapshot[
+        "authority_floor_met"
+    ] = authority_floor_met
 
     snapshot[
         "minimum_floor_met"
@@ -377,6 +608,7 @@ def research_quality_snapshot(
         >= snapshot[
             "minimum_unique_hosts"
         ]
+        and authority_floor_met
     )
 
     snapshot[
@@ -1471,6 +1703,13 @@ def plan_next_deep_research_round(
         "official/primary information, conflicting evidence, stale/current information, "
         "important drawbacks, and unanswered user-specific decision criteria WHEN those "
         "dimensions are material to the stated research goal.\n"
+        "- AUTHORITY MATTERS: inspect the supplied quality snapshot. For catalogue/current-lineup "
+        "research, prioritize official/primary sources plus independent corroboration. Retailer, "
+        "marketplace, reference/wiki, rumor, social, and video sources may provide context but do "
+        "not substitute for the required primary/independent evidence floor.\n"
+        "- Do not keep expanding a narrow catalogue lookup merely to accumulate source volume. "
+        "Once the requested lineup is established by sufficient authoritative evidence and no "
+        "material catalogue gap remains, declare complete.\n"
         "- DEPTH IS NOT BREADTH: stay inside Oliver's actual goal. A narrow request for "
         "current models/lineup should be researched carefully but must not silently expand "
         "into purchase advice, durability investigations, complaint mining, or exhaustive "

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import threading
@@ -19,10 +20,12 @@ from research.deep_research import (
 )
 from research.final_synthesis import (
     generate_grounded_final_synthesis,
+    repair_grounded_final_synthesis,
     verify_grounded_final_synthesis,
 )
 from research.public_factual_research import (
     build_internal_public_factual_packet,
+    filter_research_result_for_relevance,
     gather_public_factual_research,
 )
 from research.research_jobs import (
@@ -331,6 +334,8 @@ def _max_reads_for_job(
 def _source_index_from_research_result(
     research_result: dict,
 ) -> list[dict]:
+    """Return only readable sources accepted as evidence by Core relevance gates."""
+
     sources = []
 
     for source in (
@@ -343,6 +348,23 @@ def _source_index_from_research_result(
             source,
             dict,
         ):
+            continue
+
+        if not source.get(
+            "read_success"
+        ):
+            continue
+
+        if source.get(
+            "accepted_as_evidence"
+        ) is False:
+            continue
+
+        if _normalise_space(
+            source.get(
+                "relevance_status"
+            )
+        ).lower() == "rejected":
             continue
 
         sources.append({
@@ -358,13 +380,44 @@ def _source_index_from_research_result(
             "source_quality": source.get(
                 "source_quality"
             ),
+            "authority_tier": source.get(
+                "authority_tier"
+            ) or "legacy_curated",
+            "quality_eligible": (
+                source.get(
+                    "quality_eligible"
+                )
+                if source.get(
+                    "quality_eligible"
+                ) is not None
+                else True
+            ),
+            "authority_reason": source.get(
+                "authority_reason"
+            ),
+            "authority_anchor_matches": list(
+                source.get(
+                    "authority_anchor_matches"
+                )
+                or []
+            ),
             "published_date": source.get(
                 "published_date"
             ),
-            "read_success": bool(
+            "read_success": True,
+            "accepted_as_evidence": True,
+            "relevance_status": "accepted",
+            "identity_anchors": list(
                 source.get(
-                    "read_success"
+                    "identity_anchors"
                 )
+                or []
+            ),
+            "matched_identity_anchors": list(
+                source.get(
+                    "matched_identity_anchors"
+                )
+                or []
             ),
         })
 
@@ -431,6 +484,89 @@ def _unique_source_index(
     return merged
 
 
+def _unique_rejected_sources(
+    *source_lists: list[dict],
+) -> list[dict]:
+    merged = []
+    seen = set()
+
+    for sources in source_lists:
+        for source in sources or []:
+            if not isinstance(source, dict):
+                continue
+
+            url = _normalise_space(
+                source.get("url")
+            ).lower()
+            stage = _normalise_space(
+                source.get("stage")
+            ).lower()
+            reasons = tuple(
+                _normalise_space(reason).lower()
+                for reason in (source.get("reasons") or [])
+                if _normalise_space(reason)
+            )
+            title = _normalise_space(
+                source.get("title")
+            ).lower()
+
+            key = (url, stage, reasons, title)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            merged.append(dict(source))
+
+    return merged[-120:]
+
+
+def _research_function_accepts_identity(
+    research_fn: Callable,
+) -> bool:
+    try:
+        signature = inspect.signature(
+            research_fn
+        )
+    except (TypeError, ValueError):
+        return False
+
+    if "research_identity" in signature.parameters:
+        return True
+
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _call_research_function(
+    *,
+    research_fn: Callable,
+    query: str,
+    job: dict,
+) -> dict:
+    kwargs = {
+        "max_reads": _max_reads_for_job(
+            job
+        ),
+    }
+
+    if _research_function_accepts_identity(
+        research_fn
+    ):
+        kwargs[
+            "research_identity"
+        ] = canonical_research_topic(
+            job
+        )
+
+    return research_fn(
+        query,
+        **kwargs,
+    )
+
+
 def _normalise_accumulated_result(
     job: dict,
 ) -> dict:
@@ -465,6 +601,13 @@ def _normalise_accumulated_result(
     evidence_packets = list(
         current.get(
             "evidence_packets"
+        )
+        or []
+    )
+
+    rejected_sources = list(
+        current.get(
+            "rejected_sources"
         )
         or []
     )
@@ -561,6 +704,10 @@ def _normalise_accumulated_result(
         "source_index": source_index,
         "rounds": rounds,
         "evidence_packets": evidence_packets,
+        "rejected_sources": rejected_sources,
+        "rejected_source_count": len(
+            rejected_sources
+        ),
         "planner_history": list(
             current.get(
                 "planner_history"
@@ -611,6 +758,21 @@ def _append_research_pass(
         )
     )
 
+    rejected_sources = _unique_rejected_sources(
+        list(
+            accumulated.get(
+                "rejected_sources"
+            )
+            or []
+        ),
+        list(
+            research_result.get(
+                "rejected_sources"
+            )
+            or []
+        ),
+    )
+
     rounds = list(
         accumulated.get(
             "rounds"
@@ -629,6 +791,21 @@ def _append_research_pass(
         "readable_source_count": int(
             research_result.get(
                 "readable_source_count"
+            )
+            or 0
+        ),
+        "accepted_source_count": int(
+            research_result.get(
+                "accepted_source_count"
+            )
+            or research_result.get(
+                "readable_source_count"
+            )
+            or 0
+        ),
+        "rejected_source_count": int(
+            research_result.get(
+                "rejected_source_count"
             )
             or 0
         ),
@@ -682,6 +859,10 @@ def _append_research_pass(
         "source_index": merged_sources,
         "rounds": rounds,
         "evidence_packets": evidence_packets,
+        "rejected_sources": rejected_sources,
+        "rejected_source_count": len(
+            rejected_sources
+        ),
         "readable_source_count": len(
             [
                 source
@@ -701,11 +882,10 @@ def _run_public_research_pass(
     research_fn: Callable,
     packet_builder: Callable,
 ) -> tuple[dict, str]:
-    research_result = research_fn(
-        query,
-        max_reads=_max_reads_for_job(
-            job
-        ),
+    research_result = _call_research_function(
+        research_fn=research_fn,
+        query=query,
+        job=job,
     )
 
     if not isinstance(
@@ -715,6 +895,14 @@ def _run_public_research_pass(
         raise RuntimeError(
             "research function returned an invalid result"
         )
+
+    research_result = filter_research_result_for_relevance(
+        research_result,
+        query=query,
+        research_identity=canonical_research_topic(
+            job
+        ),
+    )
 
     if not research_result.get(
         "success"
@@ -869,6 +1057,27 @@ def _handle_initial_research_stage(
             )
             or 0
         ),
+        "accepted_source_count": int(
+            research_result.get(
+                "accepted_source_count"
+            )
+            or research_result.get(
+                "readable_source_count"
+            )
+            or 0
+        ),
+        "rejected_source_count": int(
+            research_result.get(
+                "rejected_source_count"
+            )
+            or 0
+        ),
+        "rejected_sources": list(
+            research_result.get(
+                "rejected_sources"
+            )
+            or []
+        )[-120:],
         "source_index": source_index,
         "rounds": [{
             "round": 1,
@@ -879,6 +1088,21 @@ def _handle_initial_research_stage(
             "readable_source_count": int(
                 research_result.get(
                     "readable_source_count"
+                )
+                or 0
+            ),
+            "accepted_source_count": int(
+                research_result.get(
+                    "accepted_source_count"
+                )
+                or research_result.get(
+                    "readable_source_count"
+                )
+                or 0
+            ),
+            "rejected_source_count": int(
+                research_result.get(
+                    "rejected_source_count"
                 )
                 or 0
             ),
@@ -910,7 +1134,14 @@ def _handle_initial_research_stage(
                 "readable_source_count"
             ]
         )
-        + " readable sources."
+        + " relevant readable sources; rejected "
+        + str(
+            result.get(
+                "rejected_source_count"
+            )
+            or 0
+        )
+        + " irrelevant/unusable candidates."
     )
 
     if depth == "quick":
@@ -1367,21 +1598,35 @@ def _handle_iterative_deep_stage(
             )
             or 0
         )
-        + " new sources; "
+        + " new relevant sources; "
         + str(
             quality.get(
                 "source_count"
             )
             or 0
         )
-        + " unique sources across "
+        + " quality-counting sources across "
         + str(
             quality.get(
                 "unique_host_count"
             )
             or 0
         )
-        + " hosts."
+        + " hosts ("
+        + str(
+            quality.get(
+                "primary_source_count"
+            )
+            or 0
+        )
+        + " primary, "
+        + str(
+            quality.get(
+                "independent_source_count"
+            )
+            or 0
+        )
+        + " independent)."
     )
 
     return _pause_for_next_deep_stage(
@@ -1565,6 +1810,199 @@ def _handle_final_synthesis_stage(
     )
 
 
+
+def _draft_verification_units(
+    draft: str,
+) -> list[str]:
+    value = re.sub(
+        r"[ \t]+",
+        " ",
+        str(
+            draft
+            or ""
+        ).strip(),
+    )
+
+    if not value:
+        return []
+
+    return [
+        piece.strip()
+        for piece in re.split(
+            r"(?<=[.!?])\s+|\n+",
+            value,
+        )
+        if piece.strip()
+    ]
+
+
+MIN_REPAIR_ASSESSMENT_COVERAGE = 0.90
+MAX_REPAIR_MISSING_ASSESSMENTS = 5
+
+
+def _normalise_verification_feedback_for_repair(
+    report_text: str,
+    verification: dict,
+) -> Optional[dict]:
+    """
+    Return repair-safe verifier feedback, or None when the feedback is too incomplete.
+
+    A fully structured verifier map is ideal. Real local-model runs can occasionally
+    return valid JSON that omits only the final few sentence assessments. That is not
+    safe enough for final acceptance, but it *is* safe enough for one conservative
+    repair because Core pessimistically marks every missing sentence unsupported and
+    the repaired report must still pass a fresh verifier run before delivery.
+
+    Sparse/transport-style output remains fail-closed.
+    """
+
+    if not isinstance(verification, dict):
+        return None
+
+    if verification.get("supported") is True:
+        return None
+
+    violations = [
+        _normalise_space(item).lower()
+        for item in (verification.get("violations") or [])
+        if _normalise_space(item)
+    ]
+
+    if any(
+        "could not validate the draft" in item
+        for item in violations
+    ):
+        return None
+
+    units = _draft_verification_units(report_text)
+    if not units:
+        return None
+
+    assessments = verification.get("sentence_assessments") or []
+    if not isinstance(assessments, list):
+        return None
+
+    by_index = {}
+    has_failure = False
+
+    for assessment in assessments:
+        if not isinstance(assessment, dict):
+            continue
+
+        try:
+            index = int(assessment.get("index"))
+        except (TypeError, ValueError):
+            continue
+
+        if not (1 <= index <= len(units)):
+            continue
+
+        supported = assessment.get("supported") is True
+        by_index[index] = {
+            "index": index,
+            "supported": supported,
+        }
+
+        if not supported:
+            has_failure = True
+
+    expected = set(range(1, len(units) + 1))
+    indexes = set(by_index)
+    missing = sorted(expected - indexes)
+
+    if not has_failure and not violations:
+        return None
+
+    if missing:
+        coverage = len(indexes) / len(expected)
+
+        if (
+            coverage < MIN_REPAIR_ASSESSMENT_COVERAGE
+            or len(missing) > MAX_REPAIR_MISSING_ASSESSMENTS
+        ):
+            return None
+
+        for index in missing:
+            by_index[index] = {
+                "index": index,
+                "supported": False,
+            }
+
+        normalised = dict(verification)
+        normalised["sentence_assessments"] = [
+            by_index[index]
+            for index in sorted(by_index)
+        ]
+        normalised["repair_feedback_completed_by_core"] = True
+        normalised["repair_feedback_missing_indexes"] = missing
+        normalised["repair_feedback_coverage"] = coverage
+        return normalised
+
+    normalised = dict(verification)
+    normalised["sentence_assessments"] = [
+        by_index[index]
+        for index in sorted(by_index)
+    ]
+    return normalised
+
+
+def _verification_feedback_supports_repair(
+    report_text: str,
+    verification: dict,
+) -> bool:
+    return (
+        _normalise_verification_feedback_for_repair(
+            report_text,
+            verification,
+        )
+        is not None
+    )
+
+
+def _pause_for_synthesis_review(
+    *,
+    job: dict,
+    worker_id: str,
+    checkpoint: dict,
+    accumulated: dict,
+    synthesis_record: dict,
+    verified_at: str,
+    review_reason: str,
+) -> dict:
+    review_result = {
+        **accumulated,
+        "research_phase": "final_synthesis_review_required",
+        "user_ready": False,
+        "final_synthesis": synthesis_record,
+        "final_report_verified": False,
+    }
+
+    review_checkpoint = {
+        **checkpoint,
+        "stage": "final_synthesis_review_required",
+        "stage_finished_at": verified_at,
+        "next_stage": "synthesis_review_required",
+        "user_ready": False,
+        "review_reason": review_reason,
+    }
+
+    print(
+        "[Research] Final synthesis was not fully grounded; paused for review."
+    )
+
+    return update_claimed_research_job(
+        job[
+            "id"
+        ],
+        worker_id=worker_id,
+        status="paused",
+        checkpoint=review_checkpoint,
+        result=review_result,
+        error=None,
+        resume_automatically=False,
+    )
+
+
 def _handle_final_synthesis_verification_stage(
     *,
     job: dict,
@@ -1705,25 +2143,100 @@ def _handle_final_synthesis_verification_stage(
 
     verified_at = _now_iso()
 
+    verification_record = {
+        "supported": supported,
+        "violations": violations,
+        "verified_at": verified_at,
+        "model": verification.get(
+            "model"
+        ),
+        "accepted_sentences": list(
+            verification.get(
+                "accepted_sentences"
+            )
+            or []
+        ),
+        "sentence_assessments": list(
+            verification.get(
+                "sentence_assessments"
+            )
+            or []
+        ),
+    }
+
+    repair_feedback = (
+        _normalise_verification_feedback_for_repair(
+            report_text,
+            verification_record,
+        )
+        if not supported
+        else None
+    )
+
+    if repair_feedback is not None:
+        verification_record = repair_feedback
+
     synthesis_record = {
         **synthesis_record,
-        "verification": {
-            "supported": supported,
-            "violations": violations,
-            "verified_at": verified_at,
-            "model": verification.get(
-                "model"
-            ),
-            "sentence_assessments": list(
-                verification.get(
-                    "sentence_assessments"
-                )
-                or []
-            ),
-        },
+        "verification": verification_record,
     }
 
     if not supported:
+        repair_attempt_count = int(
+            synthesis_record.get(
+                "repair_attempt_count"
+            )
+            or 0
+        )
+
+        repairable = bool(
+            repair_attempt_count < 1
+            and repair_feedback is not None
+        )
+
+        if repairable:
+            queued_result = {
+                **accumulated,
+                "research_phase": "final_synthesis_repair_pending",
+                "user_ready": False,
+                "final_synthesis": synthesis_record,
+                "final_report_verified": False,
+            }
+
+            queued_checkpoint = {
+                **started_checkpoint,
+                "stage": "final_synthesis_repair_pending",
+                "stage_finished_at": verified_at,
+                "next_stage": "final_synthesis_repair",
+                "user_ready": False,
+                "repair_attempt_count": repair_attempt_count,
+                "repair_reason": (
+                    violations[
+                        0
+                    ]
+                    if violations
+                    else (
+                        "The verifier returned complete unsupported-sentence feedback."
+                    )
+                ),
+            }
+
+            print(
+                "[Research] Verification rejected the draft; one grounded repair is queued."
+            )
+
+            return update_claimed_research_job(
+                job[
+                    "id"
+                ],
+                worker_id=worker_id,
+                status="paused",
+                checkpoint=queued_checkpoint,
+                result=queued_result,
+                error=None,
+                resume_automatically=True,
+            )
+
         review_reason = (
             violations[
                 0
@@ -1734,37 +2247,14 @@ def _handle_final_synthesis_verification_stage(
             )
         )
 
-        review_result = {
-            **accumulated,
-            "research_phase": "final_synthesis_review_required",
-            "user_ready": False,
-            "final_synthesis": synthesis_record,
-            "final_report_verified": False,
-        }
-
-        review_checkpoint = {
-            **started_checkpoint,
-            "stage": "final_synthesis_review_required",
-            "stage_finished_at": verified_at,
-            "next_stage": "synthesis_review_required",
-            "user_ready": False,
-            "review_reason": review_reason,
-        }
-
-        print(
-            "[Research] Final synthesis was not fully grounded; paused for review."
-        )
-
-        return update_claimed_research_job(
-            job[
-                "id"
-            ],
+        return _pause_for_synthesis_review(
+            job=job,
             worker_id=worker_id,
-            status="paused",
-            checkpoint=review_checkpoint,
-            result=review_result,
-            error=None,
-            resume_automatically=False,
+            checkpoint=started_checkpoint,
+            accumulated=accumulated,
+            synthesis_record=synthesis_record,
+            verified_at=verified_at,
+            review_reason=review_reason,
         )
 
     source_index = list(
@@ -1855,6 +2345,348 @@ def _handle_final_synthesis_verification_stage(
     )
 
 
+def _handle_final_synthesis_repair_stage(
+    *,
+    job: dict,
+    worker_id: str,
+    synthesis_repair_fn: Callable,
+    respect_interactive_preemption: bool,
+) -> dict:
+    checkpoint = dict(
+        job.get(
+            "checkpoint"
+        )
+        or {}
+    )
+
+    accumulated = dict(
+        job.get(
+            "result"
+        )
+        or {}
+    )
+
+    synthesis_record = accumulated.get(
+        "final_synthesis"
+    )
+
+    if not isinstance(
+        synthesis_record,
+        dict,
+    ):
+        raise RuntimeError(
+            "final synthesis repair has no persisted synthesis record"
+        )
+
+    report_text = str(
+        synthesis_record.get(
+            "report_text"
+        )
+        or ""
+    ).strip()
+
+    if not report_text:
+        raise RuntimeError(
+            "final synthesis repair has no persisted draft"
+        )
+
+    repair_attempt_count = int(
+        synthesis_record.get(
+            "repair_attempt_count"
+        )
+        or 0
+    )
+
+    verification_record = synthesis_record.get(
+        "verification"
+    )
+
+    if repair_attempt_count >= 1:
+        return _pause_for_synthesis_review(
+            job=job,
+            worker_id=worker_id,
+            checkpoint=checkpoint,
+            accumulated=accumulated,
+            synthesis_record=synthesis_record,
+            verified_at=_now_iso(),
+            review_reason=(
+                "The one permitted grounded synthesis repair was already used."
+            ),
+        )
+
+    if not isinstance(
+        verification_record,
+        dict,
+    ):
+        return _pause_for_synthesis_review(
+            job=job,
+            worker_id=worker_id,
+            checkpoint=checkpoint,
+            accumulated=accumulated,
+            synthesis_record=synthesis_record,
+            verified_at=_now_iso(),
+            review_reason=(
+                "The synthesis repair stage has no complete verifier feedback."
+            ),
+        )
+
+    if not _verification_feedback_supports_repair(
+        report_text,
+        verification_record,
+    ):
+        return _pause_for_synthesis_review(
+            job=job,
+            worker_id=worker_id,
+            checkpoint=checkpoint,
+            accumulated=accumulated,
+            synthesis_record=synthesis_record,
+            verified_at=_now_iso(),
+            review_reason=(
+                "The verifier feedback is not complete enough for a safe grounded repair."
+            ),
+        )
+
+    if (
+        respect_interactive_preemption
+        and not background_research_can_run()
+    ):
+        print(
+            "[Research] Interactive activity detected; synthesis repair yielded."
+        )
+
+        return _pause_for_next_deep_stage(
+            job=job,
+            worker_id=worker_id,
+            checkpoint={
+                **checkpoint,
+                "stage": "final_synthesis_repair_deferred",
+                "next_stage": "final_synthesis_repair",
+                "user_ready": False,
+            },
+            result=accumulated,
+        )
+
+    started_at = _now_iso()
+
+    started_checkpoint = {
+        **checkpoint,
+        "stage": "final_synthesis_repair",
+        "stage_started_at": started_at,
+        "next_stage": "final_synthesis_repair",
+        "user_ready": False,
+    }
+
+    job = update_claimed_research_job(
+        job[
+            "id"
+        ],
+        worker_id=worker_id,
+        status="running",
+        checkpoint=started_checkpoint,
+        result=accumulated,
+    )
+
+    print(
+        "[Research] Grounded final synthesis repair started."
+    )
+
+    repair = synthesis_repair_fn(
+        job,
+        accumulated,
+        report_text,
+        verification_record,
+    )
+
+    if isinstance(
+        repair,
+        str,
+    ):
+        repair = {
+            "success": bool(
+                repair.strip()
+            ),
+            "report_text": repair,
+            "uncertainties": [],
+            "source_urls": [],
+        }
+
+    if not isinstance(
+        repair,
+        dict,
+    ):
+        raise RuntimeError(
+            "final synthesis repair function returned an invalid result"
+        )
+
+    repaired_text = str(
+        repair.get(
+            "report_text"
+        )
+        or ""
+    ).strip()
+
+    if (
+        repair.get(
+            "success"
+        ) is not True
+        or not repaired_text
+    ):
+        reason = _normalise_space(
+            repair.get(
+                "failure_reason"
+            )
+        ) or (
+            "The one permitted grounded synthesis repair did not produce a usable draft."
+        )
+
+        return _pause_for_synthesis_review(
+            job=job,
+            worker_id=worker_id,
+            checkpoint=started_checkpoint,
+            accumulated=accumulated,
+            synthesis_record=synthesis_record,
+            verified_at=_now_iso(),
+            review_reason=reason,
+        )
+
+    if repaired_text == report_text:
+        return _pause_for_synthesis_review(
+            job=job,
+            worker_id=worker_id,
+            checkpoint=started_checkpoint,
+            accumulated=accumulated,
+            synthesis_record=synthesis_record,
+            verified_at=_now_iso(),
+            review_reason=(
+                "The grounded synthesis repair returned the same rejected draft."
+            ),
+        )
+
+    failed_indexes = [
+        int(
+            item.get(
+                "index"
+            )
+        )
+        for item in (
+            verification_record.get(
+                "sentence_assessments"
+            )
+            or []
+        )
+        if isinstance(
+            item,
+            dict,
+        )
+        and item.get(
+            "supported"
+        ) is not True
+        and str(
+            item.get(
+                "index"
+            )
+            or ""
+        ).isdigit()
+    ]
+
+    verification_history = list(
+        synthesis_record.get(
+            "verification_history"
+        )
+        or []
+    )
+    verification_history.append(
+        dict(
+            verification_record
+        )
+    )
+
+    repair_history = list(
+        synthesis_record.get(
+            "repair_history"
+        )
+        or []
+    )
+    repair_history.append({
+        "attempt": 1,
+        "generated_at": _now_iso(),
+        "model": repair.get(
+            "model"
+        ),
+        "violations": list(
+            verification_record.get(
+                "violations"
+            )
+            or []
+        )[
+            :8
+        ],
+        "failed_sentence_indexes": failed_indexes,
+    })
+
+    repaired_record = {
+        **synthesis_record,
+        "report_text": repaired_text,
+        "uncertainties": list(
+            repair.get(
+                "uncertainties"
+            )
+            or []
+        )[
+            :8
+        ],
+        "source_urls": list(
+            repair.get(
+                "source_urls"
+            )
+            or synthesis_record.get(
+                "source_urls"
+            )
+            or []
+        ),
+        "repair_attempt_count": 1,
+        "repair_history": repair_history,
+        "verification_history": verification_history,
+        "verification": None,
+        "repaired_at": _now_iso(),
+        "repair_model": repair.get(
+            "model"
+        ),
+    }
+
+    repaired_result = {
+        **accumulated,
+        "research_phase": "final_synthesis_repair_complete",
+        "user_ready": False,
+        "final_synthesis": repaired_record,
+        "final_report_verified": False,
+    }
+
+    repaired_checkpoint = {
+        **started_checkpoint,
+        "stage": "final_synthesis_repair_complete",
+        "stage_finished_at": _now_iso(),
+        "next_stage": "final_synthesis_verification",
+        "user_ready": False,
+        "repair_attempt_count": 1,
+    }
+
+    print(
+        "[Research] Grounded repair checkpoint saved; verification will run once more."
+    )
+
+    return update_claimed_research_job(
+        job[
+            "id"
+        ],
+        worker_id=worker_id,
+        status="paused",
+        checkpoint=repaired_checkpoint,
+        result=repaired_result,
+        error=None,
+        resume_automatically=True,
+    )
+
 def run_one_research_job(
     *,
     worker_id: Optional[str] = None,
@@ -1863,6 +2695,7 @@ def run_one_research_job(
     planner_fn: Callable = plan_next_deep_research_round,
     synthesis_fn: Callable = generate_grounded_final_synthesis,
     synthesis_verifier_fn: Callable = verify_grounded_final_synthesis,
+    synthesis_repair_fn: Callable = repair_grounded_final_synthesis,
     lease_seconds: int = 900,
     respect_interactive_preemption: bool = False,
 ) -> Optional[dict]:
@@ -1938,6 +2771,16 @@ def run_one_research_job(
                 job=job,
                 worker_id=owner,
                 synthesis_verifier_fn=synthesis_verifier_fn,
+                respect_interactive_preemption=(
+                    respect_interactive_preemption
+                ),
+            )
+
+        if next_stage == "final_synthesis_repair":
+            return _handle_final_synthesis_repair_stage(
+                job=job,
+                worker_id=owner,
+                synthesis_repair_fn=synthesis_repair_fn,
                 respect_interactive_preemption=(
                     respect_interactive_preemption
                 ),
