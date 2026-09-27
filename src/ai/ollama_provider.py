@@ -76,6 +76,8 @@ from research.public_factual_grounding import (
     verify_public_factual_draft,
 )
 
+from core.intent_router import reconstruct_bounded_factual_followup
+
 from core.conversational_research import (
     build_background_research_offer_text,
     build_background_research_queued_text,
@@ -122,6 +124,17 @@ from core.temporal_context import (
 )
 from core.email_intent import (
     is_inbox_attention_request,
+)
+from core.epistemic_calibration import (
+    extract_lexical_query_term,
+    repair_unjustified_lexical_denial,
+)
+
+from core.critical_response_safety import (
+    explicit_calendar_write_request,
+    replace_visible_answer_in_history,
+    sanitise_visible_response,
+    should_expose_model_cloud,
 )
 
 from core.source_lock import (
@@ -887,6 +900,9 @@ def build_factual_focus_instruction(
         "- Do not discuss internal answer-generation process, model memory, training "
         "data, whether a fact is hard-coded, whether it was worth checking, or "
         "whether you are 'sticking with the correct answer'.",
+        "- When asked for the meaning of an unfamiliar or unverified term, do "
+        "not assert it categorically does not exist. State uncertainty plainly "
+        "and avoid inventing a definition.",
     ]
 
     if explanation_requested:
@@ -8235,11 +8251,23 @@ def handle_direct_conversation(
         == "conversation_recall"
     )
 
+    resolved_factual_followup_query = (
+        reconstruct_bounded_factual_followup(
+            user_input, _latest_user_authored_message(conversation)
+        )
+        if core_intent == "factual_question"
+        else None
+    )
+
     core_uses_restricted_generation_context = (
         should_use_restricted_generation_context(
             core_intent,
             user_input=user_input,
         )
+        # Source restriction is a property of the epistemic route, not
+        # the surface wording. Deictic task follow-ups still need isolation
+        # from prior assistant text while receiving bounded USER evidence.
+        or core_epistemic_mode in {"user_context_reasoning", "private_user_evidence"}
         or core_is_grounded_opinion
         or core_is_consequential_advice
     )
@@ -8657,7 +8685,7 @@ def handle_direct_conversation(
             )
 
             public_research_input = (
-                user_input
+                resolved_factual_followup_query or user_input
             )
 
         public_research_result = (
@@ -9137,6 +9165,67 @@ def handle_direct_conversation(
         base_messages.append({
             "role": "system",
             "content": factual_focus_instruction,
+        })
+
+    if core_intent == "factual_question" and core_epistemic_mode == "private_state_uncertain":
+        base_messages.append({
+            "role": "system",
+            "content": (
+                "CORE PRIVATE-STATE UNCERTAINTY: Public web searches and model "
+                "memory cannot establish Oliver's unobserved current appearance, "
+                "concealed objects, thoughts, or unreported recent activities. "
+                "Use the user-authored live conversation only if it directly "
+                "supplies the requested fact. Otherwise state plainly that "
+                "you cannot see it or do not know. Do not guess unless Oliver "
+                "explicitly invites a labelled guess; do not claim camera access."
+            ),
+        })
+
+    if core_intent == "factual_question" and core_epistemic_mode in {
+        "user_context_reasoning", "private_user_evidence",
+    }:
+        # Route and generation must agree: no web research for user-supplied
+        # constraints or facts. The conversation packet may contain only
+        # user-authored evidence, never an earlier Mairon answer as authority.
+        bounded_user_context = build_recent_user_grounding_context(
+            conversation, max_user_messages=4,
+        )
+        base_messages.append({
+            "role": "system",
+            "content": (
+                "CORE USER-SOURCED CONTINUITY: Answer the current actual "
+                "question using the current user turn and relevant prior "
+                "USER statements. Interpret corrections as superseding "
+                "earlier user versions. For task reasoning, stable technical "
+                "knowledge is allowed; no invented measurements, personal "
+                "facts or external-source assertions. Never search the web "
+                "solely to verify Oliver's own premises. State exactly what "
+                "is missing if the supplied evidence is insufficient.\n"
+                + (bounded_user_context or "No previous user evidence supplied.")
+            ),
+        })
+
+    if core_intent == "factual_question" and extract_lexical_query_term(user_input):
+        base_messages.append({
+            "role": "system",
+            "content": (
+                "CORE LEXICAL UNCERTAINTY: Not recognising a term does NOT "
+                "establish that it is fake, nonsense, or nonexistent. Give a "
+                "definition only when confident. If uncertain, say you do not "
+                "recognise it and do not invent a meaning or accuse Oliver "
+                "of trying to trick you."
+            ),
+        })
+
+    if resolved_factual_followup_query:
+        base_messages.append({
+            "role": "system",
+            "content": (
+                "CORE FACTUAL FOLLOW-UP: The current fragment inherits the "
+                "question structure (not the answer) of Oliver's nearest "
+                "previous user-authored question. Answer this resolved query "
+                "and nothing else: " + resolved_factual_followup_query
+            ),
         })
 
     if core_intent == "conversation_recall":
@@ -9823,6 +9912,7 @@ def handle_direct_conversation(
             if (
                 tool_call.function.name
                 == "request_cloud_escalation"
+                and allow_cloud_escalation
             ):
                 arguments = normalise_tool_arguments(
                     tool_call.function.arguments
@@ -10008,6 +10098,22 @@ def handle_direct_conversation(
                             removed_follow_up_tail
                         )
                     )
+
+        # A categorical claim that an unfamiliar word "isn't real" is
+        # epistemically unsupported. Guard the actual published draft; a
+        # prompt alone did not stop the Phase 11.6.2 live failure.
+        if factual_focus_fidelity_required:
+            draft_text, lexical_calibration_applied = (
+                repair_unjustified_lexical_denial(
+                    user_input=user_input,
+                    draft=draft_text,
+                )
+            )
+            if lexical_calibration_applied:
+                print(
+                    "[Epistemic] Replaced an unsupported categorical "
+                    "lexical denial with calibrated uncertainty."
+                )
 
         if generation_debug_enabled():
             print(
@@ -10599,6 +10705,28 @@ def _get_response_impl(
         )
     )
 
+    core_intent = _core_contract_value(
+        core_answer_contract, "Intent"
+    )
+
+    # 11.6.6A: permission availability is not permission to request cloud
+    # on Oliver's behalf. Only explicitly requested cloud turns expose it.
+    # The calendar permission tool likewise requires an affirmative user ask.
+    calendar_write_explicit = explicit_calendar_write_request(user_input)
+    if calendar_write_explicit and core_intent in {
+        None, "", "factual_question", "action_request",
+    }:
+        # Conservative fallback if a legacy Core contract failed to label an
+        # explicit calendar-write request. This still only PROPOSES approval.
+        core_intent = "calendar_event_creation_request"
+
+    allow_cloud_escalation = should_expose_model_cloud(
+        requested=allow_cloud_escalation,
+        user_text=user_input,
+        core_intent=core_intent,
+    )
+
+
     if conversation is None:
         conversation = [
             {
@@ -10833,8 +10961,12 @@ def _get_response_impl(
     # the normal general tool loop below.
     # --------------------------------------------------
 
-    if should_use_direct_conversation(
-        user_input
+    if (
+        core_intent == "reason_from_supplied_premises"
+        or (
+            core_intent != "calendar_event_creation_request"
+            and should_use_direct_conversation(user_input)
+        )
     ):
         return handle_direct_conversation(
             client=client,
@@ -10872,18 +11004,36 @@ def _get_response_impl(
         "content": user_input
     })
 
-    tools = list(
-        OLLAMA_ACTION_TOOLS
-    )
+    if core_intent == "calendar_event_creation_request" and not calendar_write_explicit:
+        answer = "I haven't created an event. Tell me explicitly if you'd like me to add it."
+        safe_history = list(conversation)
+        safe_history.append({"role": "user", "content": user_input})
+        safe_history.append({"role": "assistant", "content": answer})
+        return answer, safe_history, None, None
 
-    tools.append(
-        CALENDAR_EVENT_REQUEST_TOOL
-    )
-
-    if allow_cloud_escalation:
-        tools.append(
-            CLOUD_ESCALATION_TOOL
-        )
+    if core_intent == "calendar_event_creation_request":
+        # Core already established explicit write intent. Expose only a
+        # permission-request tool, never an actual Calendar write tool.
+        tools = [CALENDAR_EVENT_REQUEST_TOOL]
+        working_conversation.append({
+            "role": "system",
+            "content": (
+                "CORE CALENDAR ACTION: Oliver explicitly asked you to put an "
+                "event on his calendar. You DO have a permission-request tool. "
+                "Do not claim calendar creation is unavailable or that the "
+                "event is already created. Resolve the requested title and "
+                "local start/end dates using the supplied runtime clock; "
+                "call request_calendar_event_creation to propose an approval "
+                "preview. If essential timing is genuinely missing, ask only "
+                "for the missing detail. Never execute a write yourself."
+            ),
+        })
+    else:
+        tools = list(OLLAMA_ACTION_TOOLS)
+        if calendar_write_explicit:
+            tools.append(CALENDAR_EVENT_REQUEST_TOOL)
+        if allow_cloud_escalation:
+            tools.append(CLOUD_ESCALATION_TOOL)
 
     require_web_read = (
         explicitly_requires_web_read(
@@ -10913,6 +11063,7 @@ def _get_response_impl(
     # emptiness fails closed with a real message instead of printing nothing.
     empty_final_retries = 0
     max_empty_final_retries = 2
+    calendar_action_retry_done = False
 
     tool_rounds = 0
 
@@ -10949,6 +11100,7 @@ def _get_response_impl(
             if (
                 tool_call.function.name
                 == "request_calendar_event_creation"
+                and calendar_write_explicit
             ):
                 arguments = normalise_tool_arguments(
                     tool_call.function.arguments
@@ -11018,6 +11170,7 @@ def _get_response_impl(
             if (
                 tool_call.function.name
                 == "request_cloud_escalation"
+                and allow_cloud_escalation
             ):
                 arguments = normalise_tool_arguments(
                     tool_call.function.arguments
@@ -11043,6 +11196,43 @@ def _get_response_impl(
         # --------------------------------------------------
 
         if not tool_calls:
+
+            if core_intent == "calendar_event_creation_request":
+                if not calendar_action_retry_done:
+                    calendar_action_retry_done = True
+                    working_conversation.append({
+                        "role": "system",
+                        "content": (
+                            "Core has classified this as an EXPLICIT calendar "
+                            "write request. Do not give a generic tool-access "
+                            "disclaimer or falsely claim completion. The only "
+                            "available tool requests Oliver's approval. Call "
+                            "request_calendar_event_creation with the precise "
+                            "proposal, if enough information was supplied. "
+                            "Otherwise ask for the missing time or date."
+                        ),
+                    })
+                    continue
+                # Preserve an actual clarification, but never accept a false
+                # success or bogus assertion that Calendar is unavailable.
+                clarification = str(response.message.content or "").strip()
+                if clarification.endswith("?") and not any(
+                    marker in clarification.lower()
+                    for marker in ("can't", "cannot", "don't have access", "not able")
+                ):
+                    working_conversation.append({
+                        "role": "assistant", "content": clarification
+                    })
+                    return (clarification, working_conversation, None, None)
+                fallback = (
+                    "I couldn't prepare a reliable calendar-event approval "
+                    "preview. No event was created. Please restate its "
+                    "title, date, and start/end times."
+                )
+                working_conversation.append({
+                    "role": "assistant", "content": fallback
+                })
+                return (fallback, working_conversation, None, None)
 
             response_content = str(
                 response.message.content
@@ -11543,20 +11733,16 @@ def get_response(
     conversation=None,
     allow_cloud_escalation=False,
 ):
-    """
-    Public provider entrypoint.
+    """Provider-wide final safety boundary and foreground-interaction lease.
 
-    Hold a foreground-interaction lease for the ENTIRE turn, not merely for a
-    timestamp at turn start. A long Calendar/Gmail/tool/Qwen workflow therefore
-    cannot be mistaken for user idleness and overlapped by background Ollama
-    planning. The post-response idle grace begins only after this function
-    returns (or raises).
+    The implementation is free to return a pending permission request. An
+    unapproved calendar action is NEVER reported as completed here. A visible
+    answer is checked once at the outermost provider boundary so specialised
+    paths cannot bypass instruction-leak and false-completion protection.
     """
-
     begin_interactive_turn()
-
     try:
-        return _get_response_impl(
+        result = _get_response_impl(
             client=client,
             user_input=user_input,
             instructions=instructions,
@@ -11564,6 +11750,22 @@ def get_response(
             allow_cloud_escalation=allow_cloud_escalation,
         )
 
+        answer, updated_history, cloud_reason, pending_action = result
+        # An approval request has no visible model answer to sanitise; Core
+        # still owns the actual approval and execution flow.
+        if not isinstance(answer, str) or not answer:
+            return result
+
+        # No Calendar write occurs inside this provider: it proposes only.
+        safe_answer, violation = sanitise_visible_response(user_input, answer)
+        if safe_answer != answer:
+            updated_history = replace_visible_answer_in_history(
+                updated_history, answer, safe_answer,
+            )
+            if violation:
+                print("[Safety] Repaired final provider response: " + violation)
+
+        return safe_answer, updated_history, cloud_reason, pending_action
     finally:
         end_interactive_turn()
 

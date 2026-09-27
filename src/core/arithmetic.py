@@ -909,6 +909,42 @@ def _extract_follow_up_request(
     )
 
 
+def _extract_remaining_quantity_request(text: str) -> Optional[ArithmeticRequest]:
+    """Compute explicit remaining-amount questions; never guess from two numbers alone."""
+    value = str(text or "").strip()
+    if not re.search(r"\bhow much(?:\s+\w+){0,2}\s+(?:is\s+)?left\b", value, re.I):
+        return None
+
+    unit = r"(?:GiB|MiB|TiB|GB|MB|TB|bytes?|dollars?|AUD|USD|kg|grams?|litres?|liters?)"
+    patterns = (
+        # "A drive has 931 GiB free and I use 37 GiB. How much is left?"
+        rf"\b(?P<first>{NUMBER_PATTERN})\s*(?P<unit1>{unit})?\s*"
+        rf"(?:free|available|remaining)\b[^.!?]{{0,70}}?\b"
+        rf"(?:i|we)\s+(?:use|used|spend|spent|consume|consumed|take|took)\s+"
+        rf"(?P<second>{NUMBER_PATTERN})\s*(?P<unit2>{unit})?\b",
+        # "I had 50 dollars and spent 12 dollars. How much is left?"
+        rf"\b(?:i|we)\s+(?:have|had|started\s+with)\s+"
+        rf"(?P<first>{NUMBER_PATTERN})\s*(?P<unit1>{unit})?\s+"
+        rf"(?:and|then)\s+(?:(?:i|we)\s+)?"
+        rf"(?:use|used|spend|spent|consume|consumed)\s+"
+        rf"(?P<second>{NUMBER_PATTERN})\s*(?P<unit2>{unit})?\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, value, re.I)
+        if not match:
+            continue
+        first_unit = (match.group('unit1') or '').lower()
+        second_unit = (match.group('unit2') or '').lower()
+        if not first_unit or first_unit != second_unit:
+            # A missing or conflicting unit leaves the operation ambiguous.
+            continue
+        return _build_request('subtract', (
+            _parse_decimal(match.group('first')),
+            _parse_decimal(match.group('second')),
+        ))
+    return None
+
+
 def extract_arithmetic_request(
     raw: str,
     conversation_state=None,
@@ -929,6 +965,10 @@ def extract_arithmetic_request(
 
     if not text:
         return None
+
+    remaining = _extract_remaining_quantity_request(text)
+    if remaining is not None:
+        return remaining
 
     # --------------------------------------------------
     # Addition / sum / total

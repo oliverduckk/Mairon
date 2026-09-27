@@ -6,6 +6,7 @@ from core.turn_state import TurnState
 from core.conversational_research import (
     contextual_opinion_requires_public_grounding,
 )
+from core.epistemic_calibration import is_inaccessible_private_state_question
 
 
 @dataclass
@@ -93,6 +94,8 @@ SPECIFIC_LOOKUP_PATTERNS = [
 ]
 
 STABLE_EXPLANATION_PATTERNS = [
+    r"^\s*(?:can|could|would)\s+(?:you|u)\s+(?:please\s+)?"
+    r"(?:explain|describe|define|walk\s+me\s+through)\b",
     r"^\s*what (?:is|are)\b",
     r"^\s*what does\b",
     r"^\s*how (?:does|do)\b",
@@ -117,9 +120,16 @@ def _matches_any(text: str, patterns) -> bool:
 def classify_factual_authority(text: str) -> str:
     """Second-stage authority decision for generic factual questions."""
     value = str(text or "").strip()
+    value = re.sub(r"^\s*whts\b", "what's", value, flags=re.I)
+    value = re.sub(r"\bdiffrence\b", "difference", value, flags=re.I)
 
     if not value:
         return "public_source_verified"
+
+    # Public search cannot reveal an unobserved fact about the user. This
+    # narrow check must precede "today"/"right now" freshness patterns.
+    if is_inaccessible_private_state_question(value):
+        return "private_state_uncertain"
 
     if _matches_any(value, EXPLICIT_PUBLIC_VERIFICATION_PATTERNS):
         return "public_source_verified"
@@ -130,10 +140,29 @@ def classify_factual_authority(text: str) -> str:
     if _matches_any(value, CHANGING_PUBLIC_FACT_PATTERNS):
         return "public_source_verified"
 
+    if re.search(
+        r"\b(?:default|standard)\s+port\s+(?:for|of)\s+[a-z0-9+.-]+\s*[?.!]*$",
+        value,
+        flags=re.I,
+    ):
+        return "stable_model_knowledge"
+
     if _matches_any(value, SPECIFIC_LOOKUP_PATTERNS):
         return "public_source_verified"
 
-    if _matches_any(value, STABLE_EXPLANATION_PATTERNS):
+    # Discourse framing and trailing banter do not turn a timeless
+    # explanation into a public lookup. Keep this normalization local to
+    # the *stable explanation* check, after live/current/public signals.
+    explanatory_value = re.sub(
+        r"^\s*(?:random\s+tangent|side\s+note|quick\s+question|"
+        r"different\s+topic|new\s+topic)\s*[:,-]\s*",
+        "", value, flags=re.I,
+    )
+    explanatory_value = re.sub(
+        r"^\s*(?:bro|bruh|mate|dude)\s*[,!:-]?\s+",
+        "", explanatory_value, flags=re.I,
+    )
+    if _matches_any(explanatory_value, STABLE_EXPLANATION_PATTERNS):
         return "stable_model_knowledge"
 
     # Accuracy-first default: ambiguous external factual requests verify.
@@ -143,6 +172,8 @@ def classify_factual_authority(text: str) -> str:
 def factual_question_requires_live_data(text: str) -> bool:
     """Whether verification concerns changing/current public state."""
     value = str(text or "").strip()
+    if is_inaccessible_private_state_question(value):
+        return False
     return bool(
         _matches_any(value, FRESHNESS_PATTERNS)
         or _matches_any(value, CHANGING_PUBLIC_FACT_PATTERNS)
@@ -157,6 +188,18 @@ def route_epistemic_authority(
 
     This is intentionally deterministic for high-value/private workflows.
     """
+
+    if turn.intent == "reason_from_supplied_premises":
+        return EpistemicRoute(
+            authority="user_turn_reasoning",
+            mode="user_premise_reasoning",
+            verification_required=False,
+            allow_model_memory=(turn.entities.get("reasoning_kind") == "code_trace"),
+            live_data_required=False,
+            private_data_required=False,
+            reason=("Derive the answer from the supplied premises and stable "
+                    "language semantics, not unrelated public search results."),
+        )
 
     if turn.intent == "calculate_arithmetic":
         return EpistemicRoute(
@@ -312,9 +355,57 @@ def route_epistemic_authority(
         )
 
     if turn.intent == "factual_question":
+        # Phase 11.6.6B compatibility: the intent classifier has already
+        # established the provenance of a bounded USER-only task continuation.
+        # Reclassifying its surface wording as a new public-world question
+        # silently discards that decision and launches unrelated research.
+        # High-priority actions, explicit recommendations and undisclosed
+        # private state never receive the follow-up marker.
+        if turn.entities.get("_user_grounded_followup") == "true":
+            return EpistemicRoute(
+                authority="live_user_task",
+                mode="user_context_reasoning",
+                verification_required=False,
+                allow_model_memory=True,  # stable technical semantics only
+                live_data_required=False,
+                private_data_required=False,
+                reason=(
+                    "Continue the bounded task using Oliver's user-authored "
+                    "premises and stable reasoning, not a new public lookup."
+                ),
+            )
+
+        # Explicitly stated user facts remain private conversational evidence;
+        # an unreported private fact must STILL be treated as unknown.
+        if turn.entities.get("_private_user_evidence") == "true":
+            return EpistemicRoute(
+                authority="live_conversation",
+                mode="private_user_evidence",
+                verification_required=False,
+                allow_model_memory=False,
+                live_data_required=False,
+                private_data_required=True,
+                reason="The requested private fact was explicitly supplied in a recent user turn.",
+            )
+
         factual_mode = classify_factual_authority(
-            turn.raw_text
+            turn.entities.get("factual_query") or turn.raw_text
         )
+
+        if factual_mode == "private_state_uncertain":
+            return EpistemicRoute(
+                authority="live_conversation",
+                mode="private_state_uncertain",
+                verification_required=False,
+                allow_model_memory=False,
+                live_data_required=False,
+                private_data_required=True,
+                reason=(
+                    "Public search cannot establish the user's concealed or "
+                    "unreported private state. Use only user-authored context "
+                    "when present; otherwise acknowledge lack of access."
+                ),
+            )
 
         if factual_mode == "stable_model_knowledge":
             return EpistemicRoute(

@@ -1633,6 +1633,82 @@ def _unsupported_mairon_recordkeeping_claims(
     return []
 
 
+def _unsupported_personal_history_year_claims(
+    user_input: str,
+    draft: str,
+    conversation=None,
+) -> List[str]:
+    """Block invented exact years for Oliver's personal history in social turns.
+
+    Year evidence comes from actual USER messages, never old assistant prose
+    or generated Answer Contract metadata. Only high-confidence past/personal
+    constructions are caught; generic dates and clearly fantastic banter are
+    deliberately outside this conservative guard.
+    """
+    user_context = (
+        str(user_input or "") + "\n"
+        + str(build_recent_user_grounding_context(conversation) or "")
+    )
+    supplied_years = set(re.findall(r"\b(?:19|20)\d{2}\b", user_context))
+    draft_text = str(draft or "").replace("’", "'")
+    unsupported = []
+    year_pattern = re.compile(
+        r"\b(?:since|back\s+in|from)\s+((?:19|20)\d{2})\b", re.I
+    )
+    personal_pattern = re.compile(
+        r"\b(?:you|your|yours|you've|you'd|you're|oliver)\b", re.I
+    )
+    for match in year_pattern.finditer(draft_text):
+        year = match.group(1)
+        if year in supplied_years:
+            continue
+        # This exact personal-history assertion must refer to Oliver or
+        # something he possesses, not an incidental historical example.
+        nearby = draft_text[max(0, match.start() - 100):match.end()]
+        if not personal_pattern.search(nearby):
+            continue
+        unsupported.append(
+            "unsupported exact-year claim about Oliver's personal history: " + year
+        )
+    return list(dict.fromkeys(unsupported))
+
+
+def _unsupported_new_scene_piles(
+    user_input: str,
+    draft: str,
+    conversation=None,
+) -> List[str]:
+    """Catch concrete clutter that a social joke invents out of thin air.
+
+    Only a narrow, physically plausible construction is blocked. Metaphors
+    about digital debris, rebellion or a desk having an ego remain available.
+    This check reads USER statements only; previous Mairon jokes are not proof
+    that papers, clothes, dishes, parcels, etc. are in Oliver's surroundings.
+    """
+    source = (
+        str(user_input or "") + "\n"
+        + str(build_recent_user_grounding_context(conversation) or "")
+    ).lower()
+    result = []
+    pattern = re.compile(
+        r"\b(?:next|another|new|inevitable)\b[^.!?]{0,40}?"
+        r"\b(?:pile|stack)\s+of\s+"
+        r"(?P<object>papers?|clothes?|dishes?|receipts?|bills?|"
+        r"boxes?|parcels?|cans?|cups?|laundry)\b",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(str(draft or "")):
+        noun = match.group("object").lower()
+        canonical = noun[:-1] if noun.endswith("s") and noun != "dishes" else noun
+        variants = {noun, canonical, canonical + "s"}
+        if noun == "dishes":
+            variants.add("dish")
+        if any(re.search(r"\b" + re.escape(word) + r"\b", source) for word in variants):
+            continue
+        result.append("introduced an unsupported physical pile/stack of " + noun)
+    return list(dict.fromkeys(result))
+
+
 def find_deterministic_grounding_violations(
     user_input: str,
     draft: str,
@@ -1658,6 +1734,20 @@ def find_deterministic_grounding_violations(
     )
 
     violations = []
+
+    if contract_intent(core_answer_contract) in {
+        "share_context", "casual_conversation", "acknowledge",
+    }:
+        violations.extend(
+            "unsupported Core-grounded claim: " + item
+            for item in _unsupported_personal_history_year_claims(
+                user_input, draft, conversation
+            )
+        )
+        violations.extend(
+            "unsupported Core-grounded claim: " + item
+            for item in _unsupported_new_scene_piles(user_input, draft, conversation)
+        )
 
     # Phase 6.8.9: deterministic structural source locks run before the
     # broad semantic verifier. These preserve entity ownership and

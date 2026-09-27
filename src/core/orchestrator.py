@@ -15,6 +15,9 @@ from core.epistemic_router import (
 from core.intent_router import (
     classify_turn,
 )
+from core.epistemic_calibration import classify_private_user_question
+from core.task_budget import resolve_time_budget
+from core.user_statement_recall import extract_latest_stated_colour
 from core.turn_state import (
     TurnState,
 )
@@ -319,6 +322,121 @@ class MaironCore:
 
         workflow_result = None
         direct_response = None
+
+        # Phase 11.6.6B2: a clear user-supplied time budget is arithmetic,
+        # not an invitation to let the conversational model improvise figures.
+        # Parsing is deliberately conservative: ambiguous tasks fall through.
+        # Calendar/external actions and other specialized intents are untouched.
+        if turn.intent in {
+            "casual_conversation", "factual_question", "self_correction",
+            "reason_from_supplied_premises", "calculate_arithmetic",
+        }:
+            budget = resolve_time_budget(
+                user_input,
+                getattr(self.conversation_state, "recent_user_turns", []),
+            )
+            if budget is not None:
+                turn.intent = "reason_from_supplied_premises"
+                turn.speech_act = "question"
+                turn.factuality = "user_premise_reasoning"
+                turn.should_use_tools = False
+                turn.should_answer_directly = True
+                turn.should_recommend = False
+                turn.add_reason(
+                    "Core deterministically resolved a complete, user-supplied time budget"
+                )
+                route = route_epistemic_authority(turn)
+                contract = build_answer_contract(turn=turn, route=route)
+                self.conversation_state.update_from_turn(turn)
+                return CoreDecision(
+                    turn=turn, epistemic_route=route,
+                    answer_contract=contract, direct_response=budget.answer,
+                )
+
+        # Only an explicit, uniquely extractable latest USER statement can be
+        # returned directly. Everything else keeps the grounded recall lane.
+        if turn.intent == "conversation_recall":
+            extracted = extract_latest_stated_colour(
+                user_input,
+                getattr(self.conversation_state, "recent_user_turns", []),
+            )
+            if extracted:
+                contract = build_answer_contract(turn=turn, route=route)
+                self.conversation_state.update_from_turn(turn)
+                return CoreDecision(
+                    turn=turn, epistemic_route=route,
+                    answer_contract=contract, direct_response=extracted,
+                )
+
+        # An unaided text assistant must not send private physical observations
+        # to public search, or ask its language model to guess. A future camera
+        # integration can replace this branch only when actual sensor evidence
+        # is explicitly present in the application/Core contract.
+        if route.mode in {"private_state_uncertain", "unobserved_private_state"}:
+            # Support both the current route and the legacy name. The helper
+            # returns a KIND, not a boolean; each category needs its own
+            # truthful response rather than the previous shirt-only fallback.
+            private_kind = classify_private_user_question(user_input)
+            if private_kind == "concealed_object":
+                direct_response = (
+                    "I can't observe a concealed object through this text chat, "
+                    "so I don't know the answer without you showing or telling me."
+                )
+            elif private_kind == "current_appearance":
+                direct_response = (
+                    "I can't see what you're wearing through this text chat, "
+                    "so I don't know its colour or appearance."
+                )
+            elif private_kind == "undisclosed_meal":
+                direct_response = (
+                    "I don't know what you ate unless you've told me in "
+                    "our conversation. I won't guess."
+                )
+            elif private_kind == "private_thought":
+                direct_response = (
+                    "I can't observe what you're thinking, so I don't know "
+                    "without you telling me."
+                )
+            else:
+                # Conservative boundary for a new category not yet given
+                # a domain-specific response. Never fabricate a personal fact.
+                direct_response = (
+                    "I don't have enough information to know that private fact."
+                )
+
+            contract = build_answer_contract(turn=turn, route=route)
+            self.conversation_state.update_from_turn(turn)
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
+                workflow_result=None,
+                direct_response=direct_response,
+            )
+
+        # --------------------------------------------------
+        # Reasoning grounded solely in the user's supplied premises
+        # --------------------------------------------------
+        if turn.intent == "reason_from_supplied_premises":
+            contract = build_answer_contract(turn=turn, route=route)
+            contract.allow_recommendations = False
+            contract.allow_follow_up_question = False
+            contract.allow_new_factual_claims = bool(
+                turn.entities.get("reasoning_kind") == "code_trace"
+            )
+            contract.forbidden_behaviours.extend([
+                "Solve from the specific premises Oliver supplied, not public web research.",
+                "Do not introduce unrelated world facts or invent missing numerical inputs.",
+                "If an essential premise is missing, state that instead of guessing.",
+            ])
+            direct_response = turn.entities.get("reasoning_direct_answer")
+            self.conversation_state.update_from_turn(turn)
+            return CoreDecision(
+                turn=turn,
+                epistemic_route=route,
+                answer_contract=contract,
+                direct_response=direct_response,
+            )
 
         # --------------------------------------------------
         # Deterministic arithmetic authority

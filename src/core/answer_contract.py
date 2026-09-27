@@ -209,6 +209,10 @@ def build_answer_contract(
                 # must permit the model to state factual content; otherwise the
                 # Answer Contract contradicts the epistemic route.
                 "stable_model_knowledge",
+                # Phase 11.6.6B: a bounded task continuation may need stable
+                # technical semantics to explain the USER's supplied problem.
+                # Personal premises still require user provenance, below.
+                "user_context_reasoning",
             }
         ),
         allow_follow_up_question=(
@@ -279,6 +283,15 @@ def build_answer_contract(
 
     if turn.intent == "factual_question":
         contract.allow_recommendations = False
+        if route.mode == "user_context_reasoning":
+            contract.forbidden_behaviours.extend([
+                "Use only the user's supplied premises, not prior assistant guesses, "
+                "as evidence about this particular task.",
+                "Stable technical knowledge may explain the given premises, but "
+                "do not invent new user measurements, constraints, decisions, or observations.",
+                "Do not start public research to solve a hypothetical or a question "
+                "about the task already described by Oliver.",
+            ])
         contract.forbidden_behaviours.extend([
             "Answer the current factual question before doing anything conversational.",
             "Do not append callbacks to unrelated prior topics after the factual answer.",

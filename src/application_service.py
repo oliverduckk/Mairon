@@ -12,6 +12,12 @@ from ai.provider import create_provider
 from core.action_manager import (
     describe_action,
 )
+from core.critical_response_safety import (
+    deterministic_critical_response,
+    replace_visible_answer_in_history,
+    sanitise_visible_response,
+)
+
 from core.conversation_state import (
     ConversationState,
     append_visible_turn_to_model_history,
@@ -872,6 +878,32 @@ class MaironApplication:
                 channel=channel_value,
             )
 
+        # P0: Do not fetch the web or ask the model to decide whether to
+        # ignore an explicit spoiler boundary, suggest destructive recovery
+        # commands, or triage unambiguous emergency warning signs. This
+        # checks only clear safety patterns; all other questions keep Core's
+        # ordinary intelligence pipeline.
+        critical_response = deterministic_critical_response(
+            text,
+            getattr(
+                getattr(self.core, "conversation_state", None),
+                "recent_user_turns",
+                (),
+            ),
+        )
+        if critical_response is not None:
+            self._emit_event("[Safety] Critical direct response.")
+            return self._finalize_direct_response(
+                user_text=text,
+                answer=critical_response,
+                timer=ResponseTimer(),
+                channel=channel_value,
+                intent="critical_safety_response",
+                authority="user_turn_safety",
+                route_mode="deterministic_critical_safety",
+                workflow="critical_safety",
+            )
+
         if self._pending is not None:
             return ApplicationTurn(
                 status="pending_approval_exists",
@@ -1583,6 +1615,7 @@ class MaironApplication:
                 )
             ),
             agent_action=pending.agent_action,
+            action_confirmed=bool(pending.kind == "action" and approved),
         )
 
     # --------------------------------------------------
@@ -1647,6 +1680,7 @@ class MaironApplication:
         workflow: Optional[str] = None,
         model_used: Optional[str] = None,
         agent_action: Optional[str] = None,
+        action_confirmed: bool = False,
     ) -> ApplicationTurn:
         answer = str(
             getattr(
@@ -1677,6 +1711,7 @@ class MaironApplication:
                 or self.local_model_name
             ),
             agent_action=agent_action,
+            action_confirmed=action_confirmed,
         )
 
     def _finalize_error(
@@ -1833,7 +1868,24 @@ class MaironApplication:
         workflow: Optional[str] = None,
         model_used: Optional[str] = None,
         agent_action: Optional[str] = None,
+        action_confirmed: bool = False,
     ) -> ApplicationTurn:
+        safe_answer, violation = sanitise_visible_response(
+            user_text,
+            answer,
+            action_confirmed=action_confirmed,
+        )
+        if violation:
+            self._emit_event("[Safety] Rejected unsafe final answer: " + violation)
+            self.local_state = replace_visible_answer_in_history(
+                self.local_state, str(answer), safe_answer,
+            )
+            if self.cloud_state is not None:
+                self.cloud_state = replace_visible_answer_in_history(
+                    self.cloud_state, str(answer), safe_answer,
+                )
+            answer = safe_answer
+
         response_seconds = (
             timer.stop()
         )

@@ -5,9 +5,13 @@ from core.turn_state import TurnState
 from core.seriousness import (
     assess_consequential_advice,
 )
+from core.critical_response_safety import explicit_calendar_write_request
+from core.followup_task import bounded_recent_user_turns, classify_user_grounded_followup
+from core.epistemic_calibration import is_inaccessible_private_state_question
 from core.arithmetic import (
     extract_arithmetic_request,
 )
+from core.supplied_reasoning import classify_supplied_reasoning
 from core.email_intent import is_inbox_attention_request
 from core.desktop_catalog import (
     extract_desktop_action_request,
@@ -38,6 +42,10 @@ THANKS_PATTERNS = [
 ]
 
 QUESTION_PATTERNS = [
+    # Common conversational prefaces do not turn a genuine explanation
+    # question into a social statement just because it ends with "lol".
+    r"^\s*(?:random\s+tangent|quick\s+question|quick\s+one|side\s+note)"
+    r"\s*[:,-]\s*(?:why|how|what|when|where|can|does|do|is|are|will|would|should)\b",
     r"\?$",
     r"^\s*(?:what|why|who|where|when|how|does|do|did|is|are|can|could|would|should|has|have|will)\b",
 
@@ -46,6 +54,16 @@ QUESTION_PATTERNS = [
     # to casual conversation and never reach the epistemic router.
     r"^\s*(?:explain|describe|define|compare)\b",
     r"^\s*walk\s+me\s+through\b",
+]
+
+CALENDAR_EVENT_ACTION_PATTERNS = [
+    r"^\s*(?:please\s+)?(?:put|add|create|schedule|book)\b"
+    r"[^.!?]{0,160}\b(?:on|to|in)\s+(?:my|our|the)\s+calendar\b",
+    r"^\s*(?:can|could|would)\s+you\s+(?:please\s+)?"
+    r"(?:put|add|create|schedule|book)\b"
+    r"[^.!?]{0,160}\b(?:on|to|in)\s+(?:my|our|the)\s+calendar\b",
+    r"^\s*(?:please\s+)?(?:create|add|schedule)\s+"
+    r"(?:me\s+)?(?:an?\s+)?(?:new\s+)?calendar\s+event\b",
 ]
 
 ACTION_PATTERNS = [
@@ -451,12 +469,18 @@ ASSISTANT_SOCIAL_STATE_PATTERNS = [
 ]
 
 CONVERSATION_RECALL_PATTERNS = [
+    r"\bwhat\b.{0,95}?\bdid\s+i\s+(?:actually\s+)?(?:say|tell\s+you|mention)\b",
+    r"\bwhat\s+(?:was|is)\s+it\s+i\s+(?:actually\s+)?(?:said|told\s+you)\b",
     r"\bwhat did i say\b",
     r"\bwhat did i tell you\b",
     r"\bwhat was it i said\b",
     r"\bremind me what i said\b",
     r"\bwhat did you say\b",
     r"\bwhat did you tell me\b",
+    r"\b(?:where|when|what)\s+did\s+i\s+(?:just\s+)?(?:say|mention|tell\s+you)\b",
+    r"\bwhat\s+(?:was|is)\s+(?:the|that|my)\s+"
+    r"(?:[a-z0-9'-]+\s+){0,6}?(?:i\s+(?:just\s+)?"
+    r"(?:gave\s+you|told\s+you|mentioned|said))\b",
 ]
 
 SELF_CORRECTION_PATTERNS = [
@@ -1062,6 +1086,32 @@ def _apply_pairwise_opinion_turn(
     return state
 
 
+def reconstruct_bounded_factual_followup(
+    user_input: str,
+    previous_user_text: str | None,
+) -> Optional[str]:
+    """Expand an explicit protocol-port follow-up only from a prior USER question.
+
+    A prior assistant statement is not an authority source. We inherit just the
+    question shape, never its answer. Other ambiguous follow-ups return None.
+    """
+    current = _strip_discourse_prefixes(_normalise(user_input))
+    previous = _strip_discourse_prefixes(_normalise(previous_user_text))
+    match = re.fullmatch(
+        r"(?:and\s+|what\s+about\s+|how\s+about\s+)"
+        r"(?P<service>[a-z][a-z0-9+.-]{1,30})\s*[?.!]*",
+        current,
+    )
+    if not match:
+        return None
+    if (
+        re.search(r"\b(?:default|standard)\s+port\s+(?:for|of)\s+[a-z0-9+.-]+", previous)
+        or re.search(r"\bwhat\s+port\s+does\s+[a-z0-9+.-]+\s+(?:normally|usually)\s+use", previous)
+    ):
+        return f"What is the default port for {match.group('service').upper()}?"
+    return None
+
+
 def classify_turn(user_input: str, conversation_state=None) -> TurnState:
     raw = str(user_input or "").strip()
 
@@ -1070,6 +1120,11 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
             raw
         )
     )
+
+    # Correct only obvious question-word spelling; leave the original words
+    # untouched for model generation and any retrieved evidence.
+    text = re.sub(r"^whts\b", "what's", text)
+    text = re.sub(r"\bdiffrence\b", "difference", text)
 
     state = TurnState(raw_text=raw)
 
@@ -2165,6 +2220,22 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         )
         return state
 
+    if _matches_any(text, CALENDAR_EVENT_ACTION_PATTERNS) or explicit_calendar_write_request(text):
+        state.speech_act = "request_action"
+        state.intent = "calendar_event_creation_request"
+        state.requested_action = "request_calendar_event_creation"
+        state.requires_private_data = True
+        state.requires_live_data = True
+        state.preferred_authority = "calendar"
+        state.factuality = "action_result"
+        state.should_use_tools = True
+        state.should_answer_directly = False
+        state.should_recommend = False
+        state.should_continue_conversation = False
+        state.confidence = 0.99
+        state.add_reason("explicit calendar-write request requires approval")
+        return state
+
     if _matches_any(
         text,
         CONVERSATION_RECALL_PATTERNS,
@@ -2250,6 +2321,41 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
                 "calculation outranks conversation-model interpretation"
             )
 
+        return state
+
+    # Genuine user-grounded questions (including a correction followed by a
+    # question) should not be reduced to a correction ACK or public web search.
+    # Only the user's own bounded recent turns can establish this dependency.
+    recent_user = bounded_recent_user_turns(conversation_state)
+    # An explicit recommendation is still a recommendation even when it
+    # mentions a topic from the preceding user turn. Ordinary recommendation
+    # routing and ConversationState can retain relevant context separately.
+    grounded_history = (
+        None
+        if (
+            is_inaccessible_private_state_question(raw)
+            or _matches_any(text, RECOMMENDATION_REQUEST_PATTERNS)
+        )
+        else classify_user_grounded_followup(raw, recent_user)
+    )
+    if grounded_history is not None:
+        state.speech_act = "question"
+        state.intent = "factual_question"
+        state.factuality = "user_premise_continuation"
+        state.should_use_tools = False
+        state.should_answer_directly = True
+        state.should_continue_conversation = True
+        state.is_follow_up = True
+        state.confidence = 0.94
+        state.entities["_user_grounded_followup"] = "true"
+        state.entities["_conversation_context_user_text"] = grounded_history[-1]["text"]
+        state.entities["_conversation_context_intent"] = grounded_history[-1]["intent"]
+        state.entities["_user_task_history"] = "\n".join(
+            f"- {i}. {item['text']}" for i, item in enumerate(grounded_history, 1)
+        )
+        state.add_reason(
+            "current question continues a bounded USER-authored task; no new public evidence needed"
+        )
         return state
 
     if _matches_any(
@@ -2395,6 +2501,23 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
 
         return state
 
+    supplied_reasoning = classify_supplied_reasoning(raw)
+    if supplied_reasoning is not None:
+        state.speech_act = "question"
+        state.intent = "reason_from_supplied_premises"
+        state.factuality = "user_premise_reasoning"
+        state.preferred_authority = "user_turn_reasoning"
+        state.should_use_tools = False
+        state.should_recommend = False
+        state.should_answer_directly = False
+        state.should_continue_conversation = False
+        state.entities["reasoning_kind"] = supplied_reasoning.kind
+        if supplied_reasoning.direct_answer is not None:
+            state.entities["reasoning_direct_answer"] = supplied_reasoning.direct_answer
+        state.confidence = 0.96
+        state.add_reason("explicit self-contained premise reasoning without public lookup")
+        return state
+
     if _matches_any(text, THANKS_PATTERNS):
         state.speech_act = "thanks"
         state.intent = "acknowledge"
@@ -2528,9 +2651,64 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         return state
 
     if _matches_any(text, QUESTION_PATTERNS):
+        previous_user = None
+        latest_user = getattr(conversation_state, "latest_user_turn", None)
+        if callable(latest_user):
+            prior = latest_user()
+            if isinstance(prior, dict):
+                previous_user = prior.get("text")
+        resolved = reconstruct_bounded_factual_followup(raw, previous_user)
+        if resolved:
+            state.is_follow_up = True
+            state.entities["factual_query"] = resolved
+            state.resolved_referents["factual_query"] = resolved
+            state.subject = resolved
+            state.add_reason("bounded factual follow-up reconstructed from prior user question")
         state.speech_act = "question"
         state.intent = "factual_question"
         state.factuality = "requires_epistemic_routing"
+        # Keep the epistemic difference between an unobserved private fact
+        # and a fact Oliver explicitly supplied in the recent conversation.
+        # Only recognise a direct first-person meal report here; a mention of
+        # breakfast or a prior assistant guess is not enough to grant authority.
+        if is_inaccessible_private_state_question(raw):
+            meal_question = re.search(
+                r"\bwhat\s+(?:did|have)\s+i\s+(?:eat|have|drink)\s+(?:for\s+)?"
+                r"(?P<meal>breakfast|lunch|dinner)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if meal_question:
+                meal = meal_question.group("meal")
+                for entry in reversed(bounded_recent_user_turns(conversation_state)):
+                    prior = str(entry.get("text") or "")
+                    # A meal reported for yesterday cannot answer a question
+                    # about today's meal (and vice versa). Require the user
+                    # to supply matching temporal provenance explicitly when
+                    # the question names a relative day.
+                    requested_day = (
+                        "yesterday" if re.search(r"\byesterday\b", text)
+                        else "today" if re.search(r"\b(?:today|this morning)\b", text)
+                        else None
+                    )
+                    matching_day = (
+                        requested_day is None
+                        or bool(re.search(
+                            rf"\b{requested_day}\b|"
+                            + (r"\bthis morning\b" if requested_day == "today" else r"(?!)"),
+                            prior, flags=re.IGNORECASE,
+                        ))
+                    )
+                    if matching_day and re.search(
+                        rf"\bi\s+(?:had|ate|drank)\b.{{1,110}}\b(?:for\s+)?{meal}\b",
+                        prior,
+                        flags=re.IGNORECASE,
+                    ):
+                        state.entities["_private_user_evidence"] = "true"
+                        state.entities["_conversation_context_user_text"] = prior
+                        state.entities["_conversation_context_intent"] = str(entry.get("intent") or "")
+                        state.add_reason("prior USER explicitly supplied the requested private meal")
+                        break
         state.should_continue_conversation = True
         state.confidence = 0.72
         state.add_reason("generic question requiring later epistemic routing")

@@ -13,6 +13,7 @@ from core.debate_state import (
 )
 
 from core.turn_state import TurnState
+from core.followup_task import build_bounded_task_instruction
 
 
 PRONOUN_PATTERN = re.compile(
@@ -288,6 +289,10 @@ def build_live_user_continuity_instruction(
             "PREVIOUS TURN INTENT:",
             previous_intent,
         ])
+
+    bounded_task = build_bounded_task_instruction(turn)
+    if bounded_task:
+        lines.extend(["", bounded_task])
 
     if referent_lines:
         lines.extend([
