@@ -52,6 +52,25 @@ EXPLICIT_PUBLIC_VERIFICATION_PATTERNS = [
     r"\bsource(?:s)?\b",
     r"\bcitation(?:s)?\b",
     r"\bofficial source\b",
+    r"\bofficial link\b",
+    r"\bsource url\b",
+    r"\bactual source\b",
+    r"\bwhich\s+(?:official\s+)?link\b",
+    r"\bdid\s+you\s+(?:actually\s+)?(?:load|open|read|browse)\b",
+]
+
+
+NO_EXTERNAL_VERIFICATION_PATTERNS = [
+    r"\bwithout\s+(?:looking|checking|searching)\s+(?:it\s+)?up\b",
+    r"\b(?:don['’]?t|do\s+not|dont|never)\s+(?:browse|search(?:\s+the\s+(?:web|internet))?|look\s+(?:it\s+)?up|check\s+online)\b",
+    r"\bno\s+(?:web|internet)\s+(?:search|lookup|browsing)\b",
+]
+
+EXPLICIT_MISSING_CONTEXT_PATTERNS = [
+    r"\bi\s+(?:haven['’]?t|have\s+not|havent)\s+(?:told|given|provided|sent|attached|uploaded|said)\b",
+    r"\bi\s+(?:didn['’]?t|did\s+not|didnt)\s+(?:attach|upload|provide|send|tell)\b",
+    r"\bi\s+(?:genuinely\s+)?forgot\s+to\s+(?:attach|upload|provide|send)\b",
+    r"\byou\s+(?:don['’]?t|do\s+not|dont)\s+(?:know|have)\b.{0,80}\b(?:yet|dimensions?|size|model|airline|rubric|question|answer)\b",
 ]
 
 CHANGING_PUBLIC_FACT_PATTERNS = [
@@ -130,6 +149,30 @@ def classify_factual_authority(text: str) -> str:
     # narrow check must precede "today"/"right now" freshness patterns.
     if is_inaccessible_private_state_question(value):
         return "private_state_uncertain"
+
+    # If Oliver explicitly identifies information he has not supplied, public
+    # search cannot safely fill that private/task-specific gap by guessing.
+    if _matches_any(value, EXPLICIT_MISSING_CONTEXT_PATTERNS):
+        return "insufficient_user_context"
+
+    # Respect an explicit no-browse constraint. Durable general explanations
+    # may still use stable model knowledge, but current/exact public facts must
+    # be acknowledged as unverified rather than guessed from memory.
+    no_external_verification = _matches_any(value, NO_EXTERNAL_VERIFICATION_PATTERNS)
+    if no_external_verification:
+        stripped = value
+        for pattern in NO_EXTERNAL_VERIFICATION_PATTERNS:
+            stripped = re.sub(pattern, " ", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"^\s*[,;:—–-]+\s*", "", stripped)
+        if (
+            _matches_any(value, FRESHNESS_PATTERNS)
+            or _matches_any(value, CHANGING_PUBLIC_FACT_PATTERNS)
+            or _matches_any(value, SPECIFIC_LOOKUP_PATTERNS)
+        ):
+            return "verification_declined"
+        if _matches_any(stripped, STABLE_EXPLANATION_PATTERNS):
+            return "stable_model_knowledge"
+        return "verification_declined"
 
     if _matches_any(value, EXPLICIT_PUBLIC_VERIFICATION_PATTERNS):
         return "public_source_verified"
@@ -391,6 +434,34 @@ def route_epistemic_authority(
         factual_mode = classify_factual_authority(
             turn.entities.get("factual_query") or turn.raw_text
         )
+
+        if factual_mode == "insufficient_user_context":
+            return EpistemicRoute(
+                authority="user_constraint",
+                mode="insufficient_user_context",
+                verification_required=False,
+                allow_model_memory=False,
+                live_data_required=False,
+                private_data_required=False,
+                reason=(
+                    "The user explicitly identified missing task-specific input; "
+                    "do not browse or guess the omitted details."
+                ),
+            )
+
+        if factual_mode == "verification_declined":
+            return EpistemicRoute(
+                authority="user_constraint",
+                mode="verification_declined",
+                verification_required=False,
+                allow_model_memory=False,
+                live_data_required=False,
+                private_data_required=False,
+                reason=(
+                    "The requested exact/current public fact would require external "
+                    "verification, but Oliver explicitly prohibited browsing."
+                ),
+            )
 
         if factual_mode == "private_state_uncertain":
             return EpistemicRoute(

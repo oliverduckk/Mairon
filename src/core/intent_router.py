@@ -46,8 +46,12 @@ QUESTION_PATTERNS = [
     # question into a social statement just because it ends with "lol".
     r"^\s*(?:random\s+tangent|quick\s+question|quick\s+one|side\s+note)"
     r"\s*[:,-]\s*(?:why|how|what|when|where|can|does|do|is|are|will|would|should)\b",
-    r"\?$",
+    # A real question can be followed by a qualification after the question mark.
+    # Example: "am I allowed? I haven't told you the airline". Requiring the
+    # question mark to be the final character misroutes these as social chat.
+    r"\?",
     r"^\s*(?:what|why|who|where|when|how|does|do|did|is|are|can|could|would|should|has|have|will)\b",
+    r"\b(?:but|and|so)\s+(?:can|could|would)\s+(?:you|u)\b",
 
     # Imperative information requests are still questions semantically.
     # Without these, prompts such as "Explain how DNS works." fall through
@@ -522,6 +526,14 @@ BANTER_PATTERNS = [
 ]
 
 RECOMMENDATION_REQUEST_PATTERNS = [
+    r"\bone\s+(?:(?:actual|really)\s+)?(?:useful|practical|concrete|specific)\s+(?:next\s+)?step\b",
+
+    # A user may reject generic advice and then ask for one focused recommendation
+    # in the same turn ("I don't want a speech. Give me one concrete skill...").
+    # Recognise the request clause even when it is not the first clause.
+    r"\bgive\s+me\s+(?:one|a|an|some)\s+(?:(?:concrete|practical|specific|single)\s+)?"
+    r"(?:skill|step|action|option|suggestion|recommendation|thing)\b",
+
     r"\bwhat should i buy\b",
     r"\bwhat do you recommend\b",
     r"\brecommend\b",

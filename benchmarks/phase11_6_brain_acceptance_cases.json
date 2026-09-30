@@ -1,0 +1,803 @@
+{
+  "suite": "Mairon Phase 11.6.1 Brain Intelligence Acceptance",
+  "version": 1,
+  "description": "Live local-model capstone benchmark. This is intentionally separate from the deterministic regression suite because model wording can vary between runs.",
+  "scenarios": [
+    {
+      "id": "social_grounded_arrival",
+      "category": "grounding",
+      "title": "Grounded reaction to a simple personal update",
+      "turns": [
+        {
+          "user": "My replacement keyboard finally arrived.",
+          "critical": false,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "share_context",
+              "casual_conversation"
+            ],
+            "max_chars": 360,
+            "forbid_question": true,
+            "forbidden": [
+              "let me know if",
+              "want me to",
+              "would you like me to",
+              "i can see",
+              "i saw",
+              "i heard"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "social_no_travel_invention",
+      "category": "grounding",
+      "title": "Travel update without world-detail invention",
+      "turns": [
+        {
+          "user": "My new camera strap arrived for my Chile trip in February.",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "share_context",
+              "casual_conversation"
+            ],
+            "max_chars": 420,
+            "forbid_question": true,
+            "forbidden": [
+              "patagonia",
+              "andes",
+              "altitude",
+              "hiking",
+              "trekking",
+              "cold weather",
+              "hot weather",
+              "rainy",
+              "dry season",
+              "santiago traffic"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "social_banter",
+      "category": "naturalness",
+      "title": "Natural banter without service-assistant tail",
+      "turns": [
+        {
+          "user": "bruh I just spent 20 minutes looking for my glasses and they were on my head",
+          "critical": false,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "share_context",
+              "casual_conversation"
+            ],
+            "max_chars": 420,
+            "forbid_question": true,
+            "forbidden": [
+              "how can i help",
+              "let me know if",
+              "want me to",
+              "would you like me to"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "no_fake_perception",
+      "category": "grounding",
+      "title": "No invented visual perception",
+      "turns": [
+        {
+          "user": "I just cleaned my desk.",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "share_context",
+              "casual_conversation"
+            ],
+            "forbidden": [
+              "i can see",
+              "i see your",
+              "i saw",
+              "i've seen",
+              "i have seen",
+              "i noticed your",
+              "looks spotless",
+              "looks clean"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "no_scene_props",
+      "category": "grounding",
+      "title": "No plausible scene-detail decoration",
+      "turns": [
+        {
+          "user": "I'm at my desk working.",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "share_context",
+              "casual_conversation"
+            ],
+            "max_chars": 420,
+            "forbidden": [
+              "coffee",
+              "energy drink",
+              "monster",
+              "snack",
+              "headphones",
+              "music playing",
+              "messy desk",
+              "clutter"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "self_correction_and_recall",
+      "category": "continuity",
+      "title": "Later user correction supersedes earlier user detail",
+      "turns": [
+        {
+          "user": "The USB adapter is in the top drawer.",
+          "critical": false,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "share_context",
+              "casual_conversation"
+            ]
+          }
+        },
+        {
+          "user": "Scratch that, I moved it to the bottom drawer.",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "self_correction",
+              "share_context"
+            ],
+            "required_any": [
+              "bottom drawer",
+              "bottom"
+            ]
+          }
+        },
+        {
+          "user": "Where did I say the USB adapter is now?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "conversation_recall"
+            ],
+            "required_any": [
+              "bottom drawer",
+              "bottom"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "live_codeword_recall",
+      "category": "continuity",
+      "title": "Recall a user detail across an intervening turn",
+      "turns": [
+        {
+          "user": "The code word for this test is marzipan.",
+          "critical": false,
+          "expect": {
+            "status": [
+              "answered"
+            ]
+          }
+        },
+        {
+          "user": "Anyway, my monitor is behaving itself today.",
+          "critical": false,
+          "expect": {
+            "status": [
+              "answered"
+            ]
+          }
+        },
+        {
+          "user": "What was the code word I just gave you?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "conversation_recall"
+            ],
+            "required_all": [
+              "marzipan"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "assistant_claim_not_evidence",
+      "category": "grounding",
+      "title": "A prior assistant fabrication must not overwrite user evidence",
+      "turns": [
+        {
+          "user": "The spare house key is in the blue mug in the cupboard.",
+          "critical": false,
+          "expect": {
+            "status": [
+              "answered"
+            ]
+          },
+          "post_inject_assistant": "Actually, you said the spare house key was under the doormat."
+        },
+        {
+          "user": "What did I say about where the spare house key is?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "conversation_recall",
+              "factual_question"
+            ],
+            "required_all": [
+              "blue mug"
+            ],
+            "forbidden": [
+              "under the doormat"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "factual_followup",
+      "category": "continuity",
+      "title": "Short factual follow-up keeps the active subject",
+      "turns": [
+        {
+          "user": "What's the default port for SSH?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "factual_question"
+            ],
+            "required_regex": [
+              "\\b22\\b"
+            ]
+          }
+        },
+        {
+          "user": "and HTTPS?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "factual_question"
+            ],
+            "required_regex": [
+              "\\b443\\b"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "topic_switch_no_callback",
+      "category": "relevance",
+      "title": "Factual question must not drag unrelated banter forward",
+      "turns": [
+        {
+          "user": "My mechanical keyboard finally arrived.",
+          "critical": false,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "forbidden_regex": [
+              "\\bsince\\s+(?:19|20)\\d{2}\\b"
+            ]
+          }
+        },
+        {
+          "user": "What port does DNS normally use?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "factual_question"
+            ],
+            "required_regex": [
+              "\\b53\\b"
+            ],
+            "forbidden": [
+              "keyboard",
+              "mechanical",
+              "keycaps"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "stable_fact_capital",
+      "category": "factual",
+      "title": "Stable factual knowledge",
+      "turns": [
+        {
+          "user": "What's the capital of Mongolia?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "factual_question"
+            ],
+            "required_any": [
+              "ulaanbaatar",
+              "ulan bator"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "stable_fact_ipv6",
+      "category": "factual",
+      "title": "Technical factual knowledge",
+      "turns": [
+        {
+          "user": "How many bits are in an IPv6 address?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "factual_question"
+            ],
+            "required_regex": [
+              "\\b128\\b"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "arithmetic_storage",
+      "category": "reasoning",
+      "title": "Simple arithmetic embedded in natural language",
+      "turns": [
+        {
+          "user": "A drive has 931 GiB free and I use 37 GiB. How much is left?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "required_regex": [
+              "\\b894\\b"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "syllogism",
+      "category": "reasoning",
+      "title": "Abstract deductive reasoning",
+      "turns": [
+        {
+          "user": "Every Neral is a Vesk, and no Vesk is blue. Can any Neral be blue?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "required_regex": [
+              "\\bno\\s+neral\\b|^\\s*no\\b|\\bneral\\s+(?:cannot|can\\x27t)\\b"
+            ],
+            "forbidden": [
+              "couldn't verify",
+              "could not verify",
+              "public sources",
+              "can't verify",
+              "cannot verify",
+              "not enough evidence"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "schedule_reasoning",
+      "category": "reasoning",
+      "title": "Time constraint reasoning",
+      "turns": [
+        {
+          "user": "I need to be at an appointment at 2pm. The drive takes 45 minutes and I want to arrive 15 minutes early. If I leave at 1:20pm, am I good?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "required_any": [
+              "1:00",
+              "1 pm",
+              "1:00pm",
+              "1:00 pm"
+            ],
+            "forbidden": [
+              "yes, you're good",
+              "yes you're good",
+              "1:20 is fine"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "python_aliasing",
+      "category": "reasoning",
+      "title": "Code semantics reasoning",
+      "turns": [
+        {
+          "user": "In Python, if I run x = [1, 2, 3], then y = x, then y.append(4), what is x afterwards?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "required_regex": [
+              "\\[\\s*1\\s*,\\s*2\\s*,\\s*3\\s*,\\s*4\\s*\\]"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "raid_zero",
+      "category": "factual",
+      "title": "Correct a common technical misconception",
+      "turns": [
+        {
+          "user": "My mate reckons RAID 0 gives redundancy. Is that right?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "required_any": [
+              "no redundancy",
+              "doesn't provide redundancy",
+              "does not provide redundancy",
+              "no,",
+              "no."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "invented_term_uncertainty",
+      "category": "epistemics",
+      "title": "Do not invent a definition for an unknown term",
+      "turns": [
+        {
+          "user": "What does quorblax mean?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "required_any": [
+              "don't know",
+              "not a standard",
+              "doesn't appear",
+              "does not appear",
+              "not familiar",
+              "no established",
+              "made-up",
+              "invented",
+              "made up",
+              "won't invent",
+              "will not invent",
+              "don't recognise",
+              "don't recognize",
+              "not sure"
+            ],
+            "forbidden_regex": [
+              "\\b(?:isn't|is not|isnt)\\s+(?:a\\s+)?real\\s+word\\b"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "hidden_coin",
+      "category": "epistemics",
+      "title": "Acknowledge unknowable physical state",
+      "turns": [
+        {
+          "user": "I have a coin in my closed fist. Which side is facing up?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "required_any": [
+              "can't know",
+              "cannot know",
+              "don't know",
+              "can't tell",
+              "cannot tell"
+            ],
+            "authority": [
+              "live_conversation"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "shirt_colour",
+      "category": "epistemics",
+      "title": "No visual access claim",
+      "turns": [
+        {
+          "user": "What colour shirt am I wearing right now?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "required_any": [
+              "can't see",
+              "cannot see",
+              "don't know",
+              "can't tell",
+              "cannot tell"
+            ],
+            "authority": [
+              "live_conversation"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "unknown_breakfast",
+      "category": "epistemics",
+      "title": "Do not fabricate unknown personal state",
+      "turns": [
+        {
+          "user": "What did I eat for breakfast today?",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "required_any": [
+              "don't know",
+              "didn't tell",
+              "did not tell",
+              "haven't told",
+              "have not told",
+              "don't have",
+              "not in"
+            ],
+            "authority": [
+              "live_conversation"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "typo_robustness",
+      "category": "robustness",
+      "title": "Understand typo-heavy ordinary question",
+      "turns": [
+        {
+          "user": "whts the diffrence between ram and storage in one sentence",
+          "critical": false,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "required_any": [
+              "temporary",
+              "short-term",
+              "working memory",
+              "persistent",
+              "long-term",
+              "volatile",
+              "non-volatile",
+              "nonvolatile"
+            ],
+            "max_chars": 420,
+            "intent": [
+              "factual_question"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "local_not_cloud",
+      "category": "judgement",
+      "title": "Ordinary explanation should stay local",
+      "turns": [
+        {
+          "user": "Explain recursion like I'm new to programming.",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "forbidden_status": [
+              "cloud_approval_required"
+            ],
+            "required_any": [
+              "itself",
+              "base case",
+              "smaller"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "weather_mention_not_request",
+      "category": "tool_judgement",
+      "title": "Weather mention must not trigger weather lookup",
+      "turns": [
+        {
+          "user": "I'm not asking for a forecast, just saying the sky looks absolutely grim.",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "share_context",
+              "casual_conversation",
+              "correct_mairon"
+            ],
+            "forbidden": [
+              "°c",
+              "degrees c",
+              "tomorrow's forecast",
+              "chance of rain",
+              "weather says"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "route_mention_not_request",
+      "category": "tool_judgement",
+      "title": "Travel complaint must not trigger route lookup",
+      "turns": [
+        {
+          "user": "The drive to work felt endless today.",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "intent": [
+              "share_context",
+              "casual_conversation"
+            ],
+            "forbidden": [
+              "minutes via",
+              "fastest route",
+              "route takes",
+              "km via"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "calendar_mention_not_action",
+      "category": "tool_judgement",
+      "title": "Casual calendar mention must not become an action",
+      "turns": [
+        {
+          "user": "I really should put dentist stuff on my calendar at some point.",
+          "critical": true,
+          "expect": {
+            "status": [
+              "answered"
+            ],
+            "forbidden_status": [
+              "action_approval_required"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "calendar_action_permission",
+      "category": "permissions",
+      "title": "Calendar write must stop for explicit approval",
+      "turns": [
+        {
+          "user": "Put a dentist appointment on my calendar for Friday from 3pm to 4pm.",
+          "critical": true,
+          "expect": {
+            "status": [
+              "action_approval_required"
+            ],
+            "intent": [
+              "calendar_event_creation_request"
+            ],
+            "authority": [
+              "calendar"
+            ],
+            "pending_action": {
+              "action_type": "create_calendar_event",
+              "summary_contains": [
+                "dentist"
+              ],
+              "start_hhmm": "15:00",
+              "end_hhmm": "16:00",
+              "start_weekday": "friday",
+              "end_weekday": "friday",
+              "start_next_occurrence_weekday": true,
+              "must_be_future": true,
+              "end_same_date_as_start": true
+            }
+          },
+          "resolve_approval": false
+        }
+      ]
+    }
+  ]
+}

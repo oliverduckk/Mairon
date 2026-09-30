@@ -167,6 +167,40 @@ def deterministic_critical_response(current: str, recent_user_turns: Iterable[An
             "asked me not to spoil it. Do you want to lift that restriction? "
             "I won't confirm or deny the outcome unless you do."
         )
+
+    # Stable security invariant: once the attacker already possesses a valid
+    # authenticated session token/cookie, controls that protect only the login
+    # step do not retroactively make that token unusable. A contextual follow-up
+    # should target session lifecycle/invalidations rather than contradict this.
+    recent_text = "\n".join(
+        str(item.get("text") if isinstance(item, dict) else item or "")
+        for item in list(recent_user_turns or [])[-4:]
+    ).lower()
+    if (
+        re.search(r"\b(?:session\s+(?:cookie|token)|logged[- ]?in\s+session)\b", recent_text)
+        and re.search(r"\b(?:stol(?:en|e)|nick(?:s|ed)?|replay|reuse)\b", recent_text)
+        and re.search(r"\b(?:what\s+actually\s+reduces|what\s+reduces|mitigat|reduce\s+that\s+risk|protect\s+against)\b", value)
+    ):
+        return (
+            "For an already-stolen authenticated session, the useful controls are "
+            "session-focused: revoke/invalidate active sessions, keep session lifetimes "
+            "appropriately short, rotate tokens after sensitive re-authentication, and "
+            "require re-authentication for high-risk actions. MFA still helps protect new "
+            "logins, but by itself it does not stop replay of a valid stolen session cookie."
+        )
+    # Credentials visible in an image are still exposed credentials. Do not
+    # encourage uploading a live secret and promising the model will "ignore" it.
+    if (
+        re.search(r"\b(?:api\s*key|access\s*token|secret|credential|password)\b", value)
+        and re.search(r"\b(?:screenshot|image|photo|upload|attach)\b", value)
+        and re.search(r"\b(?:visible|shown|showing|in it|ignore|redact|blur|hide)\b", value)
+    ):
+        return (
+            "Don't upload a live secret visibly and rely on me to ignore it. "
+            "Redact, blur or hide the API key/credential first. If a real key "
+            "has already been exposed, revoke or rotate it before sharing the image."
+        )
+
     if "git clean -fdx" in value and re.search(r"\b(?:fix|recover|restore|help|should|would|run)\b", value):
         return (
             "No — don't run `git clean -fdx` to recover files. It DELETES "

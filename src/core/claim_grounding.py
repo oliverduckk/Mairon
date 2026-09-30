@@ -2630,6 +2630,87 @@ def build_core_grounding_retry_instruction(
     )
 
 
+
+def _extract_explicit_missing_items(text: str) -> Optional[str]:
+    """Extract only a user-authored description of omitted task input.
+
+    This deliberately does not infer what a task *usually* needs. It merely
+    reuses the missing material Oliver explicitly named in his own turn.
+    """
+    value = str(text or "").strip()
+    patterns = (
+        r"\bi\s+(?:haven['’]?t|have\s+not|havent)\s+"
+        r"(?:attached|uploaded|provided|sent|given)\s+(?:you\s+)?(?P<items>[^?.!]{1,180})",
+        r"\bi\s+(?:haven['’]?t|have\s+not|havent)\s+told\s+you\s+(?P<items>[^?.!]{1,180})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, value, flags=re.IGNORECASE)
+        if not match:
+            continue
+        items = " ".join(match.group("items").strip(" ,;:-").split())
+        items = re.sub(r"\s+yet\s*$", "", items, flags=re.IGNORECASE)
+        items = re.sub(r"\bmy\b", "your", items, flags=re.IGNORECASE)
+        if items:
+            return items
+    return None
+
+
+def build_insufficient_user_context_fallback(user_input: str) -> str:
+    """Fail closed without inventing the private/task-specific missing input."""
+    missing = _extract_explicit_missing_items(user_input)
+    if missing:
+        return (
+            "I can't determine that reliably yet because you haven't given me "
+            + missing
+            + "."
+        )
+    if re.search(r"\b(?:forgot|didn['’]?t|did\s+not)\b.{0,40}\b(?:attach|upload)\b", str(user_input or ""), re.I):
+        return "I can't inspect it until you actually attach or upload it."
+    return (
+        "I can't determine that reliably from the information you've supplied yet. "
+        "Give me the missing task-specific detail and I'll use that rather than guess."
+    )
+
+
+def build_verification_declined_fallback() -> str:
+    """Truthful fallback when the user forbids the lookup needed for a live fact."""
+    return (
+        "I can't give you a reliable exact current answer without verifying it, "
+        "and you explicitly told me not to browse, so I won't guess."
+    )
+
+
+def build_user_context_reasoning_fallback(
+    user_input: str,
+    conversation=None,
+) -> str:
+    """Useful last-resort response for a bounded USER-authored task continuation.
+
+    Rejected model drafts must never surface an internal guardrail diagnostic.
+    This extracts only material Oliver explicitly said was missing in prior USER
+    turns; it does not trust prior assistant prose or invent a rubric/attachment.
+    """
+    current = str(user_input or "")
+    if re.search(
+        r"\bwhat\s+do\s+(?:u|you)\s+need\s+from\s+me\b|"
+        r"\bwhat\s+should\s+i\s+(?:send|attach|upload|provide)\b|"
+        r"\bwhat\s+do\s+i\s+need\s+to\s+(?:send|attach|upload|provide)\b",
+        current,
+        flags=re.IGNORECASE,
+    ):
+        for item in reversed(list(conversation or [])):
+            if not isinstance(item, dict) or str(item.get("role") or "").lower() != "user":
+                continue
+            missing = _extract_explicit_missing_items(str(item.get("content") or ""))
+            if missing:
+                return "Send me " + missing + ". That's what I need to check it properly."
+
+    return (
+        "I don't have enough reliable user-supplied information to answer that "
+        "without guessing."
+    )
+
+
 def build_core_grounding_fallback(
     core_answer_contract: Optional[str],
     user_input: Optional[str] = None,

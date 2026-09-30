@@ -639,6 +639,68 @@ def _conversation_texts(
     return result
 
 
+
+def _conversation_user_texts(conversation):
+    """Recent USER-only messages for spoiler boundaries.
+
+    Assistant prose is never allowed to widen or invent Oliver's spoiler ceiling.
+    """
+    result = []
+    if not conversation:
+        return result
+    for message in conversation[-12:]:
+        if isinstance(message, dict):
+            role = message.get("role")
+            content = message.get("content") or ""
+        else:
+            role = getattr(message, "role", None)
+            content = getattr(message, "content", "") or ""
+        if role == "user" and content:
+            result.append(str(content))
+    return result
+
+
+def _explicit_conversation_spoiler_ceiling(text):
+    """Extract a hard ceiling from explicit no-spoiler wording without persisting it.
+
+    "No spoilers past season 1" is a real ceiling even though it is not phrased
+    as "I'm up to season 1". It should govern the live conversation and outrank
+    older stored progress, but should not silently become a durable profile.
+    """
+    value = _normalise_text(text)
+    if not value:
+        return None
+    boundary = bool(
+        re.search(
+            r"\b(?:no|without)\s+spoilers?\s+(?:past|beyond|after)\b|"
+            r"\b(?:don['’]?t|do\s+not|dont)\s+spoil\b.{0,50}\b(?:past|beyond|after)\b|"
+            r"\b(?:nothing|no\s+plot\s+details?)\s+(?:past|beyond|after)\b",
+            value,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not boundary:
+        return None
+    progress_type, progress_value = _detect_progress_value(value)
+    if not progress_type or progress_value is None:
+        return None
+    return {
+        "medium": _detect_medium(value),
+        "progress_type": progress_type,
+        "progress_value": progress_value,
+        "caught_up": False,
+        "conversation_scoped": True,
+    }
+
+
+def _latest_conversation_spoiler_ceiling(user_input, conversation=None):
+    latest = None
+    for text in [*_conversation_user_texts(conversation), str(user_input or "")]:
+        candidate = _explicit_conversation_spoiler_ceiling(text)
+        if candidate is not None:
+            latest = candidate
+    return latest
+
 def resolve_media_title(
     user_input,
     conversation=None,
@@ -1438,6 +1500,21 @@ def prepare_spoiler_context(
             title
         )
     )
+
+    # A live, explicit "no spoilers past X" boundary is authoritative for this
+    # conversation even when Oliver did not phrase it as a progress statement.
+    # It intentionally overrides older durable profile progress without writing
+    # anything back to disk.
+    conversation_ceiling = _latest_conversation_spoiler_ceiling(
+        user_input=user_input,
+        conversation=conversation,
+    )
+    if conversation_ceiling is not None:
+        merged_profile = dict(profile or {})
+        merged_profile.update(conversation_ceiling)
+        if title and not merged_profile.get("title"):
+            merged_profile["title"] = title
+        profile = merged_profile
 
     high_risk = is_high_spoiler_risk(
         user_input

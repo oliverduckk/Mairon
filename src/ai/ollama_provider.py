@@ -108,6 +108,9 @@ from personality.opinion_ledger import (
 
 from core.claim_grounding import (
     build_core_grounding_fallback,
+    build_insufficient_user_context_fallback,
+    build_user_context_reasoning_fallback,
+    build_verification_declined_fallback,
     build_core_grounding_retry_instruction,
     build_mairon_agency_modality_instruction,
     build_recent_user_grounding_context,
@@ -117,6 +120,10 @@ from core.claim_grounding import (
     should_verify_factual_focus_fidelity,
     verify_core_grounded_draft,
     verify_factual_focus_fidelity,
+)
+from core.calendar_proposal_guard import (
+    CalendarProposalError,
+    validate_calendar_proposal,
 )
 from core.temporal_context import (
     build_relative_date_context,
@@ -8268,6 +8275,7 @@ def handle_direct_conversation(
         # the surface wording. Deictic task follow-ups still need isolation
         # from prior assistant text while receiving bounded USER evidence.
         or core_epistemic_mode in {"user_context_reasoning", "private_user_evidence"}
+        or core_epistemic_mode in {"insufficient_user_context", "verification_declined"}
         or core_is_grounded_opinion
         or core_is_consequential_advice
     )
@@ -9165,6 +9173,29 @@ def handle_direct_conversation(
         base_messages.append({
             "role": "system",
             "content": factual_focus_instruction,
+        })
+
+    if core_intent == "factual_question" and core_epistemic_mode == "insufficient_user_context":
+        base_messages.append({
+            "role": "system",
+            "content": (
+                "CORE MISSING-INPUT BOUNDARY: Oliver explicitly identified task-specific "
+                "information he has not supplied. Do not browse for a substitute, do not "
+                "guess the omitted detail, and do not invent attachments or policies. "
+                "Answer the question conditionally or state what is missing, using only "
+                "the missing details Oliver actually named."
+            ),
+        })
+
+    if core_intent == "factual_question" and core_epistemic_mode == "verification_declined":
+        base_messages.append({
+            "role": "system",
+            "content": (
+                "CORE NO-BROWSE BOUNDARY: Oliver explicitly prohibited external lookup. "
+                "Do not search, browse, or claim that verification happened. If the request "
+                "asks for an exact/current public fact that cannot be established without "
+                "live verification, say so plainly and do not guess from memory."
+            ),
         })
 
     if core_intent == "factual_question" and core_epistemic_mode == "private_state_uncertain":
@@ -10602,11 +10633,28 @@ def handle_direct_conversation(
                     "the verified extractive fallback."
                 )
 
+            elif core_epistemic_mode == "user_context_reasoning":
+                final_response_text = build_user_context_reasoning_fallback(
+                    user_input=user_input,
+                    conversation=conversation,
+                )
+                print(
+                    "[Grounding] User-task drafts remained invalid; Core used a "
+                    "bounded USER-only fallback instead of exposing guardrail internals."
+                )
+
+            elif core_epistemic_mode == "insufficient_user_context":
+                final_response_text = build_insufficient_user_context_fallback(user_input)
+                print("[Epistemic] Missing-input fallback used; no lookup or guess performed.")
+
+            elif core_epistemic_mode == "verification_declined":
+                final_response_text = build_verification_declined_fallback()
+                print("[Epistemic] No-browse fallback used; exact/current fact left unverified.")
+
             else:
                 final_response_text = (
-                    "I'm tripping my own response guardrails on that one. "
-                    "I'm not going to force through a draft I already know "
-                    "is bad."
+                    "I couldn't produce a reliable answer to that without crossing "
+                    "the evidence limits for this turn."
                 )
 
                 print(
@@ -11142,18 +11190,28 @@ def _get_response_impl(
 
                     break
 
-                pending_action = {
-                    "type": "create_calendar_event",
-                    "summary": arguments["summary"],
-                    "start_time": arguments["start_time"],
-                    "end_time": arguments["end_time"],
-                    "location": arguments.get(
-                        "location"
-                    ) or None,
-                    "description": arguments.get(
-                        "description"
-                    ) or None,
-                }
+                try:
+                    validated_calendar = validate_calendar_proposal(
+                        user_input=user_input,
+                        model_arguments=arguments,
+                        timezone_name=os.getenv(
+                            "MAIRON_TIMEZONE",
+                            "Australia/Sydney",
+                        ),
+                    )
+                except CalendarProposalError as exc:
+                    clarification = str(exc).strip() or (
+                        "Please provide an unambiguous calendar date and time."
+                    )
+                    safe_history = list(base_conversation)
+                    safe_history.append({"role": "user", "content": user_input})
+                    safe_history.append({"role": "assistant", "content": clarification})
+                    print("[Calendar] Core rejected an ambiguous/invalid proposal before approval.")
+                    return clarification, safe_history, None, None
+
+                pending_action = validated_calendar.action
+                if validated_calendar.corrected:
+                    print("[Calendar] Core canonicalised model timestamps from the user's explicit date/time.")
 
                 return (
                     None,

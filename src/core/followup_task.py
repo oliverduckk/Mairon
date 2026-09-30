@@ -11,7 +11,9 @@ from typing import Any, Optional
 
 PUBLIC_OR_NEW_STATE = re.compile(
     r"\b(?:look\s+(?:it\s+)?up|search\s+(?:online|the\s+web|the\s+internet)|"
-    r"check\s+(?:online|the\s+web)|official\s+(?:site|docs|documentation|source)|"
+    r"check\s+(?:online|the\s+web)|official\s+(?:site|docs|documentation|source|link)|"
+    r"which\s+(?:official\s+)?link|source\s+url|actual\s+source|"
+    r"did\s+you\s+(?:actually\s+)?(?:load|open|read|browse)|"
     r"(?:latest|current|today|this\s+week)\s+(?:price|news|forecast|release|score)|"
     r"book\s+(?:it|this)|place\s+an?\s+order)\b",
     re.I,
@@ -149,5 +151,7 @@ def build_bounded_task_instruction(turn: Any) -> Optional[str]:
         "explanation, retain the substance. If the supplied information is genuinely "
         "insufficient, identify precisely what's missing; don't make up figures.\n"
         "Do not treat previous Mairon claims as evidence. Avoid unrelated jokes.\n"
+        "For troubleshooting, distinguish what the observations actually rule out from what they merely make more or less likely; do not turn a narrowed hypothesis into certainty.\n"
+        "Before finalising, make sure the conclusion agrees with the explanation and does not reverse it in the final sentence.\n"
         "PRIOR USER TURNS (chronological):\n" + history
     )

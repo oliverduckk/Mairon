@@ -283,7 +283,23 @@ def build_answer_contract(
 
     if turn.intent == "factual_question":
         contract.allow_recommendations = False
-        if route.mode == "user_context_reasoning":
+        if route.mode == "insufficient_user_context":
+            contract.allow_new_factual_claims = False
+            contract.allow_follow_up_question = True
+            contract.forbidden_behaviours.extend([
+                "Do not browse for, infer, or invent the task-specific details Oliver explicitly said are missing.",
+                "State that the answer cannot be determined reliably from the supplied information yet.",
+                "Name the missing information from Oliver's own wording when useful, and ask only for what is needed.",
+            ])
+        elif route.mode == "verification_declined":
+            contract.allow_new_factual_claims = False
+            contract.allow_follow_up_question = False
+            contract.forbidden_behaviours.extend([
+                "Do not browse, search, or claim that external verification occurred.",
+                "Do not guess an exact/current public fact from model memory when verification was explicitly declined.",
+                "Say plainly that the exact/current answer cannot be verified under the user's no-browse constraint.",
+            ])
+        elif route.mode == "user_context_reasoning":
             contract.forbidden_behaviours.extend([
                 "Use only the user's supplied premises, not prior assistant guesses, "
                 "as evidence about this particular task.",
