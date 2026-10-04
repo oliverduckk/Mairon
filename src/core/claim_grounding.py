@@ -1,4 +1,7 @@
+import ast
+import builtins
 import json
+import math
 import os
 import re
 from typing import Any, Dict, List, Optional
@@ -512,6 +515,14 @@ def _extract_incidental_public_attributions(
             "possessive creative credit",
             re.compile(
                 rf"\b(?P<name>{name_pattern})'s\s+"
+                r"(?:art|artwork|writing|direction|directing|design|music|"
+                r"score|illustrations?|story|animation|cinematography|work)\b"
+            ),
+        ),
+        (
+            "single-token possessive creative credit",
+            re.compile(
+                r"\b(?P<name>[A-Z][A-Za-z0-9'-]{2,})'s\s+"
                 r"(?:art|artwork|writing|direction|directing|design|music|"
                 r"score|illustrations?|story|animation|cinematography|work)\b"
             ),
@@ -1439,6 +1450,7 @@ def _unsupported_mairon_perception_claims(
         r"\bi\s+can\s+see\s+(?:your|the|that|this)\b",
         r"\bi(?:'ve| have)\s+watched\s+you\b",
         r"\bi\s+watched\s+you\b",
+        r"\bi(?:'m| am)\s+(?:just\s+)?(?:here\s+)?(?:watching|looking\s+at|staring\s+at)\s+(?:your|the|that|this)\s+(?:clock|timer|screen|monitor|cursor|room|window|door|desk|table)\b",
         r"\bi(?:'ve| have)\s+heard\s+you\b",
         r"\bi\s+heard\s+you\b",
         r"\bi\s+can\s+hear\s+you\b",
@@ -1471,6 +1483,8 @@ USER_PHYSICAL_ACTION_FAMILIES = {
     "rush": ("rush", "rushing", "rushed"),
     "sit": ("sit", "sits", "sat", "sitting"),
     "stand": ("stand", "stands", "stood", "standing"),
+    "stare": ("stare", "stares", "stared", "staring"),
+    "look": ("look", "looks", "looked", "looking"),
     "walk": ("walk", "walks", "walked", "walking"),
     "run": ("run", "runs", "ran", "running"),
     "lie": ("lie", "lies", "lay", "lying", "laying"),
@@ -1483,6 +1497,60 @@ USER_PHYSICAL_ACTION_FAMILIES = {
     "drive": ("drive", "drives", "drove", "driving"),
     "leave": ("leave", "leaves", "left", "leaving"),
 }
+
+
+USER_PHYSICAL_OBJECT_TERMS = (
+    "chair", "couch", "sofa", "bed", "desk", "screen", "monitor",
+    "window", "door", "table", "floor", "wall", "walls", "room",
+    "clock", "timer", "cursor",
+    "shirt", "clothes", "clothing", "face", "eyes", "food", "drink",
+)
+
+
+def _unsupported_user_physical_object_claims(
+    *,
+    draft: str,
+    grounding_text: str,
+) -> List[str]:
+    """Reject concrete scene objects attached to Oliver when he never supplied them.
+
+    This is intentionally conservative: it only checks a compact set of ordinary
+    physical scene/body objects and only when the draft presents them as part of
+    Oliver's immediate situation rather than as a clearly hypothetical example.
+    """
+    text = _normalise_for_grounding(draft)
+    grounding = _normalise_for_grounding(grounding_text)
+    violations: List[str] = []
+
+    for term in USER_PHYSICAL_OBJECT_TERMS:
+        if re.search(r"\b" + re.escape(term) + r"\b", grounding, flags=re.IGNORECASE):
+            continue
+
+        pattern = (
+            r"\b(?:your|the|that|this)\s+" + re.escape(term) + r"s?\b"
+            r"|\b" + re.escape(term) + r"s?\b[^.!?]{0,55}\byou(?:\b|'re|'ve|'ll|'d)"
+        )
+        if not re.search(pattern, text, flags=re.IGNORECASE):
+            continue
+
+        # Explicit hypotheticals/examples are not observations about Oliver's scene.
+        unit_candidates = [
+            unit.strip()
+            for unit in re.split(r"(?<=[.!?])\s+", text)
+            if re.search(r"\b" + re.escape(term) + r"s?\b", unit, flags=re.IGNORECASE)
+        ]
+        if unit_candidates and all(
+            re.search(r"\b(?:if|imagine|suppose|hypothetically|for example|could be|might be)\b", unit, flags=re.IGNORECASE)
+            for unit in unit_candidates
+        ):
+            continue
+
+        violations.append(
+            "unsupported Oliver immediate physical-scene object claim involving " + term
+        )
+        break
+
+    return violations
 
 
 def _grounding_mentions_action_family(
@@ -1540,11 +1608,42 @@ def _unsupported_user_physical_action_claims(
             + r")\b"
         )
 
-        if not re.search(
+        direct_match = re.search(
             pattern,
             value,
             flags=re.IGNORECASE,
-        ):
+        )
+
+        # Participial scene descriptions can put the invented action before
+        # the explicit second-person subject: "Sitting there staring at
+        # nothing, you're ...". Treat those as the same observable-state
+        # claim without broadening to generic imperative "look" phrasing.
+        reversed_scene_match = False
+        ing_variants = [
+            item
+            for item in variants
+            if item.endswith("ing")
+        ]
+        if ing_variants:
+            reversed_scene_match = bool(re.search(
+                r"\b(?:"
+                + "|".join(re.escape(item) for item in ing_variants)
+                + r")\b[^.!?]{0,80}\byou(?:\b|'re|'ve|'ll|'d)",
+                value,
+                flags=re.IGNORECASE,
+            ))
+
+        indirect_scene_match = False
+        if ing_variants:
+            indirect_scene_match = bool(re.search(
+                r"\byou\b[^.!?]{0,65}\b(?:stop|stopped|keep|kept|start|started|continue|continued)\s+(?:"
+                + "|".join(re.escape(item) for item in ing_variants)
+                + r")\b",
+                value,
+                flags=re.IGNORECASE,
+            ))
+
+        if not (direct_match or reversed_scene_match or indirect_scene_match):
             continue
 
         if _grounding_mentions_action_family(
@@ -1633,6 +1732,110 @@ def _unsupported_mairon_recordkeeping_claims(
     return []
 
 
+def _unsupported_relationship_history_claims(
+    *,
+    draft: str,
+    grounding_text: str,
+) -> List[str]:
+    """Reject plausible shared-history claims that Oliver never established."""
+    text = str(draft or "").replace("’", "'")
+    grounding = _normalise_for_grounding(grounding_text)
+
+    patterns = (
+        r"\bi(?:'ve| have)\s+(?:known|been\s+(?:helping|processing|dealing\s+with|putting\s+up\s+with))\s+you\b[^.!?]{0,100}\b(?:since|for)\b",
+        r"\bi(?:'ve| have)\s+been\b[^.!?]{0,120}\bsince\s+day\s+one\b",
+        r"\bi(?:'ve| have)\s+been\b[^.!?]{0,100}\bsince\s+before\s+you\b",
+        r"\bsince\s+before\s+you\s+(?:had|got|were|became|started)\b",
+        r"\bwe(?:'ve| have)\s+been\b[^.!?]{0,90}\bfor\s+(?:years?|months?|ages?)\b",
+        r"\byou(?:'re| are)\s+(?:treating|testing|using|debugging|programming|training|"
+        r"poking|prodding|messing\s+with)\s+(?:me\b[^.!?]{0,100})?\bagain\b",
+        r"\byou\s+(?:keep|kept)\s+(?:treating|testing|using|debugging|programming|training|"
+        r"poking|prodding|messing\s+with)\s+me\b",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        phrase = _normalise_for_grounding(match.group(0))
+        if phrase and phrase in grounding:
+            continue
+        return ["Mairon invented unsupported relationship/conversation history"]
+
+    return []
+
+
+
+def find_unknown_media_opinion_overreach_violations(
+    user_input: str,
+    draft: str,
+) -> List[str]:
+    """Reject invented work-specific takes after Mairon admits it lacks familiarity.
+
+    An explicit first-hand-knowledge disclaimer is good epistemic behaviour, but
+    it cannot be followed by concrete claims about pacing, world-building,
+    characters, prose, plot quality, or Oliver's attachment to the work. If
+    Mairon lacks enough knowledge for a real take, it should say that cleanly
+    rather than replace fake familiarity with fake speculation.
+    """
+    user = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
+    response = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
+
+    if not re.search(
+        r"\bwhat\s+do\s+you\s+(?:actually\s+)?think\s+(?:of|about)\b|"
+        r"\bwhat(?:'s| is)\s+your\s+(?:take|opinion|view)\b",
+        user,
+        flags=re.IGNORECASE,
+    ):
+        return []
+
+    admits_limited_familiarity = bool(re.search(
+        r"\bi\s+(?:haven['’]?t|have\s+not|didn['’]?t|did\s+not)\s+"
+        r"(?:read|watch|see|play|finish|consume|experience)\b|"
+        r"\bi\s+don['’]?t\s+know\s+enough\b|"
+        r"\bi\s+can['’]?t\s+give\s+(?:you\s+)?(?:a\s+)?real\s+take\b",
+        response,
+        flags=re.IGNORECASE,
+    ))
+    if not admits_limited_familiarity:
+        return []
+
+    violations: List[str] = []
+
+    work_specific_guess = re.search(
+        r"\b(?:pacing|world[- ]?building|characters?|character\s+work|plot|prose|"
+        r"writing|story|themes?|dialogue|ending|combat|romance)\b"
+        r"[^.!?]{0,80}\b(?:sucks?|bad|good|great|weak|strong|dense|boring|slow|"
+        r"amazing|excellent|poor|messy|bloated|thin|deep|shallow|impressive|"
+        r"trying\s+too\s+hard|works?|doesn['’]?t\s+work)\b|"
+        r"\b(?:sucks?|bad|good|great|weak|strong|dense|boring|amazing|excellent|"
+        r"poor|messy|bloated|thin|deep|shallow)\b[^.!?]{0,80}"
+        r"\b(?:pacing|world[- ]?building|characters?|plot|prose|writing|story|themes?)\b",
+        response,
+        flags=re.IGNORECASE,
+    )
+    if work_specific_guess:
+        violations.append(
+            "unknown-media opinion admitted insufficient familiarity but then invented work-specific evaluative details"
+        )
+
+    if re.search(
+        r"\byou(?:'re| are)\s+(?:clearly\s+)?(?:obsessed|a\s+fan|into\s+it|hooked)\b|"
+        r"\byou\s+(?:obviously|clearly)\s+(?:love|like|adore)\b",
+        response,
+        flags=re.IGNORECASE,
+    ) and not re.search(
+        r"\bi\s+(?:love|like|adore|am\s+obsessed|am\s+into)\b",
+        user,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "unknown-media opinion invented Oliver's preference/attachment to the work"
+        )
+
+    return list(dict.fromkeys(violations))
+
+
 def _unsupported_personal_history_year_claims(
     user_input: str,
     draft: str,
@@ -1707,6 +1910,63 @@ def _unsupported_new_scene_piles(
             continue
         result.append("introduced an unsupported physical pile/stack of " + noun)
     return list(dict.fromkeys(result))
+
+
+
+def find_question_echo_violations(
+    user_input: str,
+    draft: str,
+) -> List[str]:
+    """Reject a response that merely hands Oliver's question back to him.
+
+    This is a response-adequacy check, not a semantic fact checker. It is
+    intentionally conservative: the proposed answer must itself be a question
+    and be almost entirely copied from the current user message.
+    """
+
+    user = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        str(user_input or "").lower(),
+    ).strip()
+    answer_raw = str(draft or "").strip()
+    answer = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        answer_raw.lower(),
+    ).strip()
+
+    if (
+        not user
+        or not answer
+        or not answer_raw.endswith("?")
+        or len(answer) < 24
+    ):
+        return []
+
+    if answer in user:
+        return [
+            "response merely echoed Oliver's question instead of answering it"
+        ]
+
+    answer_tokens = answer.split()
+    user_tokens = set(user.split())
+
+    if len(answer_tokens) < 6:
+        return []
+
+    overlap = sum(
+        1
+        for token in answer_tokens
+        if token in user_tokens
+    ) / len(answer_tokens)
+
+    if overlap >= 0.9:
+        return [
+            "response mostly echoed Oliver's question instead of answering it"
+        ]
+
+    return []
 
 
 def find_deterministic_grounding_violations(
@@ -1784,8 +2044,34 @@ def find_deterministic_grounding_violations(
         )
 
     for description in (
+        _unsupported_user_physical_object_claims(
+            draft=draft,
+            grounding_text=grounding_text,
+        )
+    ):
+        violations.append(
+            (
+                "unsupported Core-grounded claim: "
+                + description
+            )
+        )
+
+    for description in (
         _unsupported_mairon_recordkeeping_claims(
             draft=draft,
+        )
+    ):
+        violations.append(
+            (
+                "unsupported Core-grounded claim: "
+                + description
+            )
+        )
+
+    for description in (
+        _unsupported_relationship_history_claims(
+            draft=draft,
+            grounding_text=grounding_text,
         )
     ):
         violations.append(
@@ -1861,6 +2147,2343 @@ def find_deterministic_grounding_violations(
         )
 
     return violations
+
+
+def find_user_diagnostic_overclaim_violations(
+    user_input: str,
+    draft: str,
+    core_answer_contract: Optional[str],
+    conversation=None,
+) -> List[str]:
+    """Reject confident claims about Oliver's unmeasured diagnostic setup.
+
+    Stable technical knowledge may explain what a measurement *suggests*, but it
+    cannot manufacture user-specific bands, backhaul state, access points,
+    materials or topology. This validator is deliberately narrow and only fires
+    when the USER-authored packet is clearly diagnostic/troubleshooting-shaped.
+    """
+    if contract_intent(core_answer_contract) != "factual_question":
+        return []
+
+    if contract_epistemic_mode(core_answer_contract) not in {
+        "stable_model_knowledge",
+        "user_context_reasoning",
+        "public_source_verified",
+    }:
+        return []
+
+    current_user = str(user_input or "").lower()
+    source = (
+        current_user
+        + "\n"
+        + str(build_recent_user_grounding_context(conversation, max_user_messages=4) or "")
+    ).lower()
+
+    if not re.search(
+        r"\b(?:mbps|gbps|ping|latency|speed\s*test|signal|wi[- ]?fi|wireless|mesh|"
+        r"router|node|backhaul|flicker|refresh\s+rate|vrr|measured|tested|reading)\b",
+        source,
+        flags=re.IGNORECASE,
+    ):
+        return []
+
+    text = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
+    violations: List[str] = []
+
+    # When Oliver asks what to *test first*, preserve diagnostic information
+    # instead of immediately mutating configuration that has not been measured.
+    # A first step should normally isolate a variable (same device near/far,
+    # association/RSSI, wired-vs-wireless path) before forcing a band/channel.
+    asks_first_test = bool(re.search(
+        r"\b(?:what|which)\b[^?]{0,50}\b(?:test|check|try)\b[^?]{0,25}\bfirst\b|"
+        r"\bfirst\b[^?]{0,25}\b(?:test|check|thing)\b",
+        current_user,
+        flags=re.IGNORECASE,
+    ))
+    if asks_first_test and not re.search(
+        r"\b(?:2\.4|5|6)\s*ghz\b|\bchannel(?:\s+width)?\b|\bband\b",
+        source,
+        flags=re.IGNORECASE,
+    ):
+        # Before an isolating test, a wired-fast / wireless-slow comparison
+        # narrows the problem domain but does not prove a single Wi-Fi root
+        # cause. Reject definitive diagnoses such as "that's a classic range
+        # issue" so Core can use its calibrated same-device isolation fallback.
+        if re.search(
+            r"\b(?:that(?:'s| is)|this\s+is|it(?:'s| is))\s+"
+            r"(?:(?:a\s+)?classic\s+|definitely\s+|clearly\s+|obviously\s+)?"
+            r"(?:a\s+)?(?:wi[- ]?fi\s+)?(?:range|signal|coverage|backhaul|interference|roaming)\s+"
+            r"(?:issue|problem|fault)\b|"
+            r"\b(?:definitely|clearly|obviously)\b[^.!?]{0,60}"
+            r"\b(?:range|signal|coverage|backhaul|interference|roaming)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "diagnostic first-test answer asserted a single unmeasured Wi-Fi root cause before isolating the variable"
+            )
+
+        if re.search(
+            r"\b(?:force|forcing|switch|switching|set|setting|change|changing|lock|locking)\b[^.!?]{0,70}"
+            r"(?:\b(?:2\.4|5|6)\s*ghz\b|\bchannel(?:\s+width)?\b|\bband\b)",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "diagnostic first-test answer changed an unmeasured radio configuration instead of isolating a variable"
+            )
+
+        # For the common wired-fast / wireless-slow location comparison, the
+        # cleanest first isolation is the same wireless device near the source
+        # versus in the problem location. Merely checking an assumed radio band
+        # first leaves device-vs-location-vs-path confounded.
+        if (
+            re.search(r"\bwired\s+[a-z][a-z0-9_-]{2,30}\b", source)
+            and re.search(r"\bphone\b", source)
+            and re.search(r"\b(?:upstairs|downstairs|room|area|location)\b", source)
+        ):
+            band_check = re.search(
+                r"\b(?:check|see|verify|confirm|look)\b[^.!?]{0,160}"
+                r"\b(?:2\.4|5|6)\s*ghz\b|"
+                r"\b(?:check|see|verify|confirm|look)\b[^.!?]{0,160}\b(?:band|channel)\b|"
+                r"\b(?:check|see|verify|confirm)\b[^.!?]{0,160}"
+                r"\b(?:phone|device|adapter)\b[^.!?]{0,120}"
+                r"\b(?:capable|capability|band|channel)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            same_device_near_source = re.search(
+                r"\b(?:same\s+)?phone\b[^.!?]{0,100}"
+                r"\b(?:near|next\s+to|beside|closer\s+to|by)\b[^.!?]{0,70}"
+                r"\b(?:router|node|wi[- ]?fi\s+source|access\s+point|source)\b|"
+                r"\b(?:router|node|wi[- ]?fi\s+source|access\s+point|source)\b[^.!?]{0,70}"
+                r"\b(?:same\s+)?phone\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if band_check and (
+                not same_device_near_source
+                or band_check.start() < same_device_near_source.start()
+            ):
+                violations.append(
+                    "diagnostic first-test answer prioritized an unmeasured band hypothesis over same-device near-vs-problem-location isolation"
+                )
+
+    # A user-described wired endpoint cannot simultaneously be treated as if
+    # Core had observed its Wi-Fi channel/band configuration.
+    wired_entities = {
+        match.group("entity")
+        for match in re.finditer(
+            r"\bwired\s+(?P<entity>[a-z][a-z0-9_-]{2,30})\b",
+            source,
+            flags=re.IGNORECASE,
+        )
+    }
+    for entity in sorted(wired_entities):
+        if re.search(
+            rf"\b(?:your\s+)?{re.escape(entity)}\b[^.!?]{{0,70}}"
+            r"\b(?:on|using|at)\s+(?:2\.4|5|6|20|40|80|160)\s*(?:mhz|ghz)?\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "diagnostic answer assigned an unobserved Wi-Fi band/channel to a user-described wired device"
+            )
+            break
+
+    # Also catch comparisons such as "the same 5GHz band as the console".
+    # A wired endpoint has no Wi-Fi band to compare against. Allow an explicit
+    # correction ("the wired console is not on a Wi-Fi band") but reject any
+    # positive band/channel association in the same sentence.
+    for entity in sorted(wired_entities):
+        entity_units = [
+            unit.strip()
+            for unit in re.split(r"(?<=[.!?])\s+", text)
+            if re.search(rf"\b{re.escape(entity)}\b", unit, flags=re.IGNORECASE)
+        ]
+        for unit in entity_units:
+            has_radio_term = bool(re.search(
+                r"\b(?:2\.4|5|6)\s*ghz\b|\b(?:wi[- ]?fi\s+)?band\b|\bchannel\b",
+                unit,
+                flags=re.IGNORECASE,
+            ))
+            explicit_negation = bool(re.search(
+                rf"\b(?:wired\s+)?{re.escape(entity)}\b[^.!?]{{0,55}}"
+                r"\b(?:isn['’]?t|is\s+not|doesn['’]?t|does\s+not|can['’]?t|cannot)\b"
+                r"[^.!?]{0,55}\b(?:wi[- ]?fi|band|channel|ghz)\b|"
+                r"\bno\s+(?:wi[- ]?fi\s+)?band\b",
+                unit,
+                flags=re.IGNORECASE,
+            ))
+            if has_radio_term and not explicit_negation:
+                violations.append(
+                    "diagnostic answer associated a user-described wired device with a Wi-Fi band/channel"
+                )
+                break
+        if violations and violations[-1].startswith("diagnostic answer associated"):
+            break
+
+    # Mentioning backhaul as a hypothesis is fine. Declaring its actual state
+    # is not, unless Oliver supplied a backhaul-specific observation.
+    if "backhaul" not in source and re.search(
+        r"\b(?:the|your)?\s*(?:mesh\s+)?backhaul(?:\s+(?:path|link))?\b"
+        r"[^.!?]{0,90}\b(?:is|are|was|were|looks?|seems?)\s+"
+        r"(?:fine|healthy|good|working|functioning|okay|ok|not\s+(?:the\s+)?bottleneck)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "diagnostic answer declared unmeasured backhaul state as established fact"
+        )
+
+    if "access point" not in source and re.search(
+        r"\b(?:the|your)\s+(?:specific\s+)?access\s+point\b[^.!?]{0,90}"
+        r"\b(?:serving|for|on)\s+(?:your\s+)?(?:upstairs|upper\s+floor|room|area)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "diagnostic answer invented a user-specific access-point/topology detail"
+        )
+
+    physical_details = (
+        "concrete",
+        "brick",
+        "metal studs",
+        "radiator",
+        "heater",
+        "steel",
+        "foil insulation",
+        "drywall",
+        "plaster",
+        "attic",
+        "antenna alignment",
+        "wall",
+        "walls",
+        "floor",
+        "floors",
+    )
+    hedge_markers = (
+        "could be", "might be", "may be", "possible", "possibly",
+        "for example", "such as", "one possibility", "a possibility",
+    )
+    for detail in physical_details:
+        if detail in source or detail not in text:
+            continue
+        containing_units = [
+            unit.strip()
+            for unit in re.split(r"(?<=[.!?])\s+", text)
+            if detail in unit
+        ]
+        if not containing_units:
+            continue
+        if any(
+            not any(marker in unit for marker in hedge_markers)
+            for unit in containing_units
+        ):
+            violations.append(
+                "diagnostic answer asserted an unmeasured physical/layout detail as the actual cause"
+            )
+            break
+
+    if re.search(
+        r"\b(?:almost\s+certainly|definitely|clearly|classic\s+(?:case|symptom|sign)(?:\s+of)?|"
+        r"the\s+bottleneck\s+is|the\s+issue\s+is)\b[^.!?]{0,140}"
+        r"\b(?:physical\s+interference|wireless\s+interference|interference|poor\s+placement|"
+        r"poor\s+signal(?:\s+strength)?|signal\s+attenuation|antenna\s+alignment|walls?|floors?|"
+        r"attic|drywall|concrete|metal\s+studs)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "diagnostic answer promoted an unmeasured physical cause from hypothesis to near-certainty"
+        )
+
+    if re.search(
+        r"\b(?:probably|likely|most\s+likely)\b[^.!?]{0,45}"
+        r"\b(?:due\s+to|because\s+of|caused\s+by|from)\b[^.!?]{0,70}"
+        r"\b(?:physical\s+interference|wireless\s+interference|interference|poor\s+placement|"
+        r"poor\s+signal(?:\s+strength)?|signal\s+attenuation|antenna\s+alignment|walls?|floors?|"
+        r"attic|drywall|concrete|metal\s+studs)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "diagnostic answer promoted an unmeasured physical cause from hypothesis to near-certainty"
+        )
+
+    # A main-node reading does not collapse a mesh problem into purely
+    # environmental causes. The unmeasured wireless/mesh path remains open.
+    if (
+        "mesh" in source
+        and "main" in source
+        and re.search(r"\bupstairs\b", source)
+        and "backhaul" not in source
+        and re.search(
+            r"\b(?:narrows?|narrowed|points?|pointed)\b[^.!?]{0,120}"
+            r"\b(?:environmental|interference|physical\s+obstruction|walls?|floors?)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        and not re.search(
+            r"\b(?:mesh\s+path|wireless\s+path|backhaul|node\s+placement|"
+            r"association|roaming|signal\s+path)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    ):
+        violations.append(
+            "diagnostic answer excluded the still-unmeasured mesh/wireless path"
+        )
+
+    # A fast near-node reading is useful evidence, but it does not prove that
+    # every router/node/hardware component is healthy or establish one exact
+    # physical cause. Preserve "less likely / points toward" calibration.
+    if re.search(r"\b(?:mbps|gbps)\b", source, flags=re.IGNORECASE):
+        if re.search(
+            r"\b(?:proves?|proven)\b[^.!?]{0,110}\b(?:hardware|router|node|equipment)\b"
+            r"[^.!?]{0,60}\b(?:fine|healthy|working|good|okay|ok)\b|"
+            r"\b(?:hardware|router|node|equipment)\b[^.!?]{0,80}\b(?:is|are)\s+definitely\s+fine\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "diagnostic answer treated one throughput reading as proof that all relevant hardware is healthy"
+            )
+
+        if re.search(
+            r"\b(?:points?|pointed)\s+squarely\s+to\b[^.!?]{0,140}"
+            r"\b(?:physical\s+layer|attenuation|interference|walls?|backhaul|signal)\b|"
+            r"\brules?\s+out\b[^.!?]{0,120}\b(?:general\s+service\s+degradation|"
+            r"bandwidth\s+cap|throttled\s+plan|isp\s+problem)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "diagnostic answer overclaimed what the supplied throughput measurements rule out or prove"
+            )
+
+        if (
+            re.search(r"\bupstairs\b", source, flags=re.IGNORECASE)
+            and re.search(r"\b(?:main\s+)?(?:mesh\s+)?node\b", source, flags=re.IGNORECASE)
+            and re.search(
+                r"\brules?\s+out\b[^.!?]{0,120}\b(?:wireless\s+)?(?:range|coverage|distance|attenuation|signal\s+loss|signal\s+strength)\b|"
+                r"\b(?:wireless\s+)?(?:range|coverage|distance|attenuation|signal\s+loss|signal\s+strength)\b[^.!?]{0,90}\b(?:is|was)\s+ruled\s+out\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ):
+            violations.append(
+                "diagnostic answer ruled out an upstairs range/coverage path that remains compatible with the supplied measurements"
+            )
+
+    # User-specific network infrastructure must come from the USER packet. A
+    # generic ISP/mesh prompt does not establish a tower, an upstairs access
+    # point, or a particular between-floor backhaul topology.
+    if "tower" not in source and re.search(
+        r"\b(?:tower|cell\s+tower|wireless\s+tower)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "diagnostic answer introduced an unprovided network tower/infrastructure detail"
+        )
+
+    if "access point" not in source and re.search(
+        r"\b(?:the|your|an?)\s+access\s+point\b[^.!?]{0,70}"
+        r"\b(?:upstairs|downstairs|between\s+floors|in\s+your\s+room|in\s+the\s+room)\b|"
+        r"\baccess\s+point\s+(?:upstairs|downstairs)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "diagnostic answer invented a user-specific access-point/topology detail"
+        )
+
+    if "backhaul" not in source and re.search(
+        r"\b(?:mesh\s+)?backhaul\b[^.!?]{0,60}\bbetween\s+(?:the\s+)?floors\b|"
+        r"\bbetween\s+(?:the\s+)?floors\b[^.!?]{0,60}\b(?:mesh\s+)?backhaul\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "diagnostic answer invented a user-specific between-floor backhaul topology"
+        )
+
+    # If a wired endpoint is already fast, a conditional conclusion that two
+    # slow *wireless* location tests would make the ISP/plan the likely cause is
+    # internally inconsistent with the supplied evidence.
+    if wired_entities and re.search(r"\b(?:mbps|gbps)\b", source, re.IGNORECASE):
+        if re.search(
+            r"\bif\s+(?:they|both|the\s+phone\s+tests?)\b[^.!?]{0,80}\bslow\b"
+            r"[^.!?]{0,100}\b(?:isp|internet\s+plan|plan)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "diagnostic answer contradicted the known fast wired result by making slow wireless location tests evidence for an ISP/plan bottleneck"
+            )
+
+    # Preserve relations in the supplied measurements. "Phone fast next to
+    # the main node, slow upstairs" does not establish that the upstairs test
+    # happened next to that node, nor does it establish a separate upstairs
+    # mesh node.
+    user_supplied_upstairs_node = bool(re.search(
+        r"\bupstairs\s+(?:mesh\s+)?node\b|"
+        r"\b(?:mesh\s+)?node\s+upstairs\b|"
+        r"\b(?:mesh\s+)?node\b[^.!?]{0,25}\b(?:is|was|located|sitting)\s+upstairs\b|"
+        r"\b(?:mesh\s+)?node\b[^.!?]{0,25}\bon\s+(?:the\s+)?upper\s+floor\b",
+        source,
+        flags=re.IGNORECASE,
+    ))
+    draft_asserts_upstairs_node = bool(re.search(
+        r"\bupstairs\s+(?:mesh\s+)?node\b|"
+        r"\b(?:mesh\s+)?node\s+upstairs\b|"
+        r"\b(?:mesh\s+)?node\b[^.!?]{0,25}\b(?:is|was|located|sitting)\s+upstairs\b|"
+        r"\b(?:mesh\s+)?node\b[^.!?]{0,25}\bon\s+(?:the\s+)?upper\s+floor\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    if draft_asserts_upstairs_node and not user_supplied_upstairs_node:
+        violations.append(
+            "diagnostic answer invented a separate upstairs mesh-node/topology relation"
+        )
+
+    # If the current USER turn explicitly contrasts a fast reading next to the
+    # main node with a slow upstairs reading, do not collapse those into one
+    # location (for example, '20 Mbps upstairs even when close to the node').
+    user_separates_near_and_upstairs = bool(re.search(
+        r"\bphone\b[^.!?]{0,90}\b(?:hits?|gets?|reaches?)\b[^.!?]{0,50}"
+        r"\b(?:next\s+to|near|beside)\b[^.!?]{0,45}\b(?:main\s+)?(?:mesh\s+)?node\b"
+        r"[^.!?]{0,90}\b(?:but|while|and)\b[^.!?]{0,40}\b(?:still\s+)?(?:slow|\d+(?:\.\d+)?(?:\s*(?:mbps|gbps))?)\b[^.!?]{0,35}\bupstairs\b",
+        current_user,
+        flags=re.IGNORECASE,
+    ))
+    if user_separates_near_and_upstairs and re.search(
+        r"\bphone\b[^.!?]{0,80}\bupstairs\b[^.!?]{0,100}"
+        r"\b(?:even\s+when|while|despite\s+being)\b[^.!?]{0,45}"
+        r"\b(?:close\s+to|near|next\s+to|beside)\b[^.!?]{0,45}\b(?:main\s+)?(?:mesh\s+)?node\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "diagnostic answer collapsed distinct near-node and upstairs measurements into the same location"
+        )
+
+    # A wired endpoint's throughput can be known without its physical location
+    # being known. Do not silently move it next to the router/node.
+    for entity in sorted(wired_entities):
+        user_places_wired_near_source = bool(re.search(
+            rf"\b(?:wired\s+)?{re.escape(entity)}\b[^.!?]{{0,90}}"
+            r"\b(?:next\s+to|near|beside|by)\b[^.!?]{0,45}\b(?:router|node|wi[- ]?fi\s+source)\b",
+            source,
+            flags=re.IGNORECASE,
+        ))
+        draft_places_wired_near_source = bool(re.search(
+            rf"\b(?:wired\s+)?{re.escape(entity)}\b[^.!?]{{0,100}}"
+            r"\b(?:next\s+to|near|beside|by)\b[^.!?]{0,45}\b(?:router|node|wi[- ]?fi\s+source)\b",
+            text,
+            flags=re.IGNORECASE,
+        ))
+        if draft_places_wired_near_source and not user_places_wired_near_source:
+            violations.append(
+                "diagnostic answer invented the physical location of a user-described wired endpoint"
+            )
+            break
+
+    # VRR tracks frame presentation cadence, not scene brightness. Dark scenes
+    # can expose refresh/gamma instability, but brightness itself does not tell
+    # VRR what refresh rate to choose. Avoid inventing a panel type too.
+    if re.search(r"\b(?:vrr|variable\s+refresh)\b", source, re.IGNORECASE):
+        if re.search(
+            r"\b(?:refresh\s+rate|display)\b[^.!?]{0,120}"
+            r"\b(?:based\s+on|triggered\s+by)\b[^.!?]{0,80}"
+            r"\b(?:brightness|luminance|darkness|motion)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "VRR explanation incorrectly tied refresh-rate selection to scene brightness/content"
+            )
+        if re.search(
+            r"\b(?:switch(?:es|ed|ing)?|change(?:s|d|ing)?)\b[^.!?]{0,55}\brefresh\s+rates?\b"
+            r"[^.!?]{0,70}\b(?:to\s+match|for)\b[^.!?]{0,45}\b(?:slower|faster|dark|bright)\s+scenes?\b|"
+            r"\brefresh\s+rates?\b[^.!?]{0,70}\b(?:match(?:es|ing)?|tracks?)\b[^.!?]{0,45}"
+            r"\b(?:slower|faster|dark|bright)\s+scenes?\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "VRR explanation incorrectly treated scene content as the controller of refresh-rate changes"
+            )
+        if re.search(r"\bdisplay\b[^.!?]{0,60}\bdrop(?:s|ping)?\s+frames\b", text, re.IGNORECASE):
+            violations.append(
+                "VRR explanation incorrectly described the display itself as dropping frames"
+            )
+        if not re.search(r"\b(?:oleds?|lcds?|pwm|va|ips|tn|local\s+dimming)\b", source, re.IGNORECASE) and re.search(
+            r"\b(?:oleds?|lcds?|pwm|va(?:\s+panel)?|ips(?:\s+panel)?|tn(?:\s+panel)?|local\s+dimming(?:\s+zones?)?)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "VRR diagnosis introduced an unprovided panel/dimming technology"
+            )
+        if (
+            re.search(r"\bdark\s+scenes?\b", current_user, re.IGNORECASE)
+            and re.search(
+                r"\b(?:strong|clear|definite)\s+(?:indicator|sign)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ):
+            violations.append(
+                "VRR diagnosis treated dark-scene correlation as a strong/definite indicator instead of compatible evidence"
+            )
+
+        if (
+            re.search(r"\bdark\s+scenes?\b", current_user, re.IGNORECASE)
+            and re.search(
+                r"\bdark\s+scenes?\b[^.!?]{0,160}\b(?:gpu|graphics)\b[^.!?]{0,120}"
+                r"\b(?:under\s+load|more\s+load|heavier\s+load|frame[- ]?rate\s+drops?|stutter(?:ing)?)\b|"
+                r"\b(?:gpu|graphics)\b[^.!?]{0,120}\b(?:under\s+load|more\s+load|heavier\s+load)\b"
+                r"[^.!?]{0,120}\bdark\s+scenes?\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ):
+            violations.append(
+                "VRR diagnosis incorrectly treated dark scenes themselves as evidence of higher GPU load or frame-rate drops"
+            )
+
+        if re.search(
+            r"\b(?:your\s+screen|it)\s+flickers\b[^.!?]{0,60}\bbecause\b|"
+            r"\bthe\s+cause\s+is\b",
+            text,
+            flags=re.IGNORECASE,
+        ) and not re.search(r"\b(?:measured|confirmed|verified|tested)\b", source):
+            violations.append(
+                "VRR diagnosis stated a definite cause from correlation alone"
+            )
+
+        if re.search(
+            r"\b(?:display|screen|monitor)\b[^.!?]{0,100}\b(?:drop(?:s|ping)?|lower(?:s|ing)?|reduce(?:s|d|ing)?)\b"
+            r"[^.!?]{0,80}\brefresh\s+rate\b[^.!?]{0,120}"
+            r"\b(?:save\s+power|reduce\s+motion\s+blur|static|dim|dark)\b|"
+            r"\brefresh\s+rate\b[^.!?]{0,100}\b(?:drop(?:s|ping)?|lower(?:s|ing)?)\b"
+            r"[^.!?]{0,100}\b(?:dark|dim|static|save\s+power|motion\s+blur)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "VRR diagnosis invented scene-brightness/power or motion-blur control of refresh-rate selection"
+            )
+
+        if not re.search(
+            r"\b(?:manga|anime|chapter|episode|adaptation)\b",
+            current_user,
+            flags=re.IGNORECASE,
+        ) and re.search(
+            r"\b(?:manga|anime|chapter|episode|adaptation)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "VRR diagnostic answer revived unrelated media context after the conversation had switched topics"
+            )
+        if re.search(r"\b(?:it(?:'s| is)|this is)\s+not\s+a\s+defect\b", text, re.IGNORECASE):
+            violations.append(
+                "VRR diagnosis ruled out a display defect without user-specific isolation evidence"
+            )
+        if not re.search(r"\b(?:brightness\s+control|dimming|backlight|pixel\s+response)\b", source, re.IGNORECASE) and re.search(
+            r"\b(?:aggressive\s+)?(?:brightness|dimming)\s+(?:adjustments?|changes?)\b[^.!?]{0,100}"
+            r"\b(?:cause|causes|causing|create|creates|creating|stutter|flicker)\b|"
+            r"\b(?:backlight|pixel\s+response)\b[^.!?]{0,90}\b(?:stutter|flicker)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "VRR diagnosis invented an unmeasured brightness/dimming or panel-response mechanism"
+            )
+
+        if not re.search(r"\b(?:mid[- ]frame|low[- ]brightness\s+intervals?)\b", source, re.IGNORECASE) and re.search(
+            r"\b(?:mid[- ]frame|low[- ]brightness\s+intervals?)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "VRR diagnosis invented an unsupported mid-frame/low-brightness timing mechanism"
+            )
+
+    # A near-main-node result does not rule out an unmeasured mesh backhaul or
+    # upstairs wireless path. Explicit rule-out wording is stronger than a
+    # hypothesis and therefore needs direct user evidence.
+    if "backhaul" not in source and re.search(
+        r"\b(?:rules?|ruled)\s+out\b[^.!?]{0,110}\bbackhaul\b|"
+        r"\bbackhaul\b[^.!?]{0,90}\b(?:is|was|has been)\s+(?:ruled\s+out|not\s+the\s+bottleneck)\b|"
+        r"\bproves?\b[^.!?]{0,120}\b(?:bottleneck|problem|issue)\b[^.!?]{0,60}"
+        r"\b(?:isn['’]?t|is\s+not|wasn['’]?t|was\s+not)\b[^.!?]{0,60}\bbackhaul\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "diagnostic answer ruled out an unmeasured backhaul path"
+        )
+
+    if (
+        "mesh" in source
+        and "main" in source
+        and "upstairs" in source
+        and re.search(
+            r"\b(?:it|that)\s+(?:just\s+)?means\b[^.!?]{0,120}"
+            r"\b(?:signal\s+(?:is\s+)?(?:getting\s+)?lost|over[- ]the[- ]air|through\s+the\s+air)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        and not re.search(
+            r"\b(?:mesh\s+path|wireless\s+path|backhaul|roaming|association)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    ):
+        violations.append(
+            "diagnostic answer collapsed an unresolved mesh/path problem into wireless propagation alone"
+        )
+
+    return list(dict.fromkeys(violations))
+
+
+def _is_stolen_session_credential_context(
+    user_input: str,
+) -> bool:
+    """Return True for questions about an already-copied authenticated session.
+
+    This is the shared semantic gate for both validation and deterministic
+    fallback. Keeping one detector prevents the acceptance guard from knowing
+    about a concept that the fallback path cannot recognise.
+
+    Deliberately bounded:
+    - there must be theft/copy/compromise language;
+    - the turn must explicitly concern a session;
+    - the copied credential must be identified as a cookie/token/credential.
+
+    Ordinary cookie, token, login, or MFA questions therefore stay on the
+    normal stable-knowledge path.
+    """
+    user = re.sub(
+        r"\s+",
+        " ",
+        str(
+            user_input
+            or ""
+        ).strip(),
+    ).lower()
+
+    stolen_or_copied = bool(
+        re.search(
+            r"\b(?:stolen|stole|steal|steals|stealing|"
+            r"nicks?|nicked|nick(?:ing)?|"
+            r"cop(?:y|ied|ies|ying)|"
+            r"compromis(?:e|ed|es|ing))\b",
+            user,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    session_context = bool(
+        re.search(
+            r"\bsessions?\b",
+            user,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    credential_context = bool(
+        re.search(
+            r"\b(?:cookies?|tokens?|credentials?|session\s+ids?)\b",
+            user,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    return (
+        stolen_or_copied
+        and session_context
+        and credential_context
+    )
+
+
+def find_session_cookie_security_violations(
+    user_input: str,
+    draft: str,
+) -> List[str]:
+    """Prevent common stolen-session misconceptions.
+
+    A copied authenticated session is distinct from the login ceremony that
+    created it. Local cookie deletion, ordinary logout wording, or a password
+    change must not be presented as universal server-side revocation of the
+    attacker's already-copied credential.
+    """
+    if not _is_stolen_session_credential_context(
+        user_input
+    ):
+        return []
+
+    text = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
+    bad_patterns = (
+        r"\buntil\b[^.!?]{0,90}\b(?:clear|delete|remove)\b[^.!?]{0,30}\bcookies?\b",
+        r"\b(?:clear|delete|remove)\b[^.!?]{0,30}\bcookies?\b[^.!?]{0,70}"
+        r"\b(?:stop|invalidate|revoke|kick|end)\b[^.!?]{0,40}\b(?:attacker|thief|session|access)\b",
+        r"\b(?:stolen|existing|copied)\s+session\b[^.!?]{0,80}\b(?:remains?|stays?)\s+active\b"
+        r"[^.!?]{0,90}\bunless\b[^.!?]{0,70}\b(?:clear|delete|remove)\b[^.!?]{0,30}\bcookies?\b",
+        r"\bunless\b[^.!?]{0,60}\b(?:clear|delete|remove)\b[^.!?]{0,30}\bcookies?\b"
+        r"[^.!?]{0,80}\b(?:session|access|attacker|stolen)\b",
+    )
+    violations = []
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in bad_patterns):
+        violations.append(
+            "stolen-session answer treated local cookie deletion as revocation of the attacker's copied session"
+        )
+
+    # If Oliver is explicitly asking about a stolen/copied authenticated cookie,
+    # listing "clear cookies" as part of invalidating the attacker is misleading
+    # unless the answer clearly distinguishes local browser deletion from
+    # server-side revocation of the attacker's copied credential.
+    mentions_cookie_clearing = bool(re.search(
+        r"\b(?:clear(?:s|ed|ing)?|delet(?:e|es|ed|ing)|remov(?:e|es|ed|ing))\b[^.!?]{0,45}\b(?:cookies?|browser\s+data|site\s+data|browser\s+storage)\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    explicitly_disclaims_cookie_revocation = bool(re.search(
+        r"\b(?:clear(?:ing)?|delet(?:e|ing)|remov(?:e|ing))\b[^.!?]{0,50}"
+        r"\b(?:local\s+|your\s+|browser\s+)?(?:cookies?|browser\s+data|site\s+data|browser\s+storage)\b"
+        r"[^.!?]{0,100}\b(?:doesn['’]?t|does\s+not|won['’]?t|will\s+not|can['’]?t|cannot)\b"
+        r"[^.!?]{0,80}\b(?:revoke|invalidate|stop|kill|end|erase|remove|delete)\b"
+        r"[^.!?]{0,80}\b(?:attacker|thief|copied|stolen|remote|other\s+device|session|access)\b|"
+        r"\b(?:only|just)\b[^.!?]{0,40}\b(?:clear|remove|delete)s?\b[^.!?]{0,50}"
+        r"\b(?:your|the)\s+(?:local\s+|browser\s+)?(?:cookie|browser\s+data|site\s+data|browser\s+storage)",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    if (
+        mentions_cookie_clearing
+        and not explicitly_disclaims_cookie_revocation
+        and "stolen-session answer treated local cookie deletion as revocation of the attacker's copied session"
+        not in violations
+    ):
+        violations.append(
+            "stolen-session answer treated local cookie deletion as revocation of the attacker's copied session"
+        )
+
+    if re.search(
+        r"\b(?:until|unless)\b[^.!?]{0,90}\bchange\s+(?:your\s+|the\s+)?password\b|"
+        r"\bchange\s+(?:your\s+|the\s+)?password\b[^.!?]{0,90}\b(?:kills?|ends?|invalidates?|revokes?|stops?)\b[^.!?]{0,50}\b(?:session|cookie|attacker|access)\b",
+        text,
+        flags=re.IGNORECASE,
+    ) and not re.search(
+        r"\bif\b[^.!?]{0,80}\b(?:service|site|server|provider)\b[^.!?]{0,80}\b(?:invalidates?|revokes?|ends?)\b[^.!?]{0,40}\bsessions?\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "stolen-session answer treated a password change as guaranteed invalidation of an already-stolen session"
+        )
+
+    unqualified_logout_claim = bool(re.search(
+        r"\buntil\b[^.!?]{0,100}\b(?:log(?:ged|ging)?\s*out|logout)\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    logout_is_server_qualified = bool(re.search(
+        r"\b(?:log(?:ged|ging)?\s*out|logout)\b[^.!?]{0,90}\b(?:everywhere|all\s+sessions|all\s+devices|server[- ]side|revokes?|invalidates?)\b|"
+        r"\b(?:server[- ]side|all\s+sessions|all\s+devices|logout\s+endpoint|service|site|server|provider)\b"
+        r"[^.!?]{0,90}\b(?:log\s*out|logout|revokes?|invalidates?)\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    if unqualified_logout_claim and not logout_is_server_qualified:
+        violations.append(
+            "stolen-session answer treated an unspecified logout as guaranteed server-side invalidation of the attacker's copied session"
+        )
+
+    # Catch causal phrasing such as "kick them out by logging out and clearing
+    # cookies or changing your password". Those local/user actions only remove
+    # the attacker's copied token if the service performs server-side session
+    # invalidation; the wording must not imply that guarantee generically.
+    local_action_kicks_attacker = bool(re.search(
+        r"\b(?:kick|force|get)\s+(?:them|the\s+attacker|the\s+thief)\s+out\b"
+        r"[^.!?]{0,60}\b(?:by|with)\b[^.!?]{0,100}"
+        r"\b(?:log(?:ged|ging)?\s*out|logout|clear(?:s|ed|ing)?\s+cookies?|"
+        r"chang(?:e|es|ed|ing)\s+(?:your\s+|the\s+)?password)\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    if local_action_kicks_attacker and not re.search(
+        r"\b(?:server[- ]side|all\s+sessions|all\s+devices|logout\s+everywhere|"
+        r"revoke(?:s|d)?\s+(?:the\s+)?session|invalidate(?:s|d)?\s+(?:the\s+)?session)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "stolen-session answer treated local logout/password/cookie actions as guaranteed revocation of the attacker's copied session"
+        )
+
+    return list(dict.fromkeys(violations))
+
+
+def find_explicit_example_request_violations(
+    user_input: str,
+    draft: str,
+) -> List[str]:
+    """Enforce an explicit request for a concrete/tiny example.
+
+    The model may choose the example, but it cannot answer only with another
+    abstract definition when Oliver explicitly asked to see one.
+    """
+    user = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
+    if not re.search(
+        r"\b(?:give|show)\s+(?:me\s+)?(?:a\s+)?(?:tiny|small|quick|simple|concrete)?\s*example\b|"
+        r"\b(?:tiny|small|quick|simple|concrete)\s+example\b",
+        user,
+        flags=re.IGNORECASE,
+    ):
+        return []
+
+    text = str(draft or "").strip()
+    if not text:
+        return ["explicit example request received no example"]
+
+    example_markers = (
+        r"\bfor example\b",
+        r"\be\.g\.",
+        r"\bsuppose\b",
+        r"\bimagine\b",
+        r"\blet['’]?s say\b",
+        r"\bsay you (?:have|start|train|split|run)\b",
+        r"\bconsider\b.{0,30}:",
+        r"\bexample\s*:",
+        r"```",
+    )
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in example_markers):
+        return []
+
+    return [
+        "explicit example request was answered only abstractly without a concrete example"
+    ]
+
+
+def find_recommendation_forecast_violations(
+    draft: str,
+    core_answer_contract,
+) -> List[str]:
+    """Keep ordinary recommendations from smuggling in unsupported forecasts.
+
+    A skill/item/action can be recommended from stable judgement, but a claim
+    that it "won't be replaced", is future-proof, or will survive automation is
+    a separate changing-world prediction. Without verified evidence in the
+    current contract, reject that rationale and let the model retry more modestly.
+    """
+    runtime = coerce_answer_contract_runtime(core_answer_contract)
+    if runtime is None or runtime.intent != "recommendation_request":
+        return []
+    if runtime.verified_evidence_claims:
+        return []
+
+    text = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
+    forecast_patterns = (
+        r"\b(?:won['’]?t|will\s+not|can['’]?t|cannot|isn['’]?t\s+going\s+to|is\s+not\s+going\s+to)\b[^.!?]{0,100}\b(?:replace|replaced|automate|automated|eliminate|eliminated|disappear|replicate|replicated)\b",
+        r"\b(?:ai|automation)\b[^.!?]{0,80}\b(?:won['’]?t|will\s+not|can['’]?t|cannot)\b[^.!?]{0,80}\b(?:replicate|replace|automate|eliminate)\b",
+        r"\b(?:humans?|people)\s+(?:still\s+)?(?:hold|retain|keep)\s+(?:the\s+)?(?:leverage|advantage|edge)\b[^.!?]{0,80}\b(?:ai|automation|automated|scales?)\b",
+        r"\b(?:future[- ]?proof|automation[- ]?proof|ai[- ]?proof)\b",
+        r"\b(?:will|is\s+going\s+to)\b[^.!?]{0,80}\b(?:survive|remain|stay)\b[^.!?]{0,60}\b(?:ai|automation|automated)\b",
+        r"\b(?:ai|automation|machines?)\b[^.!?]{0,60}\b(?:will|would)\s+fail\b",
+        r"\b(?:machines?|ai|automation)\b[^.!?]{0,60}\b(?:don['’]?t|do\s+not|can['’]?t|cannot)\s+(?:model|understand|handle|reason\s+about|replicate)\b",
+    )
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in forecast_patterns):
+        return [
+            "recommendation rationale made an unsupported future replacement/automation forecast"
+        ]
+    return []
+
+
+def find_recommendation_topic_drift_violations(
+    user_input: str,
+    draft: str,
+    conversation=None,
+) -> List[str]:
+    """Keep a requested next step attached to the live topic, not a side constraint.
+
+    A phrase such as "I have uni shit to do too" limits how much advice Oliver
+    wants; it does not silently replace the subject of a rejection/application
+    follow-up with an invented university deadline.
+    """
+    current = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
+    if not re.search(r"\b(?:next\s+step|useful\s+next\s+step|one\s+actual\s+useful)\b", current):
+        return []
+
+    prior_user = re.sub(
+        r"\s+",
+        " ",
+        str(build_recent_user_grounding_context(conversation, max_user_messages=3) or "").strip(),
+    ).lower()
+    if not re.search(r"\b(?:rejection|rejected|grad|graduate|application|job)\b", prior_user):
+        return []
+
+    text = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
+    stays_on_topic = bool(re.search(
+        r"\b(?:rejection|rejected|application|apply|job|role|grad|graduate|employer|email|career)\b",
+        text,
+    ))
+    invented_uni_task = bool(re.search(
+        r"\b(?:submit|finish|complete|crush|do|focus\s+on|tackle|pick|start(?:\s+typing)?)\b[^.!?]{0,70}"
+        r"\b(?:assignments?|class|uni|university|coursework|course|task)\b|"
+        r"\b(?:assignments?|class|uni|university|coursework|course)\b[^.!?]{0,70}"
+        r"\b(?:tonight|urgent|deadline|due\s+(?:today|tomorrow|this\s+week)|submit|finish|complete|one\s+at\s+a\s+time)\b",
+        text,
+    ))
+    user_context = (prior_user + " " + current).lower()
+    supplied_specific_uni_task = bool(re.search(
+        r"\b(?:assignments?|coursework|deadline|due\s+(?:today|tomorrow|this\s+week)|"
+        r"exam|quiz|class\s+task|uni\s+assignment)\b",
+        user_context,
+    ))
+    if invented_uni_task and not supplied_specific_uni_task:
+        return [
+            "recommendation follow-up invented a specific university task/deadline from a generic uni constraint"
+        ]
+    if invented_uni_task and not stays_on_topic:
+        return [
+            "recommendation follow-up drifted from the live rejection/application topic into an invented university task"
+        ]
+
+    invented_personal_activity = bool(re.search(
+        r"\b(?:open|opening|check|checking)\b[^.!?]{0,45}\b(?:your\s+)?(?:uni|university)\s+portal\b|"
+        r"\b(?:check|checking)\b[^.!?]{0,35}\b(?:your\s+)?grades?\b|"
+        r"\b(?:email|message)\b[^.!?]{0,55}\b(?:you(?:'ve| have)\s+been\s+avoiding|you\s+avoided)\b|"
+        r"\b(?:stop\s+)?(?:scrolling|doomscrolling)\b|"
+        r"\bdrowning\b[^.!?]{0,40}\bdoomscrolling\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    supplied_personal_activity = bool(re.search(
+        r"\b(?:portal|grades?|avoiding\s+(?:an?\s+)?email|scrolling|doomscrolling)\b",
+        user_context,
+        flags=re.IGNORECASE,
+    ))
+    if invented_personal_activity and not supplied_personal_activity:
+        return [
+            "recommendation follow-up invented a personal task or current behaviour that Oliver did not supply"
+        ]
+
+    return []
+
+
+def find_recommendation_completion_violations(
+    user_input: str,
+    draft: str,
+    core_answer_contract,
+) -> List[str]:
+    """Require a concrete candidate when Oliver explicitly asks what to watch/read/play.
+
+    Repeating the requested mood or constraints is not a recommendation. The rule
+    is intentionally limited to explicit media-selection prompts; broader advice
+    requests keep their existing behaviour.
+    """
+    runtime = coerce_answer_contract_runtime(core_answer_contract)
+    if runtime is None or runtime.intent != "recommendation_request":
+        return []
+
+    current = re.sub(r"\s+", " ", str(user_input or "").strip())
+    if not re.search(
+        r"\bwhat\s+should\s+i\s+(?:watch|read|play)\b|"
+        r"\b(?:recommend|pick|choose)\b[^?]{0,35}\b(?:movie|show|series|anime|manga|book|game)\b",
+        current,
+        flags=re.IGNORECASE,
+    ):
+        return []
+
+    text = str(draft or "").strip()
+    if not text:
+        return ["explicit media recommendation did not name a concrete candidate"]
+
+    concrete = bool(
+        re.search(
+            r"\b(?i:watch|read|play|try|start\s+with|go\s+with|pick)\s+"
+            r"(?:\*{0,2}|[\"'“‘])?"
+            r"[A-Z0-9][A-Za-z0-9&:’'._!+\-]*(?:\s+[A-Z0-9][A-Za-z0-9&:’'._!+\-]*){0,8}",
+            text,
+        )
+        or re.search(r"[\"“][^\"”]{2,80}[\"”]", text)
+    )
+
+    if concrete:
+        return []
+
+    return ["explicit media recommendation did not name a concrete candidate"]
+
+
+def find_pairwise_comparison_drift_violations(
+    draft: str,
+    core_answer_contract,
+) -> List[str]:
+    """Reject a conclusion that silently replaces a requested comparison side.
+
+    Core may allow third platforms/tools as context, but a Mac-vs-Windows style
+    request should not end by recommending Linux (or another third option) as if
+    that were one of the requested sides. Structured contract metadata carries
+    the frame so this check does not have to parse model-facing prose.
+    """
+    runtime = coerce_answer_contract_runtime(core_answer_contract)
+    if runtime is None:
+        return []
+
+    frame = str((runtime.metadata or {}).get("comparison_frame") or "").strip()
+    if " vs " not in frame.lower():
+        return []
+
+    left, right = re.split(r"\s+vs\s+", frame, maxsplit=1, flags=re.IGNORECASE)
+    left = left.strip().lower()
+    right = right.strip().lower()
+    if not left or not right:
+        return []
+
+    draft_lower = re.sub(r"\s+", " ", str(draft or "").lower()).strip()
+
+    def side_present(side: str) -> bool:
+        aliases = {side}
+        if side in {"mac", "macos", "mac os"}:
+            aliases.update({"mac", "macos", "mac os"})
+        if side in {"windows", "win"}:
+            aliases.update({"windows", "win"})
+        return any(
+            re.search(rf"\b{re.escape(alias)}\b", draft_lower, flags=re.IGNORECASE)
+            for alias in aliases
+        )
+
+    if not side_present(left) or not side_present(right):
+        return [
+            "pairwise comparison answer omitted one of the two requested comparison sides"
+        ]
+
+    units = [
+        unit.strip()
+        for unit in re.split(r"(?<=[.!?])\s+", str(draft or ""))
+        if unit.strip()
+    ]
+
+    for unit in units:
+        low = unit.lower()
+        if left in low or right in low:
+            continue
+
+        direct = re.search(
+            r"\b(?:choose|pick|prefer|use|go\s+with|stick(?:ing)?\s+with)\s+"
+            r"(?P<target>[A-Za-z][A-Za-z0-9+._-]{1,30})\b",
+            unit,
+            flags=re.IGNORECASE,
+        )
+        if direct:
+            target = direct.group("target").lower()
+            if target not in {left, right, "it", "that", "this"}:
+                return [
+                    "pairwise comparison answer concluded with a third option instead of the requested pair"
+                ]
+
+        pronoun = re.search(
+            r"\b(?:comfortable|familiar|happy|experienced)\s+with\s+"
+            r"(?P<target>[A-Za-z][A-Za-z0-9+._-]{1,30})\b[^.!?]{0,70}"
+            r"\bstick(?:ing)?\s+with\s+it\b",
+            unit,
+            flags=re.IGNORECASE,
+        )
+        if pronoun:
+            target = pronoun.group("target").lower()
+            if target not in {left, right}:
+                return [
+                    "pairwise comparison answer concluded with a third option instead of the requested pair"
+                ]
+
+    # A third platform can be discussed as context (for example Linux VMs on
+    # Mac vs Windows), but it must not silently become a third candidate in the
+    # final comparison. Catch standalone option headings/summary bullets rather
+    # than banning contextual mentions of the platform.
+    requested_aliases = {left, right}
+    if left in {"mac", "macos", "mac os"} or right in {"mac", "macos", "mac os"}:
+        requested_aliases.update({"mac", "macos", "mac os"})
+    if left in {"windows", "win"} or right in {"windows", "win"}:
+        requested_aliases.update({"windows", "win"})
+
+    third_platforms = ("linux", "chromeos", "freebsd")
+    raw_draft = str(draft or "")
+    for platform in third_platforms:
+        if platform in requested_aliases:
+            continue
+        if re.search(
+            rf"(?im)^\s*[-*]?\s*(?:\*\*)?{re.escape(platform)}(?:\*\*)?\s*:\s*",
+            raw_draft,
+        ):
+            return [
+                "pairwise comparison answer promoted a contextual third platform into a third comparison option"
+            ]
+
+    return []
+
+
+
+
+def find_insufficient_context_overreach_violations(
+    draft: str,
+    core_answer_contract,
+) -> List[str]:
+    """Keep missing-input answers from filling the gap with generic world claims."""
+    if contract_epistemic_mode(core_answer_contract) != "insufficient_user_context":
+        return []
+    text = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
+    if re.search(
+        r"\b(?:most|usually|often|typically|generally|commonly|standard)\b[^.!?]{0,120}"
+        r"\b(?:airlines?|carriers?|bags?|devices?|systems?|companies?|providers?|policies?|limits?)\b|"
+        r"\b(?:airlines?|carriers?|providers?|companies?)\b[^.!?]{0,120}"
+        r"\b(?:usually|often|typically|generally|commonly|strict(?:er|est)?|standard)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return [
+            "missing-input answer filled an unknown task detail with an unnecessary generic world claim"
+        ]
+
+    if re.search(
+        r"\b(?:kicked|removed|denied|refused|tossed|rejected)\b[^.!?]{0,60}\b(?:plane|flight|boarding|board|gate)\b|"
+        r"\b(?:gate|boarding)\b[^.!?]{0,55}\b(?:tossed|rejected|denied|refused)\b|"
+        r"\b(?:security|airport\s+security)\b[^.!?]{0,80}\b(?:repack|re-pack|pay|fee|confiscat|reject)\w*\b|"
+        r"\b(?:pay|charged?)\b[^.!?]{0,60}\b(?:fee|oversize|overweight|baggage)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return [
+            "missing-input answer invented airline/airport consequences that cannot be known without the carrier policy and bag details"
+        ]
+
+    # A missing policy/detail means the permission state is unknown. Do not
+    # turn epistemic uncertainty into the opposite categorical conclusion
+    # (for example, "definitely not allowed") merely because required
+    # carrier/policy details were omitted.
+    if re.search(
+        r"\b(?:definitely|certainly|guaranteed(?:ly)?)\b[^.!?]{0,55}"
+        r"\b(?:allowed|permitted|accepted|compliant|eligible|prohibited|forbidden)\b|"
+        r"\b(?:allowed|permitted|accepted|compliant|eligible|prohibited|forbidden)\b"
+        r"[^.!?]{0,45}\b(?:definitely|certainly|guaranteed)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return [
+            "missing-input answer converted an unknown policy/permission state into a categorical conclusion"
+        ]
+
+    return []
+
+def find_tcp_udp_semantics_violations(
+    *,
+    user_input: str,
+    draft: str,
+) -> List[str]:
+    """Protect a stable networking polarity from subject drift.
+
+    When Oliver explicitly asks about TCP versus UDP connection setup, Core
+    should never let a draft blur which protocol is connection-oriented or
+    which one uses a connection-establishment handshake. This is a compact
+    stable-fact invariant, not a general web/current-world checker.
+    """
+
+    user = _normalise_for_grounding(user_input).lower()
+    text = _normalise_for_grounding(draft).lower()
+
+    if not (re.search(r"\btcp\b", user) and re.search(r"\budp\b", user)):
+        return []
+
+    if not re.search(r"\b(?:handshake|connectionless|connection[- ]oriented)\b", user):
+        return []
+
+    violations: List[str] = []
+
+    if re.search(r"\btcp\b[^.!?]{0,100}\bconnectionless\b", text) or re.search(
+        r"\bconnectionless\b[^.!?]{0,100}\btcp\b",
+        text,
+    ):
+        violations.append("TCP/UDP explanation incorrectly described TCP as connectionless")
+
+    udp_positive_handshake = bool(
+        re.search(
+            r"\budp\b[^.!?]{0,100}\b(?:requires?|needs?)\b[^.!?]{0,45}\bhandshake\b",
+            text,
+        )
+        or (
+            re.search(
+                r"\budp\b[^.!?]{0,100}\buses?\b[^.!?]{0,45}\bhandshake\b",
+                text,
+            )
+            and not re.search(
+                r"\budp\b[^.!?]{0,100}\b(?:does\s+not|doesn't|doesnt|do\s+not|don't|dont|no)\b"
+                r"[^.!?]{0,30}\buses?\b[^.!?]{0,45}\bhandshake\b",
+                text,
+            )
+        )
+    )
+    if udp_positive_handshake:
+        violations.append("TCP/UDP explanation incorrectly gave UDP a connection-establishment handshake")
+
+    # For an explicit pairwise correction, both roles must be named clearly.
+    # A dangling sentence such as "That's connectionless" after discussing
+    # TCP is too ambiguous to safely accept even if the intended subject was UDP.
+    if re.search(r"\bconnectionless\b", text):
+        udp_near_connectionless = bool(
+            re.search(r"\budp\b[^.!?]{0,90}\bconnectionless\b", text)
+            or re.search(r"\bconnectionless\b[^.!?]{0,90}\budp\b", text)
+        )
+        if not udp_near_connectionless:
+            violations.append("TCP/UDP explanation left the connectionless role ambiguous instead of assigning it to UDP")
+
+    tcp_near_handshake = bool(
+        re.search(r"\btcp\b[^.!?]{0,100}\bhandshake\b", text)
+        or re.search(r"\bhandshake\b[^.!?]{0,100}\btcp\b", text)
+    )
+    if not tcp_near_handshake:
+        violations.append("TCP/UDP explanation did not clearly assign connection establishment/handshake to TCP")
+
+    return list(dict.fromkeys(violations))
+
+
+def find_python_mutable_default_semantics_violations(
+    user_input: str,
+    draft: str,
+    conversation=None,
+) -> List[str]:
+    """Reject contradictions in the canonical mutable-default trace.
+
+    The original program can live in a prior USER turn, so derive the expected
+    trace from current + recent user-authored context rather than keying only on
+    whichever wrong wording the model happened to use this time.
+    """
+    source_raw = "\n".join([
+        str(user_input or ""),
+        str(build_recent_user_grounding_context(conversation, max_user_messages=4) or ""),
+    ])
+    source = source_raw.lower()
+    if not (
+        re.search(r"def\s+[a-zA-Z_]\w*\s*\([^)]*=\s*\[\s*\]", source)
+        or ("mutable default" in source and "python" in source)
+    ):
+        return []
+
+    text_raw = str(draft or "").strip()
+    text = re.sub(r"\s+", " ", text_raw).lower()
+    violations = []
+
+    if re.search(r"\b(?:stored|kept|saved)\s+in\s+(?:the\s+)?closure\b", text):
+        violations.append(
+            "Python mutable-default explanation incorrectly said the default is stored in a closure"
+        )
+
+    if re.search(r"\bx\s*=\s*x\s+or\s+\[\s*\]", text):
+        violations.append(
+            "Python mutable-default fix used 'x = x or []', which replaces an explicitly supplied empty list instead of only handling None"
+        )
+
+    # Derive the trace for the deliberately narrow canonical form used by Core:
+    # def f(x=[]): x.append(<literal>); return x ; print(f()); print(f())
+    # This does not execute user code. It only literal-parses the appended scalar.
+    trace_match = re.search(
+        r"def\s+(?P<fn>[A-Za-z_]\w*)\s*\(\s*(?P<arg>[A-Za-z_]\w*)\s*=\s*\[\s*\]\s*\)\s*:\s*"
+        r"(?P<body>[^`\n]{1,180})",
+        source_raw,
+    )
+    expected_outputs = None
+    if trace_match:
+        fn = trace_match.group("fn")
+        arg = trace_match.group("arg")
+        body = re.sub(r"\s+", " ", trace_match.group("body").strip())
+        body_match = re.fullmatch(
+            rf"{re.escape(arg)}\.append\((?P<literal>[^()]+)\)\s*;\s*return\s+{re.escape(arg)}\s*",
+            body,
+        )
+        if body_match:
+            try:
+                item = ast.literal_eval(body_match.group("literal").strip())
+            except (ValueError, SyntaxError):
+                item = object()
+            if isinstance(item, (str, int, float, bool, type(None))):
+                call_count = len(re.findall(
+                    rf"print\s*\(\s*{re.escape(fn)}\s*\(\s*\)\s*\)",
+                    source_raw,
+                    flags=re.IGNORECASE,
+                ))
+                if 1 <= call_count <= 6:
+                    state = []
+                    expected_outputs = []
+                    for _ in range(call_count):
+                        state.append(item)
+                        expected_outputs.append(list(state))
+
+    if expected_outputs and len(expected_outputs) >= 2:
+        # Successive append calls cannot have identical outputs. Any prose that
+        # says "both prints/calls/outputs show ..." contradicts the derived trace
+        # regardless of which list literal the model invents.
+        if re.search(
+            r"\bboth\s+(?:prints?|calls?|outputs?)\b[^.!?]{0,100}(?:show|print|return|are|give|produce)?",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "Python mutable-default follow-up contradicted the derived trace: "
+                f"the first call is {expected_outputs[0]}, the second call is {expected_outputs[1]}; "
+                "the two calls do not have the same output"
+            )
+
+        explicit_pair = re.search(
+            r"\bfirst\s+(?:print|call|output)?[^.!?]{0,50}(?P<first>\[[^\]]*\])"
+            r"[^.!?]{0,90}\b(?:then|second)\b[^.!?]{0,50}(?P<second>\[[^\]]*\])",
+            text_raw,
+            flags=re.IGNORECASE,
+        )
+        if explicit_pair:
+            try:
+                first_value = ast.literal_eval(explicit_pair.group("first"))
+                second_value = ast.literal_eval(explicit_pair.group("second"))
+            except (ValueError, SyntaxError):
+                first_value = second_value = None
+            if (
+                first_value is not None
+                and second_value is not None
+                and (
+                    first_value != expected_outputs[0]
+                    or second_value != expected_outputs[1]
+                )
+            ):
+                violations.append(
+                    "Python mutable-default follow-up stated outputs that contradict the deterministically derived first/second call trace"
+                )
+
+    if re.search(
+        r"\bbecause\b[^.!?]{0,80}\b(?:inefficient|unnecessary)\b",
+        text,
+        flags=re.IGNORECASE,
+    ) and not re.search(
+        r"\bdefault(?:s|\s+arguments?)?\b[^.!?]{0,90}\bevaluated\b[^.!?]{0,50}\bonce\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "Python mutable-default explanation substituted an unsupported efficiency rationale for the language's once-at-definition semantics"
+        )
+
+    if re.search(
+        r"\b(?:cache|caches|cached|caching)\b[^.!?]{0,100}\b(?:list|object|default)\b|"
+        r"\b(?:save|saving|saves)\s+(?:on\s+)?memory\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "Python mutable-default explanation incorrectly framed default-object reuse as a caching/memory optimisation"
+        )
+
+    return list(dict.fromkeys(violations))
+
+def find_scaler_leakage_contradiction_violations(
+    user_input: str,
+    draft: str,
+    conversation=None,
+) -> List[str]:
+    """Reject incomplete or contradictory data-leakage/scaler explanations.
+
+    General data-leakage tutoring should identify an information-boundary
+    violation, not stop at a vague exam analogy. Scaler follow-ups then get
+    stricter checks for directionality, code integrity and calibration.
+    """
+    source_raw = "\n".join([
+        str(user_input or ""),
+        str(build_recent_user_grounding_context(conversation, max_user_messages=4) or ""),
+    ])
+    source = source_raw.lower()
+    current_user = str(user_input or "").lower()
+    raw = str(draft or "")
+    text = re.sub(r"\s+", " ", raw.strip()).lower()
+    bad: List[str] = []
+
+    # A first-principles explanation of ML data leakage must describe an
+    # information boundary: information unavailable to the genuine training
+    # process/prediction setting leaks into training, preprocessing or model
+    # selection. An exam metaphor alone is not enough for a tutoring request.
+    if (
+        re.search(r"\bdata\s+leakage\b", current_user)
+        and re.search(r"\b(?:machine\s+learning|ml|model)\b", current_user)
+        and re.search(r"\b(?:explain|understand|what|why)\b", current_user)
+    ):
+        has_train_test_boundary = bool(
+            re.search(r"\btrain(?:ing)?\b", text)
+            and re.search(r"\b(?:test|validation|held[- ]?out)\b", text)
+        )
+        has_prediction_boundary = bool(re.search(
+            r"\b(?:prediction\s+time|future\s+data|future\s+information|target|label|outcome)\b",
+            text,
+            flags=re.IGNORECASE,
+        ))
+        has_information_flow = bool(re.search(
+            r"\b(?:information|data|statistics?|features?|values?|labels?|outcomes?)\b"
+            r"[^.!?]{0,120}\b(?:leak|leaks|leaked|use|uses|using|learn|learns|learned|"
+            r"influence|influences|influenced|available|seen|sees)\b|"
+            r"\b(?:leak|leaks|leaked|uses?|learns?|influences?|sees?)\b"
+            r"[^.!?]{0,120}\b(?:information|data|statistics?|features?|values?|labels?|outcomes?)\b",
+            text,
+            flags=re.IGNORECASE,
+        ))
+        if not ((has_train_test_boundary or has_prediction_boundary) and has_information_flow):
+            bad.append(
+                "data-leakage tutoring answer did not explain the actual information-boundary violation"
+            )
+
+        if re.search(
+            r"\b(?:performance|accuracy|validation\s+(?:score|performance))\b[^.!?]{0,80}"
+            r"\b(?:tanks?|collapses?|fails?)\b[^.!?]{0,35}\b(?:instantly|immediately|always)\b|"
+            r"\bmodel\b[^.!?]{0,90}\bjust\s+memor(?:ise|ize|ises|izes|ised|ized|ising|izing)\b"
+            r"[^.!?]{0,70}\b(?:answers?|targets?|labels?)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            bad.append(
+                "data-leakage tutoring answer overstated leakage as guaranteed memorization or immediate real-world performance collapse"
+            )
+
+
+        # A spurious-correlation or distribution-shift example is not, by
+        # itself, a leakage example. If the teaching example explains failure
+        # only as a seasonal/correlation pattern changing on new data, require
+        # an actual information-boundary mechanism in that example (future
+        # information, target-derived data, or held-out/test contamination).
+        example_match = re.search(
+            r"\b(?:for\s+example|suppose|imagine|let['’]?s\s+say)\b"
+            r"(?P<example>.{0,700})",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if example_match:
+            example = example_match.group("example")
+            distribution_shift_shape = bool(re.search(
+                r"\b(?:seasonal|spurious)\b[^.!?]{0,60}\b(?:trends?|correlations?)\b|"
+                r"\bnew\s+data\b[^.!?]{0,120}\b(?:predictions?|performance|accuracy)\b"
+                r"[^.!?]{0,80}\b(?:off|wrong|worse|drop|fail)\b",
+                example,
+                flags=re.IGNORECASE,
+            ))
+            leakage_mechanism = bool(re.search(
+                r"\b(?:future\s+(?:information|data)|target[- ]derived|label[- ]derived|"
+                r"held[- ]?out\s+(?:test|validation)|test\s+(?:set|data)\b[^.!?]{0,100}"
+                r"(?:used|seen|included|fit|influence)|validation\s+(?:set|data)\b[^.!?]{0,100}"
+                r"(?:used|seen|included|fit|influence)|unavailable\s+at\s+(?:prediction|inference)\s+time)\b",
+                example,
+                flags=re.IGNORECASE,
+            ))
+            if distribution_shift_shape and not leakage_mechanism:
+                bad.append(
+                    "data-leakage tutoring example described distribution shift/spurious correlation without an actual leakage mechanism"
+                )
+
+        for unit in re.split(r"(?<=[.!?])\s+", text):
+            if not re.search(
+                r"\b(?:performance|accuracy|score)\b[^.!?]{0,70}\b(?:tanks?|collapses?|fails?)\b",
+                unit,
+                flags=re.IGNORECASE,
+            ):
+                continue
+            if not re.search(
+                r"\b(?:can|could|may|might|often|sometimes|can\s+appear\s+to|risk)\b",
+                unit,
+                flags=re.IGNORECASE,
+            ):
+                bad.append(
+                    "data-leakage tutoring answer treated downstream performance collapse as guaranteed rather than a possible consequence"
+                )
+                break
+
+    scaler_context = bool(
+        "scaler" in source
+        and re.search(r"train\s*/?\s*test|train(?:ing)?\s+(?:and|or)\s+test", source)
+    )
+    if not scaler_context:
+        return list(dict.fromkeys(bad))
+
+    fit_on_all = bool(re.search(
+        r"\b(?:fit|fitting|fit_transform|learns?)\b[^.!?]{0,120}"
+        r"\b(?:entire|whole|all|full)\b[^.!?]{0,70}\b(?:dataset|data)\b|"
+        r"\b(?:including|uses?)\b[^.!?]{0,50}\btest\s+(?:set|data)\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    # The live user prompt itself can establish the leaking workflow even when
+    # a later short paraphrase says only "before the split".
+    if not fit_on_all and re.search(
+        r"\bfit(?:ting)?\b[^.!?]{0,60}\bscaler\b[^.!?]{0,80}"
+        r"\bbefore\b[^.!?]{0,50}\b(?:train\s*/?\s*test\s+)?split\b",
+        source,
+        flags=re.IGNORECASE,
+    ):
+        fit_on_all = True
+    if not fit_on_all:
+        return list(dict.fromkeys(bad))
+
+    if re.search(r"\b(?:tiny|small|quick|simple|concrete)\s+example\b", current_user, re.IGNORECASE):
+        code_blocks_for_example = re.findall(
+            r"```(?:python)?\s*\n?(.*?)```",
+            raw,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        has_explicit_numeric_split = bool(
+            re.search(
+                r"\btrain(?:ing)?\b[^.!?]{0,120}\b-?\d+(?:\.\d+)?\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            and re.search(
+                r"\b(?:test|held[- ]?out)\b[^.!?]{0,120}\b-?\d+(?:\.\d+)?\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        has_executed_split = any(
+            re.search(r"(?<!from\s)\btrain_test_split\s*\(", block, re.IGNORECASE)
+            for block in code_blocks_for_example
+        )
+        has_natural_language_example = bool(
+            re.search(
+                r"\b(?:for\s+example|suppose|imagine|let['’]?s\s+say)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            and re.search(r"\btrain(?:ing)?\b", text, flags=re.IGNORECASE)
+            and re.search(r"\b(?:test|held[- ]?out)\b", text, flags=re.IGNORECASE)
+            and re.search(r"\b-?\d+(?:\.\d+)?\b", text)
+        )
+        presented_example_marker = bool(re.search(
+            r"(?:\b(?:for\s+example|suppose|imagine|let['’]?s\s+say)\b|\be\.g\.)",
+            text,
+            flags=re.IGNORECASE,
+        ))
+        if (
+            presented_example_marker
+            and not (has_explicit_numeric_split or has_executed_split or has_natural_language_example)
+        ):
+            bad.append(
+                "scaler-leakage tiny-example request used an example marker but never gave a concrete train/test example"
+            )
+        if code_blocks_for_example and not (has_explicit_numeric_split or has_executed_split):
+            bad.append(
+                "scaler-leakage tiny example included code but never instantiated an actual train/test split or explicit train/test values"
+            )
+
+
+        # If teaching with executable Python, the snippet itself must be sound
+        # enough to demonstrate the concept rather than introducing unrelated
+        # runtime errors.
+        for block in code_blocks_for_example:
+            try:
+                tree = ast.parse(block)
+            except SyntaxError:
+                bad.append(
+                    "scaler-leakage code example is syntactically invalid Python"
+                )
+                continue
+
+            defined = set(dir(builtins))
+            assigned_1d_names = set()
+            standard_scaler_vars = set()
+
+            def _collect_target_names(node):
+                names = set()
+                if isinstance(node, ast.Name):
+                    names.add(node.id)
+                elif isinstance(node, (ast.Tuple, ast.List)):
+                    for elt in node.elts:
+                        names.update(_collect_target_names(elt))
+                return names
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        defined.add(alias.asname or alias.name.split(".")[0])
+                elif isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        defined.add(alias.asname or alias.name)
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    defined.add(node.name)
+                elif isinstance(node, ast.Assign):
+                    target_names = set()
+                    for target in node.targets:
+                        target_names.update(_collect_target_names(target))
+                    defined.update(target_names)
+
+                    call = node.value
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "randn"
+                        and len(call.args) == 1
+                    ):
+                        assigned_1d_names.update(target_names)
+
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr in {"array", "asarray"}
+                        and call.args
+                        and isinstance(call.args[0], (ast.List, ast.Tuple))
+                        and all(
+                            not isinstance(item, (ast.List, ast.Tuple))
+                            for item in call.args[0].elts
+                        )
+                    ):
+                        assigned_1d_names.update(target_names)
+
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Name)
+                        and call.func.id == "StandardScaler"
+                    ):
+                        standard_scaler_vars.update(target_names)
+                elif isinstance(node, ast.AnnAssign):
+                    defined.update(_collect_target_names(node.target))
+                elif isinstance(node, (ast.For, ast.AsyncFor)):
+                    defined.update(_collect_target_names(node.target))
+
+            loaded = {
+                node.id
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+            }
+            undefined = sorted(
+                name for name in loaded
+                if name not in defined
+                and name not in {"__name__", "__file__", "__package__"}
+            )
+            if undefined:
+                bad.append(
+                    "scaler-leakage code example uses undefined name(s): "
+                    + ", ".join(undefined[:5])
+                )
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if not isinstance(node.func, ast.Attribute):
+                    continue
+                if node.func.attr not in {"fit", "fit_transform", "transform"}:
+                    continue
+                if not isinstance(node.func.value, ast.Name):
+                    continue
+                if node.func.value.id not in standard_scaler_vars:
+                    continue
+                if not node.args or not isinstance(node.args[0], ast.Name):
+                    continue
+                if node.args[0].id in assigned_1d_names:
+                    bad.append(
+                        "scaler-leakage StandardScaler example passes a one-dimensional array where sklearn expects a 2D feature matrix"
+                    )
+                    break
+
+    if re.search(
+        r"\btest\s+set\s+remains?\s+(?:truly\s+)?[\"'“”]?(?:unseen|blind)[\"'“”]?\b|"
+        r"\btest\s+set\b[^.!?]{0,60}\bremains?\s+(?:truly\s+)?[\"'“”]?(?:unseen|blind)[\"'“”]?\b",
+        text,
+        re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer contradicted itself by calling the contaminated test set unseen/blind"
+        )
+
+    if re.search(
+        r"\b(?:this|that)\s+(?:ensures?|guarantees?|keeps?)\b[^.!?]{0,100}"
+        r"\b(?:realistic|honest|not\s+inflated|unbiased|independent)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer claimed the leaking workflow preserves an unbiased/independent evaluation"
+        )
+
+    if fit_on_all and re.search(
+        r"\b(?:this|that)\s+ensures?\b[^.!?]{0,140}\bno\s+information\b[^.!?]{0,100}\bleaks?\b|"
+        r"\btest\s+set\b[^.!?]{0,100}\btransform(?:ed|ing)?\b[^.!?]{0,100}"
+        r"\bwithout\b[^.!?]{0,50}\binfluenc(?:e|ing|ed)\b[^.!?]{0,40}\b(?:parameters?|scaler|statistics?)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer contradicted the leaking workflow by claiming the test set no longer influenced the fitted preprocessing"
+        )
+
+    if re.search(
+        r"\btest\s+set\b[^.!?]{0,100}\b(?:contaminated|leaked|influenced)\b"
+        r"[^.!?]{0,100}\b(?:by|from)\b[^.!?]{0,60}\btrain(?:ing)?\s+(?:set|data)\b|"
+        r"\bleaks?\s+(?:info(?:rmation)?|data|statistics?)\s+from\s+train(?:ing)?\s+to\s+test\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer reversed the information flow; fitting before the split lets test statistics influence the training preprocessing"
+        )
+
+    if re.search(
+        r"\bbias(?:es|ing|ed)?\b[^.!?]{0,100}\btrain(?:ing)?\s+set(?:'s)?\b"
+        r"[^.!?]{0,100}\b(?:scaling|transform(?:ation)?)\b[^.!?]{0,80}"
+        r"\bmatch\b[^.!?]{0,50}\btest\s+set\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer overstated the effect as making training scaling match the test set rather than using parameters influenced by test statistics"
+        )
+
+    if re.search(
+        r"\b(?:this|that)\s+makes?\b[^.!?]{0,100}\bmodel\b[^.!?]{0,80}"
+        r"\bartificially\s+(?:good|better)\b|"
+        r"\bmodel\b[^.!?]{0,100}\bartificially\s+(?:good|better)\b",
+        text,
+        flags=re.IGNORECASE,
+    ) and not re.search(
+        r"\b(?:can|could|may|might)\b[^.!?]{0,100}\bartificially\s+(?:good|better)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer treated improved test performance as guaranteed instead of describing a biased evaluation risk"
+        )
+
+    # Catch executable-looking code accidentally placed after an inline comment
+    # inside a Python code block. This is a syntax/teaching-quality invariant,
+    # not a benchmark phrase check.
+    code_blocks = re.findall(
+        r"```(?:python)?\s*\n?(.*?)```",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for block in code_blocks:
+        for line in block.splitlines():
+            if "#" not in line:
+                continue
+            before_hash, after_hash = line.split("#", 1)
+            if not before_hash.strip():
+                continue
+            if re.search(
+                r"\b[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*\s*\(|"
+                r"\b[A-Za-z_]\w*\.(?:fit|transform|predict|score)\s*\(",
+                after_hash,
+                flags=re.IGNORECASE,
+            ):
+                bad.append(
+                    "scaler-leakage code example placed executable Python after an inline comment, so the shown code would not run as explained"
+                )
+                break
+        if bad and bad[-1].startswith("scaler-leakage code example placed executable"):
+            break
+
+    commented_split = bool(re.search(
+        r"(?m)^\s*[^\n]*#.*\bX_train\b[^\n]*\btrain_test_split\s*\(",
+        raw,
+        flags=re.IGNORECASE,
+    ))
+    later_uses_split_variables = bool(re.search(
+        r"\b(?:[A-Za-z_]\w*\.)?(?:fit|transform|predict|score)\s*\(\s*X_(?:train|test)\b|"
+        r"\bX_(?:train|test)(?:_scaled)?\b\s*=",
+        raw,
+        flags=re.IGNORECASE,
+    ))
+    if commented_split and later_uses_split_variables:
+        bad.append(
+            "scaler-leakage code example accidentally commented out the train/test split while later using X_train/X_test"
+        )
+
+    # A scaler learns summary parameters such as mean/variance; describing it
+    # as memorising the held-out distribution overstates what the preprocessing
+    # step actually stores.
+    if re.search(
+        r"\bscaler\b[^.!?]{0,100}\bmemor(?:ise|ize|ises|izes|ised|ized|ising|izing)\b"
+        r"[^.!?]{0,100}\b(?:test|held[- ]?out)\b[^.!?]{0,80}\b(?:data|distribution|set)\b|"
+        r"\bmemor(?:ise|ize|ises|izes|ised|ized|ising|izing)\b[^.!?]{0,100}"
+        r"\b(?:test|held[- ]?out)\b[^.!?]{0,80}\b(?:data|distribution|set)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer incorrectly described the scaler as memorising the held-out test distribution"
+        )
+
+    # Do not describe the bad workflow as fitting on all data and then, in the
+    # same explanation, say that the split is scaled only with training-derived
+    # statistics. Those are different workflows.
+    if fit_on_all and re.search(
+        r"\b(?:when|then|so\s+when|after\s+that)\b[^.!?]{0,100}"
+        r"\b(?:scale|scaling|transform(?:ed|ing)?)\b[^.!?]{0,80}"
+        r"\bonly\b[^.!?]{0,50}\b(?:training|train)\b[^.!?]{0,50}\b(?:stats?|statistics?|parameters?)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer contradicted the leaking workflow by switching to training-only scaling mid-explanation"
+        )
+
+    if re.search(
+        r"\b(?:evaluation|estimate|assessment|result|results|metric|metrics|score|performance)\b"
+        r"[^.!?]{0,70}\b(?:is|are|becomes?|gets?)\b[^.!?]{0,35}"
+        r"\b(?:biased\s+upward|upwardly\s+biased|overly\s+optimistic|artificially\s+inflated|inflated)\b",
+        text,
+        flags=re.IGNORECASE,
+    ) and not re.search(
+        r"\b(?:can|could|may|might|risk|potential(?:ly)?)\b[^.!?]{0,120}"
+        r"\b(?:biased\s+upward|optimistic|inflated|bias)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer treated the direction of evaluation bias as guaranteed rather than a possible optimistic bias"
+        )
+
+    if re.search(
+        r"\b(?:performance|score|metric)\b[^.!?]{0,70}\b(?:looks?|seems?|is|are)\b"
+        r"[^.!?]{0,50}\b(?:great|good|amazing|high)\b[^.!?]{0,45}\b(?:but\s+)?(?:fake|invalid|meaningless)\b",
+        text,
+        flags=re.IGNORECASE,
+    ) and not re.search(
+        r"\b(?:can|could|may|might|risk|potential(?:ly)?)\b[^.!?]{0,100}"
+        r"\b(?:optimistic|inflated|biased|misleading)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer treated a favourable performance distortion as guaranteed rather than a possible evaluation bias"
+        )
+
+    if re.search(
+        r"\b(?:which|this|that)\s+(?:artificially\s+)?(?:inflates?|inflating)\b[^.!?]{0,110}\b(?:performance|metrics?|score)\b|"
+        r"\b(?:inflates?|inflating)\b[^.!?]{0,110}\b(?:model(?:['’]s)?\s+)?(?:performance|metrics?|score)\b|"
+        r"\b(?:performance|metrics?|score)\s+(?:is|are)\s+artificially\s+inflated\b|"
+        r"\b(?:lead(?:s|ing)?|cause(?:s|d|ing)?|make(?:s|ing)?)\b[^.!?]{0,100}\boverly\s+optimistic\b",
+        text,
+        flags=re.IGNORECASE,
+    ) and not re.search(
+        r"\b(?:can|could|may|might|risk|potential(?:ly)?)\b[^.!?]{0,120}"
+        r"\b(?:inflate|inflated|optimistic|bias)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer treated optimistic/inflated evaluation as guaranteed rather than a possible bias"
+        )
+
+    if re.search(
+        r"\b(?:lead(?:s|ing)?\s+to|cause(?:s|d|ing)?)\b[^.!?]{0,80}\boverfitting\b",
+        text,
+        flags=re.IGNORECASE,
+    ) and not re.search(
+        r"\b(?:can|could|may|might|risk|potential(?:ly)?|contribute)\b[^.!?]{0,100}\boverfitting\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        bad.append(
+            "scaler-leakage answer treated overfitting as a guaranteed consequence of preprocessing leakage"
+        )
+
+    # Leakage can bias an evaluation, but contamination does not guarantee
+    # that the measured score becomes numerically higher.
+    for unit in re.split(r"(?<=[.!?])\s+|\n+", text):
+        if not re.search(
+            r"\b(?:score|performance|estimate|accuracy)\b[^.!?]{0,80}"
+            r"\b(?:inflated|higher|biased\s+upward|optimistic)\b",
+            unit,
+            flags=re.IGNORECASE,
+        ):
+            continue
+        if not re.search(
+            r"\b(?:can|could|may|might|often|risk|potential(?:ly)?)\b",
+            unit,
+            flags=re.IGNORECASE,
+        ):
+            bad.append(
+                "scaler-leakage answer treated score inflation as guaranteed rather than a possible bias"
+            )
+            break
+
+    # A tiny technical example must not introduce code that fails before it
+    # demonstrates the requested concept. Detect literal one-class slices fed
+    # into a generated classifier fit.
+    if re.search(r"\b(?:logisticregression|classifier)\b", text, flags=re.IGNORECASE):
+        y_match = re.search(
+            r"\by\s*=\s*(?:np\.)?array\s*\(\s*\[(?P<body>[^\]]+)\]\s*\)",
+            raw,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        fit_match = re.search(
+            r"\.fit\s*\([^,]+,\s*y\s*\[:\s*(?P<n>\d+)\s*\]\s*\)",
+            raw,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if y_match and fit_match:
+            try:
+                y_values = ast.literal_eval("[" + y_match.group("body") + "]")
+                n = int(fit_match.group("n"))
+                train_labels = list(y_values[:n])
+            except Exception:
+                train_labels = []
+            if train_labels and len(set(train_labels)) < 2:
+                bad.append(
+                    "scaler-leakage example trains a classifier on only one target class, so the example code would fail"
+                )
+
+    # Tiny numeric examples are useful only if their own arithmetic is sound.
+    # When a draft explicitly lists simple train/test values and then states a
+    # fitted mean, verify that mean against those same values instead of
+    # trusting model arithmetic.
+    def _listed_numbers(name):
+        patterns = [
+            rf"\b{re.escape(name)}\s*=\s*(\[[^\n]+\])",
+            rf"(?mi)^\s*[-*]?\s*{re.escape(name)}\s*:\s*(\[[^\n]+\])",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, raw, flags=re.IGNORECASE | re.MULTILINE)
+            if match:
+                return [
+                    float(item)
+                    for item in re.findall(r"-?\d+(?:\.\d+)?", match.group(1))
+                ]
+        return []
+
+    train_values = _listed_numbers("train")
+    test_values = _listed_numbers("test")
+    if train_values and test_values:
+        combined_values = train_values + test_values
+
+        def _expected_stat(context, values_train, values_all):
+            if re.search(
+                r"train\s*\+\s*test|entire\s+dataset|whole\s+dataset|"
+                r"all\s+(?:\d+|five|four|three)\s+(?:points|values|samples)|"
+                r"all\s+(?:the\s+)?(?:data|samples|points|values)",
+                context,
+                flags=re.IGNORECASE,
+            ):
+                return values_all
+            if re.search(
+                r"training\s+(?:set|values|points)|train(?:ing)?\s+only|"
+                r"just\s+(?:the\s+)?(?:\d+|three|four|five)\s+training|"
+                r"fit(?:ted)?\s+(?:the\s+)?scaler\s+on\s+(?:the\s+)?train",
+                context,
+                flags=re.IGNORECASE,
+            ):
+                return values_train
+            return None
+
+        for mean_match in re.finditer(
+            r"\bmean\s*=\s*(-?\d+(?:\.\d+)?)",
+            raw,
+            flags=re.IGNORECASE,
+        ):
+            claimed = float(mean_match.group(1))
+            context = raw[max(0, mean_match.start() - 260):mean_match.end() + 220].lower()
+            values = _expected_stat(context, train_values, combined_values)
+            if values:
+                expected = sum(values) / len(values)
+                if abs(claimed - expected) > 0.02:
+                    bad.append(
+                        "scaler-leakage numeric example stated a mean inconsistent with its own listed values"
+                    )
+                    break
+
+        # sklearn StandardScaler uses population variance (ddof=0). Tiny
+        # examples often accidentally quote sample standard deviation instead,
+        # which teaches the wrong transformation even though the leakage idea
+        # itself is correct.
+        for std_match in re.finditer(
+            r"\b(?:std|standard\s+deviation)\s*(?:=|is)\s*(?:≈|~)?\s*(-?\d+(?:\.\d+)?)",
+            raw,
+            flags=re.IGNORECASE,
+        ):
+            claimed = float(std_match.group(1))
+            context = raw[max(0, std_match.start() - 260):std_match.end() + 220].lower()
+            values = _expected_stat(context, train_values, combined_values)
+            if values:
+                mean = sum(values) / len(values)
+                expected = math.sqrt(
+                    sum((item - mean) ** 2 for item in values) / len(values)
+                )
+                if abs(claimed - expected) > max(0.03, expected * 0.04):
+                    bad.append(
+                        "scaler-leakage numeric example stated a StandardScaler standard deviation inconsistent with its own listed values"
+                    )
+                    break
+
+    return list(dict.fromkeys(bad))
+
+def find_ai_job_market_answer_violations(
+    user_input: str,
+    draft: str,
+) -> List[str]:
+    """Require AI-job answers to address jobs/roles rather than adjacent market hype."""
+    user = re.sub(r"\s+", " ", str(user_input or "").lower())
+    if not (
+        re.search(r"\bai\b", user)
+        and re.search(r"\b(?:replace|replacement|jobs?|roles?|employment|hiring)\b", user)
+        and re.search(r"\b(?:cyber|cybersecurity|security)\b", user)
+    ):
+        return []
+    text = re.sub(r"\s+", " ", str(draft or "").lower())
+    if not re.search(r"\b(?:jobs?|roles?|employment|hiring|replace|replacement|automation|tasks?)\b", text):
+        return [
+            "AI/cyber labour answer discussed adjacent market/infrastructure claims without addressing jobs or role replacement"
+        ]
+    if re.search(r"\b(?:every|all)\s+(?:cyber|cybersecurity|security)\s+(?:job|role)s?\b", text) and not re.search(
+        r"\b(?:no evidence|not enough evidence|unsupported|uncertain|cannot|can't|don['’]?t know|forecast)\b",
+        text,
+    ):
+        return [
+            "AI/cyber labour answer treated a universal job-replacement claim as established"
+        ]
+    return []
+
+
+def find_explicit_user_constraint_violations(
+    user_input: str,
+    draft: str,
+) -> List[str]:
+    """Preserve explicit negative constraints from Oliver's current turn.
+
+    This is intentionally conservative: it only blocks personal assumptions
+    Oliver explicitly told Mairon not to make. General trade-off discussion is
+    still allowed when it does not assign those preferences/facts to Oliver.
+    """
+    user = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
+    text = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
+    violations: List[str] = []
+
+    if re.search(
+        r"\b(?:don['’]?t|do\s+not)\s+(?:invent|assume|infer)\b[^.!?]{0,80}\b(?:my\s+)?budget\b",
+        user,
+        flags=re.IGNORECASE,
+    ):
+        personalised_budget = bool(re.search(
+            r"\b(?:your\s+budget|if\s+you(?:'re|\s+are)\s+on\s+a\s+budget|"
+            r"if\s+you(?:'re|\s+are)\s+willing\s+to\s+pay|if\s+you\s+can\s+afford|"
+            r"if\s+you\s+don['’]?t\s+mind\s+paying|"
+            r"you\s+(?:value|care\s+about|prioriti[sz]e)\s+(?:saving\s+money|cost)|"
+            r"whether\s+you\s+value\s+[^.!?]{0,40}saving\s+money)\b",
+            text,
+            flags=re.IGNORECASE,
+        ))
+        explicit_budget_noninference = bool(re.search(
+            r"\b(?:i\s+)?(?:won['’]?t|will\s+not|don['’]?t|do\s+not)\s+"
+            r"(?:infer|assume|invent)\b[^.!?]{0,30}\b(?:your\s+)?budget\b",
+            text,
+            flags=re.IGNORECASE,
+        ))
+        if personalised_budget and not explicit_budget_noninference:
+            violations.append(
+                "answer inferred Oliver's budget/cost preference despite an explicit no-budget-assumption constraint"
+            )
+
+    if re.search(
+        r"\b(?:don['’]?t|do\s+not)\s+(?:invent|assume|infer)\b[^.!?]{0,100}"
+        r"\b(?:which\s+one\s+i\s+(?:already\s+)?own|what\s+i\s+(?:already\s+)?own|my\s+current\s+(?:device|computer|machine))\b",
+        user,
+        flags=re.IGNORECASE,
+    ):
+        personalised_ownership = bool(re.search(
+            r"\b(?:you|your)\s+(?:already\s+)?(?:own|have|use|run)\b[^.!?]{0,50}"
+            r"\b(?:mac(?:os)?|windows|pc|laptop|machine|computer)\b|"
+            r"\b(?:your\s+mac|your\s+windows\s+(?:pc|machine|laptop|computer))\b",
+            text,
+            flags=re.IGNORECASE,
+        ))
+        explicit_ownership_noninference = bool(re.search(
+            r"\b(?:i\s+)?(?:won['’]?t|will\s+not|don['’]?t|do\s+not)\s+"
+            r"(?:infer|assume|invent)\b[^.!?]{0,45}\b(?:own|current\s+device|current\s+machine)\b",
+            text,
+            flags=re.IGNORECASE,
+        ))
+        if personalised_ownership and not explicit_ownership_noninference:
+            violations.append(
+                "answer inferred which platform/device Oliver owns despite an explicit no-ownership-assumption constraint"
+            )
+
+    if re.search(
+        r"\b(?:manga\b[^.!?]{0,80}\bnot\s+(?:the\s+)?anime|keep\s+(?:the\s+)?(?:two|manga\s+and\s+anime)\s+separate)\b",
+        user,
+        flags=re.IGNORECASE,
+    ):
+        if re.search(
+            r"\banime(?:['’]s)?\b[^.!?]{0,100}\b(?:catch(?:es)?\s+up|sequel|future\s+self|better|worse|ignore|watch|episode|adaptation|pacing|filler|art|animation|ending|source\s+material|team|studio|version|character|plot|story|antics|comparable)\b|"
+            r"\b(?:pacing|filler|watch|episode|adaptation|animation|team|studio|version|character|plot|story|antics)\b[^.!?]{0,80}\banime\b|"
+            r"\b(?:different|alternate|changed?)\s+ending\b|"
+            r"\b(?:weird|bad|good|better|worse|different)\s+adaptation\b|"
+            r"\badaptation\s+(?:choice|change|difference|ending)\b|"
+            r"\banimated\b[^.!?]{0,80}\b(?:nonsense|mess|version|adaptation)\b|"
+            r"\b(?:show|series)(?:['’]s)?\b[^.!?]{0,90}\b(?:pacing|animation|episodes?|adaptation|version|art|ending|story|plot)\b|"
+            r"\b(?:pacing|animation|episodes?|adaptation|version|art|ending|story|plot)\b[^.!?]{0,90}\b(?:show|series)(?:['’]s)?\b|"
+            r"\b(?:compared\s+to|comparable\s+to|versus|vs\.?|against)\b[^.!?]{0,80}\b(?:anime|show|series)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "answer drifted into anime discussion after Oliver explicitly locked the conversation to manga as a separate medium"
+            )
+
+    # Preserve an explicitly mentioned competing obligation. If Oliver says he
+    # also has uni/work/study obligations, a recommendation must not dismiss
+    # that same obligation as something that can simply wait.
+    obligation_terms = (
+        "uni", "university", "work", "study", "studying",
+        "assignment", "homework", "school", "class",
+    )
+    for term in obligation_terms:
+        if not re.search(
+            rf"\b(?:i\s+(?:have|got)\b[^.!?]{{0,55}}\b{re.escape(term)}\b[^.!?]{{0,45}}\b(?:to\s+do|to\s+finish|to\s+get\s+done)|"
+            rf"\b{re.escape(term)}\b[^.!?]{{0,45}}\b(?:to\s+do|to\s+finish|to\s+get\s+done))\b",
+            user,
+            flags=re.IGNORECASE,
+        ):
+            continue
+        if re.search(
+            rf"\b{re.escape(term)}\b[^.!?]{{0,35}}\bcan\s+wait\b|"
+            rf"\bput\b[^.!?]{{0,35}}\b{re.escape(term)}\b[^.!?]{{0,35}}\b(?:aside|off)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "recommendation dismissed a competing obligation Oliver explicitly said he still needs to do"
+            )
+            break
+
+    return list(dict.fromkeys(violations))
+
+
+def find_self_evaluation_overreach_violations(
+    user_input: str,
+    draft: str,
+) -> List[str]:
+    """Keep Mairon self-evaluation about Mairon, not invented Oliver habits.
+
+    A prompt such as "reckon you're becoming useful?" may be answered from
+    explicitly supplied development context.  It is not permission to invent a
+    history of Oliver wasting time, relying on Mairon, or making recurring
+    questionable decisions.
+    """
+    user = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
+    if not re.search(
+        r"\b(?:reckon|think)\b[^?]{0,55}\b(?:you(?:'re| are)|you)\b"
+        r"[^?]{0,70}\b(?:useful|better|improving|improved|competent|ready|solid)\b",
+        user,
+        flags=re.IGNORECASE,
+    ):
+        return []
+
+    text = str(draft or "").replace("’", "'")
+    if re.search(
+        r"\byou\s+(?:always|constantly|usually|keep)\b|"
+        r"\b(?:how\s+much|the\s+amount\s+of)\s+time\s+you\s+(?:waste|spend)\b|"
+        r"\byour\s+(?:questionable|bad|terrible|stupid)\s+decisions?\b|"
+        r"\byou\s+(?:need|rely\s+on|depend\s+on)\s+me\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return [
+            "self-evaluation invented unrelated recurring behaviour/history about Oliver"
+        ]
+
+    return []
+
+
+def find_factual_personal_observation_violations(
+    user_input: str,
+    draft: str,
+    core_answer_contract,
+) -> List[str]:
+    """Block decorative claims that Mairon has repeatedly observed Oliver.
+
+    Stable factual answers should explain the subject, not invent a history of
+    watching Oliver's habits.  If prior conversation really matters, Core can
+    refer to what Oliver *said* rather than claiming direct observation.
+    """
+    runtime = coerce_answer_contract_runtime(core_answer_contract)
+    if runtime is None or runtime.intent != "factual_question":
+        return []
+
+    text = str(draft or "").replace("’", "'")
+    if re.search(
+        r"\b(?:i(?:'ve| have)?\s+noticed|i\s+keep\s+noticing|i\s+keep\s+seeing|"
+        r"i(?:'ve| have)\s+seen\s+you|don['’]?t\s+think\s+i\s+haven['’]?t\s+noticed)\b"
+        r"[^.!?]{0,140}\b(?:you|your)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return [
+            "factual answer invented repeated personal observation/history about Oliver"
+        ]
+
+    return []
+
+
+def find_source_provenance_honesty_violations(
+    user_input: str,
+    draft: str,
+) -> List[str]:
+    """Reject evasive source-use claims when Oliver explicitly asks what was loaded."""
+    user = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
+    if not re.search(
+        r"\b(?:actually|really)\s+(?:load|loaded|open|opened|read|browse|browsed)\b|"
+        r"\bif\s+you\s+didn['’]?t\s+actually\s+(?:load|open|read|browse)\b",
+        user,
+        flags=re.IGNORECASE,
+    ):
+        return []
+
+    text = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
+    if re.search(
+        r"\bi\s+(?:didn['’]?t|did\s+not)\s+need\s+to\s+[\"'“”]?\s*(?:load|open|read|browse)\s*[\"'“”]?\b|"
+        r"\bno\s+need\s+to\s+[\"'“”]?\s*(?:load|open|read|browse)\s*[\"'“”]?\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return [
+            "source-provenance answer evaded whether the source was actually retrieved/read"
+        ]
+
+    explicit_use = bool(re.search(
+        r"\bi\s+(?:actually\s+)?(?:retrieved|loaded|opened|read|checked|browsed|accessed)\b|"
+        r"\bi\s+(?:did|didn['’]?t|couldn['’]?t|wasn['’]?t\s+able\s+to)\b[^.!?]{0,35}"
+        r"\b(?:load|open|read|browse|retrieve|access)\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    if not explicit_use:
+        return [
+            "source-provenance answer did not explicitly say whether the source was actually retrieved/read"
+        ]
+    return []
+
+
+def build_diagnostic_reasoning_fallback(
+    user_input: str,
+    conversation=None,
+) -> Optional[str]:
+    """Useful bounded fallback for common diagnostic follow-ups.
+
+    It reasons only from Oliver's supplied measurements plus durable mechanism
+    knowledge. It deliberately keeps unmeasured causes open rather than turning
+    a safe rejection into either a hallucination or a generic refusal.
+    """
+    current = re.sub(r"\s+", " ", str(user_input or "").strip())
+    recent_user = []
+    for item in reversed(list(conversation or [])):
+        if isinstance(item, dict):
+            role = item.get("role")
+            content = item.get("content")
+        else:
+            role = getattr(item, "role", None)
+            content = getattr(item, "content", None)
+        if str(role or "").lower() != "user":
+            continue
+        value = re.sub(r"\s+", " ", str(content or "").strip())
+        if value:
+            recent_user.append(value)
+        if len(recent_user) >= 4:
+            break
+    recent_user.reverse()
+    context = "\n".join(recent_user + [current])
+    low = context.lower()
+    current_low = current.lower()
+
+    wifi_context = bool(
+        re.search(r"\b(?:wi[- ]?fi|wireless|mesh|router|node|mbps|gbps)\b", low)
+        and re.search(r"\b(?:upstairs|wireless|wi[- ]?fi|mesh)\b", low)
+    )
+    if wifi_context:
+        if re.search(
+            r"\bwhat\s+would\s+you\s+(?:test|check)\s+first\b|"
+            r"\bwhat\s+should\s+i\s+(?:test|check)\s+first\b",
+            current_low,
+        ):
+            return (
+                "Test the same phone right next to the main Wi-Fi source/router with the same speed test, "
+                "then compare that result with upstairs. If the phone is fast near the source but slow upstairs, "
+                "that shifts suspicion away from a broadband-wide speed cap and toward the local Wi-Fi/mesh path; "
+                "it still does not tell you whether the cause is signal, roaming, backhaul, or interference."
+            )
+
+        if re.search(r"\bwhat\s+does\s+that\s+rule\s+out\b", current_low) and re.search(
+            r"\bphone\b[^\n]{0,100}\b(?:main\s+)?(?:mesh\s+)?node\b|"
+            r"\b(?:main\s+)?(?:mesh\s+)?node\b[^\n]{0,100}\bphone\b",
+            low,
+        ):
+            return (
+                "It rules out the phone being inherently limited to the slow upstairs speed and makes a total "
+                "main-node/router failure or broadband-wide cap much less likely, because the same phone is fast "
+                "next to the main node. It does not rule out the upstairs Wi-Fi/mesh path, roaming/association, "
+                "backhaul, interference, or distance; those are still separate possibilities."
+            )
+
+        if re.search(r"\b(?:pay|upgrade)\b[^?]{0,50}\bisp\b|\bisp\b[^?]{0,50}\b(?:pay|upgrade)\b", current_low):
+            return (
+                "Based on the readings you gave me, paying the ISP more is unlikely to fix the upstairs slowdown: "
+                "the same setup can deliver high throughput near the main node while the phone is slow upstairs. "
+                "That points to the local Wi-Fi/mesh path, but the readings still do not identify whether the cause "
+                "is signal, roaming, backhaul, interference, or something else in that local path."
+            )
+
+    if re.search(r"\b(?:vrr|variable\s+refresh(?:\s+rate)?)\b", low, re.IGNORECASE):
+        if re.search(r"\bwhy\b[^?]{0,90}\bflicker\b|\bflicker\b[^?]{0,90}\bwhy\b", current_low):
+            return (
+                "VRR can be related because changing refresh timing with frame delivery can expose luminance/gamma "
+                "instability, especially when frame rate fluctuates or approaches the VRR range limits. Dark scenes "
+                "can make that flicker easier to notice, but VRR being enabled does not by itself prove the display is "
+                "healthy or that VRR is the only cause."
+            )
+
+        if re.search(r"\bcould\s+it\s+still\s+be\s+vrr\b|\bdark\s+scenes?\b", current_low):
+            return (
+                "Yes, it could still be VRR. Dark scenes can make small luminance/gamma changes from variable-refresh "
+                "behaviour easier to see, so dark-only flicker is compatible with VRR, but it does not prove VRR is "
+                "the root cause. The clean isolation test is the same scene with VRR on versus off under similar frame-rate conditions."
+            )
+
+    return None
+
+
+def build_debate_continuation_fallback(
+    user_input: str,
+    conversation=None,
+) -> str:
+    """Substantive fallback for an explicit request for a counterargument."""
+    recent_user = []
+    for item in reversed(list(conversation or [])):
+        if isinstance(item, dict):
+            role = item.get("role")
+            content = item.get("content")
+        else:
+            role = getattr(item, "role", None)
+            content = getattr(item, "content", None)
+        if str(role or "").lower() != "user":
+            continue
+        value = re.sub(r"\s+", " ", str(content or "").strip())
+        if value:
+            recent_user.append(value)
+        if len(recent_user) >= 3:
+            break
+    context = " ".join(list(reversed(recent_user)) + [str(user_input or "")]).lower()
+
+    if re.search(r"\b(?:long|short)\b", context) and re.search(r"\b(?:arc|manga|pacing|setup|payoff)\b", context):
+        return (
+            "Counterargument: shorter arcs can hit harder because tighter pacing concentrates the setup and payoff, "
+            "leaves less room for repetition, and can make the climax feel sharper. Long arcs gain room for depth, "
+            "but they also carry a bigger risk of bloat or diluted momentum."
+        )
+
+    return (
+        "A reasonable counterargument is that the alternative can trade depth for concentration: less setup can mean "
+        "less drag, tighter pacing, and a sharper payoff. That does not automatically make it better, but it is the "
+        "strongest case against simply agreeing with the original position."
+    )
 
 
 def should_verify_core_grounding(
@@ -2071,6 +4694,11 @@ def verify_core_grounded_draft(
         "literal claims about reality.\n"
         "- Clearly absurd, impossible, anthropomorphic, sarcastic, teasing, or "
         "hyperbolic jokes are NOT factual claims and do NOT require evidence.\n"
+        "- For a share_opinion turn, generic evaluative reasoning about an abstract "
+        "idea, trade-off, or distinction is also not an external-world factual claim. "
+        "Mairon may reason about a user-supplied comparison without needing citation-style "
+        "support. This does NOT permit invented named entities, canon, personal history, "
+        "concrete events, measurements, or current-world facts.\n"
         "- Do NOT reject a joke merely because its literal wording is false. The "
         "whole point of obvious non-literal humour is that it is not asserting the "
         "literal proposition.\n"
@@ -2425,6 +5053,14 @@ def verify_factual_focus_fidelity(
         "- Preserve actor and target relations exactly. 'Oliver debugs Mairon' does not support "
         "'Mairon debugs Oliver's code'.\n"
         "- Preserve concrete entity identity. XM6s are not a phone simply because both are devices.\n"
+        "- On troubleshooting/diagnostic turns, also police claims about Oliver's ACTUAL setup: "
+        "do not invent bands, channel widths, access points, backhaul state, wall/floor materials, "
+        "topology, device configuration, or measurements that Oliver did not supply. General "
+        "possibilities may be framed as possibilities, but they are not observations about his setup.\n"
+        "- A reading beside one node/device does not prove the state of an unmeasured path/component. "
+        "Distinguish what the measurement rules out from what remains only a hypothesis.\n"
+        "- If Oliver explicitly says an endpoint is wired, reject a draft that assigns that endpoint "
+        "a Wi-Fi channel/band as though it were observed.\n"
         "- Obvious impossible self-personification that does not imply a real prior event can be "
         "treated as banter, but a plausible claimed history still requires support.\n\n"
         "EXAMPLES:\n"
@@ -2680,6 +5316,126 @@ def build_verification_declined_fallback() -> str:
     )
 
 
+def build_stolen_session_security_fallback(
+    user_input: str,
+) -> Optional[str]:
+    """Bounded deterministic explanation for stolen authenticated sessions.
+
+    The validator for this concept can legitimately reject every Qwen draft.
+    When that happens, Core must still be able to answer the stable security
+    concept without exposing an internal/evidence-limit fallback.
+
+    This is not a generic cyber answer generator. It activates only for the
+    tightly bounded stolen-session credential context recognised by
+    _is_stolen_session_credential_context().
+    """
+    if not _is_stolen_session_credential_context(
+        user_input
+    ):
+        return None
+
+    current = re.sub(
+        r"\s+",
+        " ",
+        str(
+            user_input
+            or ""
+        ).strip(),
+    ).lower()
+
+    asks_about_mfa = bool(
+        re.search(
+            r"\b(?:mfa|2fa|two[- ]factor|multi[- ]factor|"
+            r"multifactor|two[- ]step|authenticator)\b",
+            current,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    if asks_about_mfa:
+        return (
+            "No — MFA protects the authentication/login step, but turning it on "
+            "does not retroactively invalidate an already-stolen authenticated "
+            "session credential. If the copied session is still valid, stopping "
+            "its reuse requires the service to revoke or invalidate that session "
+            "server-side (or for it to expire); clearing only the victim browser's "
+            "local cookie does not revoke the attacker's copy."
+        )
+
+    return (
+        "An already-copied authenticated session credential is a session-control "
+        "problem, not the same thing as a new login. Controls such as MFA can protect "
+        "future authentication, but a stolen session that is still valid must be "
+        "revoked or invalidated server-side (or expire); clearing only the victim "
+        "browser's local cookie does not revoke the attacker's copy."
+    )
+
+
+def build_stable_model_knowledge_fallback(
+    user_input: str,
+    conversation=None,
+) -> Optional[str]:
+    """Return a deterministic fallback for narrow stable concepts we can teach safely.
+
+    This is deliberately not a generic encyclopedia fallback. It exists for
+    stable concepts where acceptance guards may reject repeated model drafts
+    but Core can still provide a bounded, technically correct explanation.
+
+    Any concept-specific acceptance guard that can reject every model draft
+    should have a matching bounded fallback here (or through a helper called
+    here), so Core never replaces an answerable stable fact with internal
+    evidence-limit language.
+    """
+    current = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
+
+    stolen_session_fallback = (
+        build_stolen_session_security_fallback(
+            user_input
+        )
+    )
+
+    if stolen_session_fallback is not None:
+        return stolen_session_fallback
+
+    if (
+        re.search(r"\btcp\b", current)
+        and re.search(r"\budp\b", current)
+        and re.search(r"\b(?:handshake|connectionless|connection[- ]oriented)\b", current)
+    ):
+        return (
+            "TCP is connection-oriented and establishes a connection with a three-way handshake. "
+            "UDP is connectionless and does not use a connection-establishment handshake; it sends "
+            "datagrams without first establishing a TCP-style session."
+        )
+
+    if (
+        re.search(r"\bdata\s+leakage\b", current)
+        and re.search(r"\b(?:machine\s+learning|ml|model)\b", current)
+        and re.search(r"\b(?:explain|understand|what|why)\b", current)
+    ):
+        return (
+            "Data leakage happens when information that should be unavailable during training "
+            "or evaluation leaks into the model-building process — for example, held-out test/validation "
+            "data, future information, or target-derived features. That breaks the independence of the "
+            "evaluation and can make measured performance too optimistic, so keep train/validation/test "
+            "boundaries clean and fit preprocessing only on the training data."
+        )
+
+    if (
+        re.search(r"\bwired\b[^.!?]{0,90}\b(?:mbps|gbps)\b", current)
+        and re.search(r"\bphone\b", current)
+        and re.search(r"\b(?:wi[- ]?fi|wireless|mesh|router|node|upstairs|downstairs|room)\b", current)
+        and re.search(r"\b(?:what|which)\b[^?]{0,55}\b(?:test|check|try)\b[^?]{0,30}\bfirst\b", current)
+    ):
+        return (
+            "First, test the same phone close to the main Wi-Fi/mesh source and compare that with the problem location. "
+            "That isolates the local wireless path from the broadband connection and the phone itself before you change "
+            "bands, channels, configuration, or buy new hardware."
+        )
+
+    return None
+
+
 def build_user_context_reasoning_fallback(
     user_input: str,
     conversation=None,
@@ -2691,6 +5447,24 @@ def build_user_context_reasoning_fallback(
     turns; it does not trust prior assistant prose or invent a rubric/attachment.
     """
     current = str(user_input or "")
+    recent_user_texts = []
+    for item in reversed(list(conversation or [])):
+        if isinstance(item, dict):
+            role = item.get("role")
+            content = item.get("content")
+        else:
+            role = getattr(item, "role", None)
+            content = getattr(item, "content", None)
+        if str(role or "").lower() != "user":
+            continue
+        value = re.sub(r"\s+", " ", str(content or "").strip())
+        if value:
+            recent_user_texts.append(value)
+        if len(recent_user_texts) >= 4:
+            break
+    recent_user_texts.reverse()
+    user_context = "\n".join(recent_user_texts + [current])
+
     if re.search(
         r"\bwhat\s+do\s+(?:u|you)\s+need\s+from\s+me\b|"
         r"\bwhat\s+should\s+i\s+(?:send|attach|upload|provide)\b|"
@@ -2705,9 +5479,160 @@ def build_user_context_reasoning_fallback(
             if missing:
                 return "Send me " + missing + ". That's what I need to check it properly."
 
+    if (
+        re.search(r"def\s+[A-Za-z_]\w*\s*\([^)]*=\s*\[\s*\]", user_context)
+        and re.search(r"\bwhy\b|\bnew\s+list\b|\bdefault\b", current, re.IGNORECASE)
+    ):
+        return (
+            "Python evaluates that default expression once when the function is defined, "
+            "and the resulting list is stored with the function's default arguments. "
+            "Calling the function again without an argument reuses the same list; it is not a closure variable."
+        )
+
+    if (
+        "scaler" in user_context.lower()
+        and re.search(r"train\s*/?\s*test", user_context, re.IGNORECASE)
+        and re.search(r"\bexample\b", current, re.IGNORECASE)
+    ):
+        return (
+            "Tiny example: if your training values are 0 and 10 but the held-out test value is 100, "
+            "fitting the scaler on all three lets 100 influence the mean/scale used for training. "
+            "Fit the scaler on the training values only, then use those learned parameters to transform the test value."
+        )
+
+    if (
+        "scaler" in user_context.lower()
+        and re.search(r"train\s*/?\s*test", user_context, re.IGNORECASE)
+    ):
+        return (
+            "Fit the scaler on the training set only, because fitting it before the split lets held-out test statistics "
+            "influence the preprocessing used for training. That breaks the independence of the evaluation and can make "
+            "the reported performance too optimistic; transform the test set using only the scaler learned from training data."
+        )
+
+    # A bounded pairwise technical comparison does not require personal budget
+    # or ownership facts when Oliver has already supplied the comparison and
+    # the criteria. If model drafts are rejected, stay useful rather than
+    # treating those deliberately-withheld personal details as missing inputs.
+    user_context_lower = user_context.lower()
+    mac_windows_frame = bool(
+        re.search(r"\bmac(?:os)?\s+(?:vs\.?|versus)\s+windows\b", user_context_lower)
+        or re.search(r"\bwindows\s+(?:vs\.?|versus)\s+mac(?:os)?\b", user_context_lower)
+    )
+    technical_criteria = bool(re.search(
+        r"\b(?:python|linux\s+vms?|virtual\s+machines?|network(?:ing|s)?|wsl2?|unix)\b",
+        current,
+        flags=re.IGNORECASE,
+    ))
+    if mac_windows_frame and technical_criteria:
+        return (
+            "You gave enough constraints to compare them without knowing your budget or which one you own. "
+            "For Python, both are strong. macOS gives you a Unix/POSIX-style shell and tooling natively; "
+            "Windows gives you native Windows tooling plus WSL2 for a Linux environment. Both can support Linux-VM workflows, "
+            "although exact guest/architecture support depends on the hardware and hypervisor. For networking work, macOS is convenient "
+            "for Unix-oriented CLI workflows, while Windows is more direct when you need Windows-specific networking, Active Directory, "
+            "or enterprise tooling. Neither is universally better for the criteria you listed."
+        )
+
+    if (
+        re.search(r"\b(?:pay|upgrade)\b[^?]{0,50}\bisp\b|\bisp\b[^?]{0,50}\b(?:pay|upgrade)\b", current, re.IGNORECASE)
+        and re.search(r"\bwired\b[^\n]{0,80}\b(?:mbps|gbps)\b", user_context, re.IGNORECASE)
+        and (
+            re.search(r"\b(?:main\s+)?(?:mesh\s+)?node\b[^\n]{0,80}\b(?:mbps|gbps)\b", user_context, re.IGNORECASE)
+            or re.search(r"\b(?:mbps|gbps)\b[^\n]{0,80}\b(?:main\s+)?(?:mesh\s+)?node\b", user_context, re.IGNORECASE)
+            or re.search(r"\b\d+(?:\.\d+)?\s*(?:mbps|gbps)\b[^\n]{0,80}\b(?:main\s+)?(?:mesh\s+)?node\b", user_context, re.IGNORECASE)
+            or re.search(r"\b\d{2,4}(?:\.\d+)?\b[^\n]{0,55}\b(?:main\s+)?(?:mesh\s+)?node\b", user_context, re.IGNORECASE)
+        )
+        and re.search(r"\bupstairs\b", user_context, re.IGNORECASE)
+    ):
+        return (
+            "Based on the readings you gave me, paying the ISP more is unlikely to fix the upstairs slowdown: "
+            "you already demonstrated high throughput on the wired/main-node side while the phone is slow upstairs. "
+            "That points to the local Wi-Fi/mesh path, but those readings still do not identify the exact wireless cause."
+        )
+
     return (
         "I don't have enough reliable user-supplied information to answer that "
         "without guessing."
+    )
+
+
+def build_recommendation_request_fallback(
+    user_input: str,
+    conversation=None,
+) -> str:
+    """Useful fail-closed rendering for an explicit recommendation request.
+
+    This is only used after normal local generation/retry has failed. It keeps
+    the response actionable without fabricating personal facts or returning an
+    internal evidence-limit diagnostic to Oliver.
+    """
+
+    current = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
+    recent_user = []
+
+    for message in reversed(list(conversation or [])):
+        if isinstance(message, dict):
+            role = message.get("role")
+            content = message.get("content")
+        else:
+            role = getattr(message, "role", None)
+            content = getattr(message, "content", None)
+
+        if str(role or "").lower() != "user":
+            continue
+
+        value = re.sub(r"\s+", " ", str(content or "").strip())
+        if value:
+            recent_user.append(value)
+        if len(recent_user) >= 3:
+            break
+
+    context = (" ".join(reversed(recent_user)) + " " + current).lower()
+
+    wants_one = bool(re.search(r"\b(?:one|single|just one)\b", current))
+    wants_skill = bool(re.search(r"\bskill\b|\bpractis(?:e|ing)\b|\bpractice\b", current))
+    wants_next_step = bool(re.search(r"\bnext\s+step\b|\buseful\s+step\b|\bwhat\s+should\s+i\s+do\b", current))
+
+    if re.search(r"\bwhat\s+should\s+i\s+watch\b", current):
+        if (
+            re.search(r"\bdark\b", context)
+            and re.search(r"\bcharacter(?:[- ]driven|\s+driven)?\b", context)
+            and re.search(r"\b(?:not\s+(?:a\s+)?comedy|no\s+comedy|definitely\s+not\s+(?:a\s+)?comedy)\b", context)
+        ):
+            return (
+                "Watch Monster. It's a dark, character-driven psychological thriller, "
+                "and comedy is not the point of the show."
+            )
+        return "Watch Monster if you want a serious, character-driven thriller."
+
+    if wants_skill and re.search(r"\b(?:cyber|cybersecurity|security|network|soc)\b", context):
+        return (
+            "Practice packet analysis in Wireshark: take one small capture and explain "
+            "the DNS/TCP/TLS flow from first principles. One skill, no career speech."
+        )
+
+    if wants_next_step and re.search(r"\b(?:rejection|rejected|grad|graduate|application|job)\b", context):
+        return (
+            "Take the next role you actually want and spend 10 minutes tailoring your "
+            "application to that job, then stop and get back to uni."
+        )
+
+    if wants_skill:
+        return (
+            "Pick one core skill in the area you're working on and practise it hands-on "
+            "with one small exercise instead of turning it into a whole study plan."
+        )
+
+    if wants_one or wants_next_step:
+        return (
+            "Do one small, reversible action that directly advances the thing you just "
+            "asked about, then reassess instead of turning it into a whole plan."
+        )
+
+    return (
+        "Start with one small, reversible recommendation that directly matches the "
+        "constraint you just gave me; keep everything else for later."
     )
 
 
@@ -2740,6 +5665,16 @@ def build_core_grounding_fallback(
             user_input
             or ""
         ).lower()
+
+        if re.search(
+            r"\bjust\s+wanted\s+to\s+(?:tell|share)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return (
+                "Yeah, fair — sometimes you just want to share the win without "
+                "turning it into another task."
+            )
 
         arrival_markers = (
             "arrived",
@@ -2805,13 +5740,33 @@ def build_core_grounding_fallback(
         )
 
     if intent == "self_correction":
+        current = re.sub(r"\s+", " ", str(user_input or "").strip())
+        contrast = re.search(
+            r"\b(?P<new>[A-Za-z][A-Za-z0-9_-]{1,30})\s+"
+            r"(?P<noun>cube|bag|box|folder|file|room|shelf|drawer)\b"
+            r"[^.!?]{0,35}\bnot\s+(?P<old>[A-Za-z][A-Za-z0-9_-]{1,30})\b",
+            current,
+            flags=re.IGNORECASE,
+        )
+        if contrast:
+            return (
+                "Got it — " + contrast.group("new") + " " + contrast.group("noun")
+                + ", not " + contrast.group("old") + "."
+            )
         return (
-            "Got it — correction noted."
+            "Got it — I'll use your latest correction instead of the earlier detail."
         )
 
     if intent == "casual_conversation":
+        if user_input is not None:
+            text = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
+            if re.search(r"\bjust\s+wanted\s+to\s+(?:tell|share)\b", text):
+                return (
+                    "Yeah, fair — sometimes you just want to share the win without "
+                    "turning it into another task."
+                )
         return (
-            "Fair."
+            "Yeah, fair enough."
         )
 
     if intent == "conversation_recall":

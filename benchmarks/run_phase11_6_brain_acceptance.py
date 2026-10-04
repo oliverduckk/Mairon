@@ -1006,6 +1006,37 @@ def _check_approval_preview(
     return problems
 
 
+
+
+def _contains_actual_follow_up_question(answer: str) -> bool:
+    """Distinguish a real follow-up question from a rhetorical tag question.
+
+    `forbid_question` exists to prevent Mairon from needlessly turning a closed
+    social response into another task/question. Natural tag-question banter such
+    as "you really did that, didn't you?" is not a follow-up request and should
+    not make the mechanical holdout red.
+    """
+    text = str(answer or "").strip()
+    if "?" not in text:
+        return False
+
+    tag_tail = re.compile(
+        r",\s*(?:didn|don|doesn|isn|aren|wasn|weren|haven|hasn|hadn|"
+        r"can['’]?t|couldn|wouldn|shouldn|won)"
+        r"(?:['’]?t)?\s+(?:you|he|she|it|they|we)\s*\?\s*$",
+        flags=re.IGNORECASE,
+    )
+
+    # Inspect each question-mark-terminated unit independently. If every one is
+    # only a rhetorical tag, there is no actual follow-up question.
+    start = 0
+    for match in re.finditer(r"\?", text):
+        unit = text[start:match.end()].strip()
+        start = match.end()
+        if not tag_tail.search(unit):
+            return True
+    return False
+
 def _check_expectations(
     turn_result,
     expectation: dict[str, Any],
@@ -1232,7 +1263,7 @@ def _check_expectations(
     if expectation.get(
         "forbid_question"
     ):
-        if "?" in answer:
+        if _contains_actual_follow_up_question(answer):
             failures.append(
                 "answer contained a follow-up question"
             )

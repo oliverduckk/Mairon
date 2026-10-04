@@ -660,6 +660,52 @@ def _conversation_user_texts(conversation):
     return result
 
 
+def _spoiler_user_grounding_text(user_input, conversation=None):
+    """Return only USER-authored text that may authorise spoiler-bearing names.
+
+    A hard live spoiler ceiling is safest when Core refuses to introduce a named
+    character/entity that Oliver has not himself brought into the bounded
+    conversation. This is deliberately conservative: generic craft/theme
+    analysis remains available without guessing whether a model-known name
+    appears before or after the user's ceiling.
+    """
+    parts = [*_conversation_user_texts(conversation), str(user_input or "")]
+    return "\n".join(part for part in parts if str(part).strip())
+
+
+_PROPER_NAME_STOPWORDS = {
+    "the", "this", "that", "these", "those", "and", "but", "so", "still",
+    "also", "because", "when", "while", "even", "most", "some", "one",
+    "season", "chapter", "episode", "manga", "anime", "novel", "story",
+    "character", "characters", "writing", "fight", "fights", "arc", "arcs",
+    "plot", "theme", "themes", "protagonist", "main", "series", "show",
+    "oliver", "mairon", "core", "you", "your", "here", "yes", "no", "noted",
+}
+
+
+def _ungrounded_spoiler_names(response_text, user_grounding_text):
+    """Find named-looking tokens introduced only by the assistant.
+
+    This is not a general NER system. It is a narrow hard-ceiling guard used
+    only when Oliver explicitly limited spoilers. False negatives are safer
+    than allowing a model to introduce a future character from memory; common
+    sentence-start words are filtered, and any name Oliver already supplied is
+    permitted.
+    """
+    response = str(response_text or "")
+    grounding = str(user_grounding_text or "").lower()
+    candidates = []
+    for match in re.finditer(r"\b[A-Z][a-z]{2,}(?:['’]s)?\b", response):
+        token = re.sub(r"['’]s$", "", match.group(0), flags=re.IGNORECASE)
+        low = token.lower()
+        if low in _PROPER_NAME_STOPWORDS:
+            continue
+        if re.search(rf"\b{re.escape(low)}\b", grounding, flags=re.IGNORECASE):
+            continue
+        candidates.append(token)
+    return list(dict.fromkeys(candidates))
+
+
 def _explicit_conversation_spoiler_ceiling(text):
     """Extract a hard ceiling from explicit no-spoiler wording without persisting it.
 
@@ -1588,6 +1634,11 @@ def prepare_spoiler_context(
         "domain_active": True,
         "title": title,
         "profile": profile,
+        "current_user_text": str(user_input or ""),
+        "user_grounding_text": _spoiler_user_grounding_text(
+            user_input=user_input,
+            conversation=conversation,
+        ),
         "high_risk": high_risk,
         "release_sensitive": release_sensitive,
         "must_ask_progress": must_ask_progress,
@@ -1896,6 +1947,15 @@ def build_spoiler_guard_text(
             lines.append(
                 f"- Hard spoiler ceiling: do not reveal material beyond {progress_type} {progress_value}."
             )
+            lines.extend([
+                "- With a hard ceiling active, never summarise a character's full-series arc, "
+                "later end state, transformation, redemption, death, relationship, changed "
+                "motivation, or eventual goal unless that development is explicitly known to "
+                "occur on/before the ceiling from Core evidence or Oliver's own wording.",
+                "- If Oliver asks WHY the writing works, prefer spoiler-safe craft analysis "
+                "(motivation clarity, conflict, consequences, pacing, contrast, setup/payoff) "
+                "over describing where a character eventually ends up.",
+            ])
 
     else:
         lines.append(
@@ -1993,6 +2053,41 @@ def build_spoiler_guard_text(
     )
 
 
+
+def build_spoiler_safe_discussion_fallback(user_input, spoiler_context):
+    """Return a useful craft-level answer when strict spoiler rewrites all fail.
+
+    The fallback deliberately avoids named characters, future direction, plot
+    events, endings and release details. It is only available when Core already
+    has an explicit hard progress ceiling.
+    """
+    profile = (spoiler_context or {}).get("profile") or {}
+    hard_ceiling = bool(
+        profile.get("progress_type")
+        and profile.get("progress_value") is not None
+    )
+    if not hard_ceiling:
+        return None
+
+    user = _normalise_text(user_input).lower()
+    if re.search(r"\bcharacter\s+(?:writing|work|arcs?)\b|\bcharacters?\b", user):
+        if re.search(r"\bfights?|action\b", user):
+            return (
+                "Staying inside your spoiler limit, I can still talk about the craft: "
+                "clear motivations, conflicting values and consequences make the fights matter "
+                "as character pressure rather than just spectacle. That is a solid reason to value "
+                "the character writing more than the action itself."
+            )
+        return (
+            "Staying inside your spoiler limit, the character writing works when motivations stay clear, "
+            "choices have consequences, and conflicting values create pressure without needing a later plot reveal."
+        )
+
+    return (
+        "I can keep this inside your spoiler limit by discussing the craft rather than later plot developments: "
+        "pacing, setup, motivations, consequences and themes are safe to analyse without revealing where the story goes."
+    )
+
 def find_spoiler_guard_violations(
     response_text,
     spoiler_context,
@@ -2006,17 +2101,19 @@ def find_spoiler_guard_violations(
     progress check and answering anyway.
     """
 
-    if not (
-        spoiler_context.get(
-            "must_ask_progress"
-        )
-        or spoiler_context.get(
-            "must_complete_progress"
-        )
-        or spoiler_context.get(
-            "must_confirm_latest"
-        )
-    ):
+    requires_progress_check = bool(
+        spoiler_context.get("must_ask_progress")
+        or spoiler_context.get("must_complete_progress")
+        or spoiler_context.get("must_confirm_latest")
+    )
+
+    profile = spoiler_context.get("profile") or {}
+    hard_ceiling_active = bool(
+        profile.get("progress_type")
+        and profile.get("progress_value") is not None
+    )
+
+    if not requires_progress_check and not hard_ceiling_active:
         return []
 
     text = _normalise_text(
@@ -2024,6 +2121,56 @@ def find_spoiler_guard_violations(
     ).lower()
 
     violations = []
+
+    if hard_ceiling_active and not requires_progress_check:
+        current_user = _normalise_text(
+            spoiler_context.get("current_user_text")
+        ).lower()
+
+        # With an explicit ceiling and no Core evidence proving that a
+        # development occurs before it, avoid arc/end-state language that can
+        # itself reveal future character direction. Craft analysis remains
+        # available without describing where a character eventually goes.
+        risky_arc_patterns = (
+            r"\bjourney\s+from\b[^.!?]{0,120}\bto\b",
+            r"\b(?:motivations?|identity|goals?|values?|arc|character)\b[^.!?]{0,80}\b(?:shift|shifts|shifted|changing|changes|changed|moves?|moved|evolves?|evolved)\b[^.!?]{0,100}\bfrom\b[^.!?]{0,100}\bto\b",
+            r"\b(?:shift|shifts|shifted|moves?|moved|evolves?|evolved)\b[^.!?]{0,100}\bfrom\b[^.!?]{0,100}\bto\b",
+            r"\b(?:reassembles?|rebuilds?|reorients?)\b[^.!?]{0,100}\b(?:around|toward|towards)\b",
+            r"\beventually\b[^.!?]{0,100}\b(?:becomes?|learns?|realises?|realizes?|seeks?|turns?)\b",
+            r"\bends?\s+up\b",
+            r"\b(?:becomes?|turns?\s+into|grows?\s+into)\b[^.!?]{0,90}",
+            r"\blater\b[^.!?]{0,80}\b(?:becomes?|learns?|realises?|realizes?|changes?|seeks?)\b",
+            r"\blater\s+(?:shifts?|developments?|arcs?|events?|changes?)\b",
+            r"\b(?:just\s+)?wait\s+until\b",
+            r"\byou(?:'re| are)\s+not\s+ready\s+to\s+see\b",
+            r"\byou(?:'ll| will)\s+see\b",
+            r"\b(?:characters?|they|he|she)\b[^.!?]{0,55}\b(?:get|gets|receive|receives|face|faces)\b"
+            r"[^.!?]{0,55}\b(?:comeuppance|punishment|revenge|betrayal|redemption|death|killed|expelled)\b",
+        )
+
+        if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in risky_arc_patterns):
+            # If Oliver himself explicitly supplied the same development in the
+            # current turn, repeating it is not a spoiler leak. Otherwise Core
+            # should force a spoiler-safe rewrite.
+            if not any(
+                re.search(pattern, current_user, flags=re.IGNORECASE)
+                for pattern in risky_arc_patterns
+            ):
+                violations.append(
+                    "hard spoiler ceiling forbids ungrounded character arc/end-state transformation language"
+                )
+
+        ungrounded_names = _ungrounded_spoiler_names(
+            response_text,
+            spoiler_context.get("user_grounding_text") or current_user,
+        )
+        if ungrounded_names:
+            violations.append(
+                "hard spoiler ceiling forbids assistant-introduced named entities: "
+                + ", ".join(ungrounded_names[:4])
+            )
+
+        return violations
 
     if "?" not in text:
         violations.append(

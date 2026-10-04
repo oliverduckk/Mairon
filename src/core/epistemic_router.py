@@ -112,6 +112,36 @@ SPECIFIC_LOOKUP_PATTERNS = [
     r"\bexact(?:ly)?\b",
 ]
 
+TECHNICAL_DOMAIN_PATTERNS = [
+    r"\b(?:python|javascript|java|c\+\+|tcp|udp|dns|http|https|tls|ssh|"
+    r"mfa|multi[- ]factor|session(?:\s+(?:cookie|token))?|cookie|api|git|"
+    r"vrr|variable\s+refresh\s+rate|wi[- ]?fi|wireless|mesh|router|"
+    r"scaler|standardscaler|virtual\s+environment|venv|linux|docker)\b",
+    r"`[^`\n]{1,200}`",
+    r"\bdef\s+[a-z_][a-z0-9_]*\s*\(",
+]
+
+STABLE_TECHNICAL_MECHANISM_PATTERNS = [
+    r"\bwhat\s+prints?\b",
+    r"\bwhat\s+happens?\b",
+    r"\bwhat\s+would\s+you\s+test\s+first\b",
+    r"\b(?:will|would|can|could|does|do|is|are)\b.{0,140}\b"
+    r"(?:stop|prevent|block|allow|cause|protect|replay|reuse|work|behave)\b",
+    r"\b(?:why|how)\b.{0,140}\b(?:work|behave|cause|prevent|protect|reuse|replay)\b",
+]
+
+# Durable technical claim checks are not inherently requests for live/public
+# research. Phrases such as "my mate swears TCP is connectionless ... can u
+# check me" ask Mairon to evaluate stable protocol semantics. Explicit web,
+# source, freshness and changing-public-state signals still take precedence
+# above this gate.
+TECHNICAL_PREMISE_CHECK_PATTERNS = [
+    r"\b(?:can|could|would)\s+(?:you|u)\s+(?:please\s+)?(?:check|sanity[- ]?check)\s+(?:me|this|that)\b",
+    r"\b(?:am\s+i|is\s+that|is\s+this|are\s+we)\s+(?:right|correct)\b",
+    r"\b(?:that|this)\s+(?:sounds?|seems?)\s+(?:wrong|off|cooked|sus|weird)\b",
+    r"\bmy\s+(?:mate|friend|coworker|lecturer|teacher|professor)\b[^.!?]{0,140}\b(?:says?|swears?|claims?|reckons?)\b",
+]
+
 STABLE_EXPLANATION_PATTERNS = [
     r"^\s*(?:can|could|would)\s+(?:you|u)\s+(?:please\s+)?"
     r"(?:explain|describe|define|walk\s+me\s+through)\b",
@@ -125,6 +155,8 @@ STABLE_EXPLANATION_PATTERNS = [
     r"^\s*compare\b",
     r"^\s*walk\s+me\s+through\b",
     r"\bdifference between\b",
+    r"\btrade[- ]?offs?\b",
+    r"\bpros\s+(?:and|&)\s+cons\b",
     r"\bhow .{0,80}\bworks?\b",
 ]
 
@@ -182,6 +214,22 @@ def classify_factual_authority(text: str) -> str:
 
     if _matches_any(value, CHANGING_PUBLIC_FACT_PATTERNS):
         return "public_source_verified"
+
+    # Durable technical mechanism/semantics questions do not become web
+    # lookups merely because they are phrased as "will X stop Y?" or contain
+    # a code snippet. Current/version/vendor-specific questions still exited
+    # above through freshness, changing-fact, or explicit-verification gates.
+    if (
+        _matches_any(value, TECHNICAL_DOMAIN_PATTERNS)
+        and _matches_any(value, STABLE_TECHNICAL_MECHANISM_PATTERNS)
+    ):
+        return "stable_model_knowledge"
+
+    if (
+        _matches_any(value, TECHNICAL_DOMAIN_PATTERNS)
+        and _matches_any(value, TECHNICAL_PREMISE_CHECK_PATTERNS)
+    ):
+        return "stable_model_knowledge"
 
     if re.search(
         r"\b(?:default|standard)\s+port\s+(?:for|of)\s+[a-z0-9+.-]+\s*[?.!]*$",

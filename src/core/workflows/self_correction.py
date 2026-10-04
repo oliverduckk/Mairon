@@ -21,7 +21,7 @@ import re
 _PREFIX_PATTERNS = (
     r"^\s*actually\s*[,—\-:]*\s*",
     r"^\s*scratch\s+that\s*[,—\-:]*\s*",
-    r"^\s*correction\s*[,—\-:]*\s*",
+    r"^\s*(?:wait[\s,!-]*)?correction\s*[,—\-:]*\s*",
     r"^\s*actually\s*,?\s*scratch\s+that\s*[,—\-:]*\s*",
 )
 
@@ -148,6 +148,13 @@ def build_self_correction_response(
     value = _strip_correction_prefix(
         user_input
     )
+
+    value = re.sub(
+        r"(?:[.!?]+\s*)?i\s+moved\s+it[.!?]*\s*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
 
     value = re.sub(
         r"[.!?]+\s*$",

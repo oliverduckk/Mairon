@@ -70,6 +70,16 @@ CONTEXTUAL_EVALUATION_PATTERN = re.compile(
 )
 
 
+CONTEXTUAL_AGREEMENT_PATTERN = re.compile(
+    r"(?:"
+    r"\b(?:do|would)\s+you\s+(?:actually\s+)?agree\b|"
+    r"\byou\s+(?:actually\s+)?agree\b|"
+    r"\bagree\s+or\s+disagree\b"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
 def _infer_immediate_user_subject(
     text: str,
 ) -> Optional[str]:
@@ -146,6 +156,32 @@ def _infer_immediate_user_subject(
         return None
 
     return value[:120] or None
+
+
+def _looks_like_contextual_agreement_question(
+    text: str,
+) -> bool:
+    """Recognise an agreement request that depends on the prior user turn.
+
+    This helper is intentionally context-only. A standalone factual question
+    such as "Do you agree TCP uses a three-way handshake?" remains factual.
+    The caller decides whether the preceding user turn is conversational/
+    evaluative enough for agreement to be treated as Mairon's judgement.
+    """
+
+    value = str(
+        text
+        or ""
+    ).strip()
+
+    if not value:
+        return False
+
+    return bool(
+        CONTEXTUAL_AGREEMENT_PATTERN.search(
+            value
+        )
+    )
 
 
 def _looks_like_contextual_opinion_question(
@@ -1660,6 +1696,14 @@ class ConversationState:
                 or ""
             ).strip()
 
+            previous_intent = str(
+                previous.get(
+                    "intent",
+                    "",
+                )
+                or ""
+            ).strip()
+
             if previous_text:
                 turn.entities[
                     "_conversation_context_user_text"
@@ -1667,13 +1711,7 @@ class ConversationState:
 
                 turn.entities[
                     "_conversation_context_intent"
-                ] = str(
-                    previous.get(
-                        "intent",
-                        "",
-                    )
-                    or ""
-                ).strip()
+                ] = previous_intent
 
             if pronouns:
                 referent = (
@@ -1807,8 +1845,20 @@ class ConversationState:
             if (
                 turn.intent
                 == "factual_question"
-                and _looks_like_contextual_opinion_question(
-                    text
+                and (
+                    _looks_like_contextual_opinion_question(
+                        text
+                    )
+                    or (
+                        previous_intent
+                        in {
+                            "share_opinion",
+                            "casual_conversation",
+                        }
+                        and _looks_like_contextual_agreement_question(
+                            text
+                        )
+                    )
                 )
             ):
                 turn.speech_act = "question"

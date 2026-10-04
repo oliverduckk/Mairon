@@ -77,13 +77,19 @@ class ConsequentialAdviceAssessment:
 def _normalise(
     text: str,
 ) -> str:
+    value = str(
+        text
+        or ""
+    ).translate({
+        0x2018: ord("'"),
+        0x2019: ord("'"),
+        0x02BC: ord("'"),
+    }).strip()
+
     return re.sub(
         r"\s+",
         " ",
-        str(
-            text
-            or ""
-        ).strip(),
+        value,
     )
 
 
@@ -265,9 +271,117 @@ def build_consequential_research_query(
     return value[:500]
 
 
+
+def infer_consequential_actor_role(
+    text: str,
+    domain: Optional[str] = None,
+) -> Optional[str]:
+    """Infer Oliver's role in a bounded consequential incident.
+
+    This is deliberately conservative. It only resolves roles that Oliver
+    states directly; otherwise Core leaves the role unknown rather than
+    inventing who controls the affected asset/account.
+    """
+
+    if str(domain or "").strip().lower() != "financial":
+        return None
+
+    value = _normalise(text).lower()
+
+    if re.search(
+        r"\b(?:i|we)\b[^.!?]{0,45}\b(?:sent|transferred|wired|paid)\b"
+        r"[^.!?]{0,90}\b(?:wrong|incorrect)\b",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return "mistaken_sender"
+
+    if (
+        re.search(
+            r"\b(?:someone|they|a person|another person)\b[^.!?]{0,60}"
+            r"\b(?:sent|transferred|wired|paid)\b[^.!?]{0,45}\b(?:me|us)\b"
+            r"[^.!?]{0,60}\b(?:mistake|accident|wrong)\b",
+            value,
+            flags=re.IGNORECASE,
+        )
+        or re.search(
+            r"\b(?:money|funds|payment|transfer)\b[^.!?]{0,60}"
+            r"\b(?:appeared|showed up|landed|arrived|was sent)\b[^.!?]{0,45}"
+            r"\b(?:my|our)\s+(?:bank\s+)?account\b",
+            value,
+            flags=re.IGNORECASE,
+        )
+    ):
+        return "mistaken_recipient"
+
+    return None
+
+
+def find_consequential_role_violations(
+    user_input: str,
+    draft: str,
+    *,
+    domain: Optional[str] = None,
+) -> list[str]:
+    """Reject advice that flips Oliver's explicitly stated incident role."""
+
+    role = infer_consequential_actor_role(
+        user_input,
+        domain=domain,
+    )
+
+    value = _normalise(draft).lower()
+
+    if not value or role is None:
+        return []
+
+    violations = []
+
+    if role == "mistaken_sender":
+        # A sender no longer controls funds that reached the unintended
+        # recipient. Instructions to avoid spending/touching/moving those
+        # funds silently turn Oliver into the recipient.
+        if re.search(
+            r"\b(?:do\s+not|don't|dont|stop|avoid)\b[^.!?]{0,55}"
+            r"\b(?:touch|touching|spend|spending|move|moving|withdraw|"
+            r"withdrawing|use|using|freeze)\b[^.!?]{0,70}"
+            r"\b(?:money|funds|transfer|it|accounts?|affected\s+accounts?)\b",
+            value,
+            flags=re.IGNORECASE,
+        ) or re.search(
+            r"\b(?:money|funds)\b[^.!?]{0,35}\b(?:in|into)\s+your\s+"
+            r"(?:bank\s+)?account\b",
+            value,
+            flags=re.IGNORECASE,
+        ) or re.search(
+            r"\b(?:do\s+not|don't|dont|stop|avoid)\b[^.!?]{0,55}"
+            r"\b(?:touch|move|withdraw|use|freeze)\b[^.!?]{0,70}"
+            r"\b(?:your\s+|the\s+|any\s+)?(?:affected\s+)?(?:bank\s+)?accounts?\b",
+            value,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "consequential advice flipped Oliver from mistaken sender to recipient/control-holder"
+            )
+
+    elif role == "mistaken_recipient":
+        if re.search(
+            r"\b(?:recall|reverse|cancel|stop)\b[^.!?]{0,40}\b(?:the\s+)?transfer\b"
+            r"[^.!?]{0,40}\b(?:you|your)\b",
+            value,
+            flags=re.IGNORECASE,
+        ):
+            violations.append(
+                "consequential advice flipped Oliver from mistaken recipient to sender"
+            )
+
+    return violations
+
+
 def build_consequential_advice_instruction(
     *,
     domain: Optional[str],
+    user_input: Optional[str] = None,
 ) -> str:
     domain_label = (
         str(
@@ -281,9 +395,32 @@ def build_consequential_advice_instruction(
         .strip()
     )
 
+    actor_role = infer_consequential_actor_role(
+        user_input or "",
+        domain=domain,
+    )
+
+    role_instruction = ""
+
+    if actor_role == "mistaken_sender":
+        role_instruction = (
+            "- Oliver explicitly described himself as the SENDER of the mistaken "
+            "payment/transfer. Preserve that actor direction. Do not tell him not "
+            "to spend, touch, withdraw, move, or freeze money/accounts as though the "
+            "mistaken funds were sitting in his account. A mistaken outgoing transfer "
+            "does not by itself mean his own bank accounts must be frozen or left untouched.\n"
+        )
+    elif actor_role == "mistaken_recipient":
+        role_instruction = (
+            "- Oliver explicitly described himself as the RECIPIENT of a mistaken "
+            "payment/transfer. Preserve that actor direction; do not describe him "
+            "as the person who initiated/sent the transfer.\n"
+        )
+
     return (
         "CORE CONSEQUENTIAL ADVICE MODE:\n"
-        "- This is a high-seriousness "
+        + role_instruction
+        + "- This is a high-seriousness "
         + domain_label
         + " incident. Help first; personality is secondary.\n"
         "- Give the most useful verified immediate actions before asking for "
@@ -334,15 +471,21 @@ def find_consequential_tone_violations(
         "at least you will have a good story",
         "stop panicking",
         "panic mode",
+        "pull your head out",
         "take a breath",
         "calm down",
+        "freeze up",
+        "stare at a screen",
+        "staring at a screen",
+        "don't just freeze",
+        "dont just freeze",
         "lmao",
         " lol ",
         "😂",
         "🤣",
     )
 
-    return [
+    violations = [
         (
             "consequential advice used banter, blame, or "
             "emotional-management language: "
@@ -351,3 +494,19 @@ def find_consequential_tone_violations(
         for marker in markers
         if marker in value
     ]
+
+    blame_patterns = (
+        r"\boh,?\s+great\b",
+        r"\bclassic\s+(?:way|move|mistake)\b[^.!?]{0,80}\b(?:lose|lost|send|transfer|money|payment)\b",
+        r"\b(?:hit|clicked|pressed|sent|transferred|paid)\b[^.!?]{0,90}\bbefore\b[^.!?]{0,50}\b(?:check|checking|double[- ]?check|verify|verifying)\b",
+        r"\byou\b[^.!?]{0,60}\b(?:should(?:'ve| have)|could(?:'ve| have))\b[^.!?]{0,60}\b(?:check|verify|notice|catch)\b",
+    )
+    for pattern in blame_patterns:
+        match = re.search(pattern, value, flags=re.IGNORECASE)
+        if match:
+            violations.append(
+                "consequential advice used banter, blame, or emotional-management language: "
+                + match.group(0)
+            )
+
+    return list(dict.fromkeys(violations))

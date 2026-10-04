@@ -84,6 +84,12 @@ _LEXICAL_QUERY_PATTERNS = (
     r"^\s*what(?:'s| is)\s+the\s+meaning\s+of\s+(.{1,70}?)\s*[?.!]*\s*$",
     r"^\s*define\s+(.{1,70}?)\s*[?.!]*\s*$",
     r"^\s*is\s+(.{1,70}?)\s+(?:a\s+)?(?:real\s+)?(?:word|term)\s*[?.!]*\s*$",
+    # Conversationally prefixed definition questions such as
+    # "quick one: what's a dravonetic handshake in computer networking?".
+    # Capture only the short named term before the domain preposition.
+    r"\bwhat(?:'s| is)\s+(?:an?\s+)?"
+    r"([A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,3})\s+"
+    r"(?:in|for)\s+[A-Za-z]",
 )
 
 
@@ -114,6 +120,7 @@ _CATEGORICAL_LEXICAL_DENIAL_PATTERNS = (
     r"(?:word|term|expression)\b",
     r"\b(?:does\s+not|doesn['’]?t|doesnt)\s+exist\b",
     r"\b(?:there(?:'s| is)\s+no\s+such\s+(?:word|term|expression))\b",
+    r"\bthere(?:'s| is)\s+no\s+such\s+thing\s+as\b",
     r"\b(?:it(?:'s| is)|that(?:'s| is)|this\s+is)\s+(?:just\s+)?"
     r"(?:nonsense|gibberish|fake|made[ -]up|invented)\b",
     r"\b[\w'-]+\s+is\s+(?:pure\s+|just\s+)?"

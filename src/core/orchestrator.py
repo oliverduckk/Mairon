@@ -429,6 +429,20 @@ class MaironCore:
                 "Do not introduce unrelated world facts or invent missing numerical inputs.",
                 "If an essential premise is missing, state that instead of guessing.",
             ])
+
+            if turn.entities.get("reasoning_kind") == "code_trace":
+                contract.forbidden_behaviours.extend([
+                    "Trace the supplied code in execution order rather than jumping straight to the final mutated state.",
+                    "If Oliver supplied multiple print/output expressions, report each observed output separately and in order.",
+                    "For Python default arguments, distinguish the reused default object from closure variables; do not claim a default argument is stored in a closure merely because it persists across calls.",
+                ])
+
+            if turn.entities.get("reasoning_kind") == "threshold_comparison":
+                contract.forbidden_behaviours.extend([
+                    "Answer only the supplied threshold/limit comparison.",
+                    "Do not infer fees, enforcement, security-screening outcomes, dimensional fit, or other consequences that Oliver did not supply.",
+                ])
+
             direct_response = turn.entities.get("reasoning_direct_answer")
             self.conversation_state.update_from_turn(turn)
             return CoreDecision(

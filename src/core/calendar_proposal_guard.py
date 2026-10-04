@@ -212,6 +212,90 @@ def _explicit_date(user_text: str, now_local: datetime, start_clock: time) -> da
     return None
 
 
+
+_CALENDAR_WRITE_PREFIX_RE = re.compile(
+    r"\b(?:add|put|schedule|book|create|set|plan)\s+"
+    r"(?:(?:me|us)\s+)?(?:(?:a|an|the)\s+)?",
+    re.I,
+)
+_TITLE_STOP_RE = re.compile(
+    r"\s+(?:"
+    r"(?:on|to|in)\s+(?:my|our|the)\s+calendar\b|"
+    r"(?:for|on)\s+(?:today|tomorrow|the\s+day\s+after\s+tomorrow)\b|"
+    r"(?:for|on)\s+(?:(?:this|next|coming)\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|"
+    r"(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|"
+    r"(?:from|between|at)\s+\d{1,2}(?::[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?|$)|"
+    r"20\d{2}-\d{2}-\d{2}\b|"
+    r"\d{1,2}(?:st|nd|rd|th)?\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)\b|"
+    r"(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?\b"
+    r")",
+    re.I,
+)
+
+
+def extract_user_calendar_summary(user_input: str) -> str | None:
+    """Extract an event title only from the explicit user-authored request.
+
+    This is intentionally conservative. It exists so a clear calendar request
+    does not depend on the language model remembering to call the approval
+    proposal tool. The function never invents a title: if the text between an
+    action verb and the date/calendar boundary is not usable, return None and
+    let the normal model/tool path ask for clarification.
+    """
+    text = " ".join(str(user_input or "").strip().split())
+    if not text:
+        return None
+    match = _CALENDAR_WRITE_PREFIX_RE.search(text)
+    if match is None:
+        return None
+    tail = text[match.end():].strip()
+    if not tail:
+        return None
+    stop = _TITLE_STOP_RE.search(tail)
+    title = tail[: stop.start()] if stop is not None else tail
+    title = title.strip(" \t\r\n,.;:-")
+    # A trailing bare preposition means extraction stopped too late and the
+    # candidate is not a trustworthy user-authored title.
+    title = re.sub(r"\s+\b(?:for|on|at|from|between|to|in)\b\s*$", "", title, flags=re.I).strip()
+    if not title or len(title) > 120:
+        return None
+    # Don't accept text that is really just an action/calendar noun rather
+    # than a meaningful event label.
+    if title.lower() in {"event", "calendar event", "something on my calendar"}:
+        return None
+    return title
+
+
+def build_calendar_approval_from_user_request(
+    *,
+    user_input: str,
+    timezone_name: str = "Australia/Sydney",
+    now: datetime | None = None,
+) -> ValidatedCalendarProposal | None:
+    """Deterministically prepare approval when title/date/time are user-grounded.
+
+    Returns None only when Core cannot conservatively extract a title. Date and
+    time ambiguity still raises CalendarProposalError so an unsafe proposal can
+    never fall through to a guessed model timestamp.
+    """
+    summary = extract_user_calendar_summary(user_input)
+    if not summary:
+        return None
+    return validate_calendar_proposal(
+        user_input=user_input,
+        model_arguments={
+            "summary": summary,
+            # validate_calendar_proposal derives authoritative timestamps from
+            # the user text and treats these absent suggestions as corrected.
+            "start_time": "",
+            "end_time": "",
+            "location": "",
+            "description": "",
+        },
+        timezone_name=timezone_name,
+        now=now,
+    )
+
 def _parse_proposed_datetime(value: Any, tz: ZoneInfo) -> datetime:
     try:
         result = datetime.fromisoformat(str(value or ""))

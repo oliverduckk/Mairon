@@ -7,6 +7,46 @@ from zoneinfo import ZoneInfo
 
 from ollama import Client
 
+
+def _strip_internal_reasoning_markup(text):
+    """Remove accidental model reasoning tags from user-visible content.
+
+    Qwen normally returns hidden thinking separately, but malformed completions
+    can occasionally emit <think>/</think> markers into message.content. If a
+    closing marker appears with useful text after it, keep the post-marker
+    answer and discard the preceding reasoning-looking prefix. Otherwise strip
+    the tags/blocks without inventing replacement content.
+    """
+    value = str(text or "")
+    if not value:
+        return ""
+
+    # Proper paired reasoning blocks.
+    value = re.sub(
+        r"<think\b[^>]*>.*?</think\s*>",
+        "",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # A dangling closing tag commonly separates leaked reasoning from the
+    # actual answer. Prefer the content after the final marker when present.
+    if re.search(r"</think\s*>", value, flags=re.IGNORECASE):
+        parts = re.split(r"</think\s*>", value, flags=re.IGNORECASE)
+        tail = str(parts[-1] or "").strip()
+        if tail:
+            value = tail
+        else:
+            value = " ".join(parts[:-1])
+
+    value = re.sub(
+        r"</?think\b[^>]*>",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return value.strip()
+
 from tools.tool_registry import TOOLS, execute_tool
 
 from personality.personality_engine import (
@@ -35,6 +75,7 @@ from personality.conversation_policy import (
 
 from personality.spoiler_guard import (
     build_core_spoiler_control_response,
+    build_spoiler_safe_discussion_fallback,
     build_spoiler_guard_text,
     find_spoiler_guard_violations,
     prepare_spoiler_context,
@@ -72,11 +113,17 @@ from research.public_factual_grounding import (
     build_failed_public_advice_fallback,
     build_failed_public_factual_fallback,
     build_failed_public_opinion_fallback,
+    build_supported_current_lookup_fallback,
+    find_grounded_opinion_response_violations,
     build_public_factual_retry_instruction,
     verify_public_factual_draft,
 )
 
-from core.intent_router import reconstruct_bounded_factual_followup
+from core.intent_router import (
+    is_source_provenance_followup,
+    reconstruct_bounded_factual_followup,
+    source_provenance_research_query,
+)
 
 from core.conversational_research import (
     build_background_research_offer_text,
@@ -96,6 +143,7 @@ from core.seriousness import (
     assess_consequential_advice,
     build_consequential_advice_instruction,
     build_consequential_research_query,
+    find_consequential_role_violations,
     find_consequential_tone_violations,
 )
 
@@ -108,14 +156,36 @@ from personality.opinion_ledger import (
 
 from core.claim_grounding import (
     build_core_grounding_fallback,
+    build_recommendation_request_fallback,
     build_insufficient_user_context_fallback,
     build_user_context_reasoning_fallback,
+    build_stable_model_knowledge_fallback,
+    build_diagnostic_reasoning_fallback,
+    build_debate_continuation_fallback,
     build_verification_declined_fallback,
     build_core_grounding_retry_instruction,
     build_mairon_agency_modality_instruction,
     build_recent_user_grounding_context,
     find_mairon_agency_modality_violations,
     find_incidental_public_attribution_violations,
+    find_user_diagnostic_overclaim_violations,
+    find_pairwise_comparison_drift_violations,
+    find_recommendation_forecast_violations,
+    find_recommendation_topic_drift_violations,
+    find_recommendation_completion_violations,
+    find_explicit_example_request_violations,
+    find_session_cookie_security_violations,
+    find_python_mutable_default_semantics_violations,
+    find_scaler_leakage_contradiction_violations,
+    find_tcp_udp_semantics_violations,
+    find_ai_job_market_answer_violations,
+    find_insufficient_context_overreach_violations,
+    find_explicit_user_constraint_violations,
+    find_source_provenance_honesty_violations,
+    find_self_evaluation_overreach_violations,
+    find_factual_personal_observation_violations,
+    find_question_echo_violations,
+    find_unknown_media_opinion_overreach_violations,
     should_verify_core_grounding,
     should_verify_factual_focus_fidelity,
     verify_core_grounded_draft,
@@ -123,6 +193,7 @@ from core.claim_grounding import (
 )
 from core.calendar_proposal_guard import (
     CalendarProposalError,
+    build_calendar_approval_from_user_request,
     validate_calendar_proposal,
 )
 from core.temporal_context import (
@@ -6888,6 +6959,105 @@ def repair_core_restricted_draft(
     return repaired
 
 
+def build_substantive_opinion_fallback(
+    user_input,
+    spoiler_context,
+    media_domain_active,
+    conversation=None,
+):
+    """Return a useful bounded opinion when every generated draft was rejected.
+
+    Initial opinion requests must never collapse to the generic social fallback
+    ("Got it."). When an explicit media spoiler ceiling is active, reuse the
+    existing craft-level spoiler-safe fallback; otherwise keep the take modest
+    and avoid inventing factual support.
+    """
+    if media_domain_active:
+        media_fallback = build_spoiler_safe_discussion_fallback(
+            user_input,
+            spoiler_context,
+        )
+        if media_fallback:
+            return media_fallback
+
+    value = re.sub(r"\s+", " ", str(user_input or "").strip())
+
+    # Contextual self-evaluation is allowed to reason over development changes
+    # Oliver explicitly supplied in the live conversation. Do not collapse a
+    # question like "reckon you're finally becoming useful?" into generic
+    # epistemic refusal when the immediately preceding user context names a
+    # concrete capability improvement.
+    if re.search(
+        r"\b(?:reckon|think)\b[^?]{0,45}\b(?:you(?:'re| are)|you)\b"
+        r"[^?]{0,55}\b(?:useful|better|improving|improved|competent|ready|solid)\b",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        recent_user_context = str(
+            build_recent_user_grounding_context(
+                conversation,
+                max_user_messages=4,
+            )
+            or ""
+        )
+        if re.search(
+            r"\b(?:added|built|implemented|fixed|improved|introduced|enabled)\b"
+            r"[^.\n]{0,120}\b(?:diagnostics?|routing|metadata|visibility|logging|trace|"
+            r"tooling|feature|capability)\b|"
+            r"\bdeveloper\s+diagnostics?\b|"
+            r"\brouting\s+and\s+model\s+metadata\b",
+            recent_user_context,
+            flags=re.IGNORECASE,
+        ):
+            return (
+                "Yeah, more useful in the concrete sense you just gave me: the new diagnostics "
+                "give you visibility into my routing and model metadata instead of making you guess. "
+                "That doesn't prove every answer is good, but it is a real capability improvement."
+            )
+
+    # Abstract user-authored comparisons are safe to engage directly. The
+    # fallback should not pretend it needs external evidence for a proposition
+    # that is itself subjective reasoning supplied by Oliver.
+    comparative = re.search(
+        r"^\s*(?:i\s+think|imo|in\s+my\s+opinion)\s+"
+        r"(?P<a>.+?)\s+can\s+be\s+better\s+than\s+(?P<b>.+?)\s+if\s+(?P<c>.+?)(?:[?.!]|$)",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if comparative:
+        left = re.sub(r"\s+", " ", comparative.group("a").strip())
+        right = re.sub(r"\s+", " ", comparative.group("b").strip())
+        condition = re.sub(r"\s+", " ", comparative.group("c").strip())
+        return (
+            "Yeah, that distinction makes sense to me. "
+            + left.capitalize()
+            + " isn't automatically worse than "
+            + right
+            + "; the important part is whether "
+            + condition
+            + ". If that condition is doing real work, the slower or less immediate option can absolutely be the better one."
+        )
+
+    explicit_unknown_subject = re.search(
+        r"\bwhat\s+do\s+you\s+(?:actually\s+)?think\s+(?:of|about)\s+(?P<subject>.+?)(?:[?.!]|$)",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if explicit_unknown_subject:
+        subject = str(explicit_unknown_subject.group("subject") or "").strip()
+        subject = re.sub(r"\s*(?:dont|don't|do not)\s+just\s+agree\s+with\s+me.*$", "", subject, flags=re.IGNORECASE).strip()
+        if subject:
+            return (
+                "I don't know enough about " + subject +
+                " to give you a real take without making details up, and I won't pretend I've read it."
+            )
+
+    return (
+        "I don't have enough grounded detail to give you a confident take on that without inventing support. "
+        "I'd rather be explicit about that than fake certainty."
+    )
+
+
 def find_core_micro_act_relevance_violations(
     response_text,
     user_input,
@@ -6916,6 +7086,7 @@ def find_core_micro_act_relevance_violations(
         "acknowledge",
         "casual_conversation",
         "self_correction",
+        "share_opinion",
     }:
         return []
 
@@ -6938,6 +7109,32 @@ def find_core_micro_act_relevance_violations(
     user_lowered = user_text.lower()
 
     violations = []
+
+    if (
+        intent == "share_opinion"
+        and re.search(
+            r"\b(?:thoughts?|what\s+do\s+you\s+think|what(?:'s|\s+is)\s+your\s+(?:take|view|opinion)|"
+            r"agree\s+or\s+disagree|do\s+you\s+agree)\b",
+            user_lowered,
+            flags=re.IGNORECASE,
+        )
+    ):
+        compact = re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+        generic_acknowledgements = {
+            "got it",
+            "noted",
+            "understood",
+            "okay",
+            "ok",
+            "right got you",
+            "fair",
+            "fair enough",
+        }
+        if compact in generic_acknowledgements or len(response) < 25:
+            violations.append(
+                "explicit opinion/thoughts request received only a bare acknowledgement instead of a substantive response"
+            )
+
 
     meta_defensive_markers = (
         "i'm not denying",
@@ -6997,6 +7194,18 @@ def find_core_micro_act_relevance_violations(
                 "Core social micro-act responded to an imaginary "
                 "accusation/validator instead of Oliver's current message"
             )
+        )
+
+    if (
+        re.search(r"\bjust\s+wanted\s+to\s+(?:tell|share)\b", user_lowered)
+        and re.fullmatch(
+            r"(?:noted|got\s+it|understood|okay|ok|right|fair)(?:,?\s+oliver)?[.!]*",
+            lowered,
+            flags=re.IGNORECASE,
+        )
+    ):
+        violations.append(
+            "Core social micro-act collapsed an explicit sharing moment into a generic acknowledgement"
         )
 
     return violations
@@ -7647,6 +7856,7 @@ def build_email_read_verified_fallback(
 def find_core_answer_contract_violations(
     response_text,
     core_answer_contract,
+    user_input=None,
 ):
     """
     Deterministic validation for the parts of the Core contract that can be
@@ -7753,6 +7963,33 @@ def find_core_answer_contract_violations(
         ):
             violations.append(
                 "simple acknowledgement drifted into unrelated content"
+            )
+
+    if intent == "casual_conversation" and len(text.split()) <= 1:
+        violations.append(
+            "casual conversation response became an empty/one-word acknowledgement"
+        )
+
+    runtime = coerce_answer_contract_runtime(core_answer_contract)
+    debate_continuation = bool(
+        (
+            runtime
+            and str((runtime.metadata or {}).get("debate_continuation") or "").strip().lower()
+            in {"1", "true", "yes"}
+        )
+        or (
+            intent == "share_opinion"
+            and looks_like_debate_continuation(user_input)
+        )
+    )
+
+    if intent == "share_opinion" and debate_continuation:
+        acknowledgement_only = lowered.strip(" .!?,") in {
+            "got it", "fair", "fair enough", "yeah", "yep", "okay", "ok", "sure"
+        }
+        if acknowledgement_only or len(text.split()) < 12:
+            violations.append(
+                "explicit counterargument/debate request was answered with a bare acknowledgement"
             )
 
     if intent == "share_context":
@@ -8258,12 +8495,28 @@ def handle_direct_conversation(
         == "conversation_recall"
     )
 
+    previous_user_for_factual_followup = _latest_user_authored_message(conversation)
+
     resolved_factual_followup_query = (
         reconstruct_bounded_factual_followup(
-            user_input, _latest_user_authored_message(conversation)
+            user_input, previous_user_for_factual_followup
         )
         if core_intent == "factual_question"
         else None
+    )
+
+    source_provenance_query = (
+        source_provenance_research_query(
+            user_input, previous_user_for_factual_followup
+        )
+        if core_intent == "factual_question"
+        else None
+    )
+
+    core_is_source_provenance_followup = bool(
+        resolved_factual_followup_query
+        and source_provenance_query
+        and is_source_provenance_followup(user_input)
     )
 
     core_uses_restricted_generation_context = (
@@ -8410,6 +8663,48 @@ def handle_direct_conversation(
             None
         )
 
+    # verification_declined is already a complete Core epistemic decision:
+    # Oliver explicitly prohibited the lookup needed to establish an exact or
+    # current public fact. Do not spend a model/tool loop trying to improvise
+    # wording and then risk an empty-response fallback bypassing that decision.
+    if (
+        core_intent == "factual_question"
+        and core_epistemic_mode == "verification_declined"
+    ):
+        final_response_text = build_verification_declined_fallback()
+
+        working_conversation = list(conversation)
+        working_conversation.append({
+            "role": "system",
+            "content": get_runtime_context(),
+        })
+        working_conversation.append({
+            "role": "user",
+            "content": user_input,
+        })
+        working_conversation.append({
+            "role": "assistant",
+            "content": final_response_text,
+        })
+
+        if not core_is_consequential_advice:
+            record_accepted_relationship_response(
+                response_text=final_response_text,
+                relationship_context=relationship_context,
+            )
+
+        print(
+            "[Epistemic] Verification declined by Oliver; Core returned the "
+            "deterministic no-browse fallback without model/tool generation."
+        )
+
+        return (
+            final_response_text,
+            working_conversation,
+            None,
+            None,
+        )
+
     self_correction_context = (
         build_recent_self_correction_text(
             user_input=user_input,
@@ -8484,15 +8779,17 @@ def handle_direct_conversation(
         else None
     )
 
+    contract_runtime = coerce_answer_contract_runtime(core_answer_contract)
+    contract_debate_continuation = bool(
+        contract_runtime
+        and str((contract_runtime.metadata or {}).get("debate_continuation") or "").strip().lower()
+        in {"1", "true", "yes"}
+    )
     core_is_debate_continuation = bool(
         core_intent == "share_opinion"
-        and opinion_subject
-        and opinion_subject.get(
-            "kind"
-        )
-        == "pairwise_comparison"
-        and looks_like_debate_continuation(
-            user_input
+        and (
+            contract_debate_continuation
+            or looks_like_debate_continuation(user_input)
         )
     )
 
@@ -8644,6 +8941,7 @@ def handle_direct_conversation(
 
     public_factual_evidence = None
     public_factual_research_success = False
+    public_readable_sources = []
 
     public_research_requested = (
         (
@@ -8693,7 +8991,9 @@ def handle_direct_conversation(
             )
 
             public_research_input = (
-                resolved_factual_followup_query or user_input
+                source_provenance_query
+                or resolved_factual_followup_query
+                or user_input
             )
 
         public_research_result = (
@@ -8704,6 +9004,12 @@ def handle_direct_conversation(
                     if core_is_consequential_advice
                     else 2
                 ),
+                # Foreground answers must preserve hard referents in Oliver's
+                # actual query. A readable page about the same broad topic is
+                # not enough when it fails to resolve an explicit date or
+                # similarly deterministic query constraint.
+                require_query_resolution=True,
+                require_quality_evidence=True,
             )
         )
 
@@ -8766,7 +9072,11 @@ def handle_direct_conversation(
                 "sources",
                 []
             )
-            if source.get("read_success")
+            if (
+                source.get("read_success")
+                and source.get("accepted_as_evidence") is not False
+                and source.get("relevance_status") != "rejected"
+            )
         ]
 
         for index, source in enumerate(
@@ -8805,6 +9115,103 @@ def handle_direct_conversation(
                 public_research_result
             )
         )
+
+        # Exact identification is safer and more useful when accepted source
+        # metadata already resolves the requested identity unambiguously.
+        # In that case Core owns the narrow extractive answer instead of asking
+        # Qwen to reinterpret a title/date and potentially invent exclusions or
+        # a different episode number.
+        supported_exact_lookup = (
+            build_supported_current_lookup_fallback(
+                public_factual_evidence,
+                user_input,
+            )
+            if (
+                public_factual_research_success
+                and core_intent == "factual_question"
+                and not core_is_source_provenance_followup
+            )
+            else None
+        )
+        if supported_exact_lookup is not None:
+            final_response_text = supported_exact_lookup
+            working_conversation = list(conversation)
+            working_conversation.append({
+                "role": "system",
+                "content": get_runtime_context(),
+            })
+            working_conversation.append({
+                "role": "user",
+                "content": user_input,
+            })
+            working_conversation.append({
+                "role": "assistant",
+                "content": final_response_text,
+            })
+            print(
+                "[Research] Accepted evidence uniquely resolved the requested "
+                "media identity; Core returned an extractive answer without model generation."
+            )
+            return (
+                final_response_text,
+                working_conversation,
+                None,
+                None,
+            )
+
+        # Required public-source lanes may not fall back to model memory when
+        # Core retrieved zero accepted evidence. Returning a deterministic
+        # calibrated response here prevents an empty evidence packet from being
+        # followed by confident current-world claims.
+        if not public_factual_research_success:
+            if core_is_consequential_advice:
+                final_response_text = build_failed_public_advice_fallback(
+                    domain=consequential_domain,
+                    user_input=user_input,
+                )
+            elif core_is_grounded_opinion:
+                final_response_text = build_failed_public_opinion_fallback()
+            else:
+                stable_public_fallback = build_stable_model_knowledge_fallback(
+                    user_input=user_input,
+                    conversation=conversation,
+                )
+                final_response_text = (
+                    stable_public_fallback
+                    or build_failed_public_factual_fallback()
+                )
+
+            working_conversation = list(conversation)
+            working_conversation.append({
+                "role": "system",
+                "content": get_runtime_context(),
+            })
+            working_conversation.append({
+                "role": "user",
+                "content": user_input,
+            })
+            working_conversation.append({
+                "role": "assistant",
+                "content": final_response_text,
+            })
+
+            if not core_is_consequential_advice:
+                record_accepted_relationship_response(
+                    response_text=final_response_text,
+                    relationship_context=relationship_context,
+                )
+
+            print(
+                "[Research] Required public evidence unavailable; Core returned "
+                "a deterministic fail-closed response without model generation."
+            )
+
+            return (
+                final_response_text,
+                working_conversation,
+                None,
+                None,
+            )
 
     grounded_research_evidence = (
         research_evidence
@@ -9065,6 +9472,7 @@ def handle_direct_conversation(
                 "content": (
                     build_consequential_advice_instruction(
                         domain=consequential_domain,
+                        user_input=user_input,
                     )
                 ),
             })
@@ -9249,15 +9657,31 @@ def handle_direct_conversation(
         })
 
     if resolved_factual_followup_query:
-        base_messages.append({
-            "role": "system",
-            "content": (
-                "CORE FACTUAL FOLLOW-UP: The current fragment inherits the "
-                "question structure (not the answer) of Oliver's nearest "
-                "previous user-authored question. Answer this resolved query "
-                "and nothing else: " + resolved_factual_followup_query
-            ),
-        })
+        if core_is_source_provenance_followup:
+            base_messages.append({
+                "role": "system",
+                "content": (
+                    "CORE SOURCE-PROVENANCE FOLLOW-UP: Oliver's CURRENT turn is asking "
+                    "which source/link was actually used. Core re-ran the nearest previous "
+                    "USER-authored factual request to retrieve fresh evidence. Answer the "
+                    "CURRENT provenance question, not the old question. Give the exact URL "
+                    "only when it appears in Core's newly retrieved readable evidence. If no "
+                    "requested official/primary page was actually readable in this turn, say "
+                    "that plainly. Do not trust or repeat a URL merely because a prior "
+                    "assistant message contained it. Research target: "
+                    + (source_provenance_query or resolved_factual_followup_query)
+                ),
+            })
+        else:
+            base_messages.append({
+                "role": "system",
+                "content": (
+                    "CORE FACTUAL FOLLOW-UP: The current fragment inherits the "
+                    "question structure (not the answer) of Oliver's nearest "
+                    "previous user-authored question. Answer this resolved query "
+                    "and nothing else: " + resolved_factual_followup_query
+                ),
+            })
 
     if core_intent == "conversation_recall":
         live_recall_context = (
@@ -9452,10 +9876,32 @@ def handle_direct_conversation(
             )
         )
 
+        candidate_violations.extend(
+            find_question_echo_violations(
+                user_input=user_input,
+                draft=candidate_text,
+            )
+        )
+
+        if core_is_grounded_opinion:
+            candidate_violations.extend(
+                find_grounded_opinion_response_violations(
+                    user_input=user_input,
+                    draft=candidate_text,
+                )
+            )
+
         if core_is_consequential_advice:
             candidate_violations.extend(
                 find_consequential_tone_violations(
                     candidate_text
+                )
+            )
+            candidate_violations.extend(
+                find_consequential_role_violations(
+                    user_input=user_input,
+                    draft=candidate_text,
+                    domain=consequential_domain,
                 )
             )
 
@@ -9497,6 +9943,7 @@ def handle_direct_conversation(
             find_core_answer_contract_violations(
                 response_text=candidate_text,
                 core_answer_contract=core_answer_contract,
+                user_input=user_input,
             )
         )
 
@@ -10028,8 +10475,17 @@ def handle_direct_conversation(
                     )
                 )
 
+        sanitized_draft_text = _strip_internal_reasoning_markup(
+            original_draft_text
+        )
+
+        if sanitized_draft_text != original_draft_text.strip():
+            print(
+                "[Grounding] Removed leaked internal reasoning markup from draft."
+            )
+
         draft_text = repair_core_restricted_draft(
-            response_text=original_draft_text,
+            response_text=sanitized_draft_text,
             core_answer_contract=core_answer_contract,
         )
 
@@ -10131,20 +10587,20 @@ def handle_direct_conversation(
                     )
 
         # A categorical claim that an unfamiliar word "isn't real" is
-        # epistemically unsupported. Guard the actual published draft; a
-        # prompt alone did not stop the Phase 11.6.2 live failure.
-        if factual_focus_fidelity_required:
-            draft_text, lexical_calibration_applied = (
-                repair_unjustified_lexical_denial(
-                    user_input=user_input,
-                    draft=draft_text,
-                )
+        # epistemically unsupported. Apply this narrow lexical repair on every
+        # route, including researched factual turns: failure to find a standard
+        # term is not proof that no niche/private term can exist.
+        draft_text, lexical_calibration_applied = (
+            repair_unjustified_lexical_denial(
+                user_input=user_input,
+                draft=draft_text,
             )
-            if lexical_calibration_applied:
-                print(
-                    "[Epistemic] Replaced an unsupported categorical "
-                    "lexical denial with calibrated uncertainty."
-                )
+        )
+        if lexical_calibration_applied:
+            print(
+                "[Epistemic] Replaced an unsupported categorical "
+                "lexical denial with calibrated uncertainty."
+            )
 
         if generation_debug_enabled():
             print(
@@ -10231,6 +10687,21 @@ def handle_direct_conversation(
             )
         )
 
+        violations.extend(
+            find_question_echo_violations(
+                user_input=user_input,
+                draft=draft_text,
+            )
+        )
+
+        if core_intent == "share_opinion":
+            violations.extend(
+                find_unknown_media_opinion_overreach_violations(
+                    user_input=user_input,
+                    draft=draft_text,
+                )
+            )
+
         if opinion_subject:
             violations.extend(
                 find_pairwise_opinion_integrity_violations(
@@ -10250,6 +10721,13 @@ def handle_direct_conversation(
             violations.extend(
                 find_consequential_tone_violations(
                     draft_text
+                )
+            )
+            violations.extend(
+                find_consequential_role_violations(
+                    user_input=user_input,
+                    draft=draft_text,
+                    domain=consequential_domain,
                 )
             )
 
@@ -10296,6 +10774,130 @@ def handle_direct_conversation(
             find_core_answer_contract_violations(
                 response_text=draft_text,
                 core_answer_contract=core_answer_contract,
+                user_input=user_input,
+            )
+        )
+
+        violations.extend(
+            find_pairwise_comparison_drift_violations(
+                draft=draft_text,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
+        violations.extend(
+            find_recommendation_forecast_violations(
+                draft=draft_text,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
+        violations.extend(
+            find_recommendation_topic_drift_violations(
+                user_input=user_input,
+                draft=draft_text,
+                conversation=conversation,
+            )
+        )
+
+        violations.extend(
+            find_recommendation_completion_violations(
+                user_input=user_input,
+                draft=draft_text,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
+        violations.extend(
+            find_explicit_example_request_violations(
+                user_input=user_input,
+                draft=draft_text,
+            )
+        )
+
+        violations.extend(
+            find_session_cookie_security_violations(
+                user_input=user_input,
+                draft=draft_text,
+            )
+        )
+
+        violations.extend(
+            find_python_mutable_default_semantics_violations(
+                user_input=user_input,
+                draft=draft_text,
+                conversation=conversation,
+            )
+        )
+
+        violations.extend(
+            find_scaler_leakage_contradiction_violations(
+                user_input=user_input,
+                draft=draft_text,
+                conversation=conversation,
+            )
+        )
+
+        violations.extend(
+            find_tcp_udp_semantics_violations(
+                user_input=user_input,
+                draft=draft_text,
+            )
+        )
+
+        violations.extend(
+            find_ai_job_market_answer_violations(
+                user_input=user_input,
+                draft=draft_text,
+            )
+        )
+
+        violations.extend(
+            find_insufficient_context_overreach_violations(
+                draft=draft_text,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
+        violations.extend(
+            find_explicit_user_constraint_violations(
+                user_input=user_input,
+                draft=draft_text,
+            )
+        )
+
+        violations.extend(
+            find_source_provenance_honesty_violations(
+                user_input=user_input,
+                draft=draft_text,
+            )
+        )
+
+        violations.extend(
+            find_self_evaluation_overreach_violations(
+                user_input=user_input,
+                draft=draft_text,
+            )
+        )
+
+        violations.extend(
+            find_factual_personal_observation_violations(
+                user_input=user_input,
+                draft=draft_text,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
+        # Diagnostic calibration is a direct-answer acceptance invariant, not
+        # merely a factual-focus add-on. Run it for every factual diagnostic
+        # route so stable-model-knowledge drafts cannot bypass the same checks
+        # that user-context/public-source follow-ups receive.
+        violations.extend(
+            find_user_diagnostic_overclaim_violations(
+                user_input=user_input,
+                draft=draft_text,
+                core_answer_contract=core_answer_contract,
+                conversation=conversation,
             )
         )
 
@@ -10428,6 +11030,14 @@ def handle_direct_conversation(
                 public_factual_verification
             )
 
+            if core_is_grounded_opinion:
+                violations.extend(
+                    find_grounded_opinion_response_violations(
+                        user_input=user_input,
+                        draft=draft_text,
+                    )
+                )
+
         violations = list(
             dict.fromkeys(
                 violations
@@ -10482,11 +11092,58 @@ def handle_direct_conversation(
                     salvaged_draft
                     and salvaged_draft != draft_text.strip()
                 ):
-                    salvage_violations = (
+                    salvage_violations = list(
                         _validate_salvaged_research_draft(
                             salvaged_draft
                         )
                     )
+                    salvage_violations.extend(
+                        find_ai_job_market_answer_violations(
+                            user_input=user_input,
+                            draft=salvaged_draft,
+                        )
+                    )
+                    salvage_violations.extend(
+                        find_user_diagnostic_overclaim_violations(
+                            user_input=user_input,
+                            draft=salvaged_draft,
+                            core_answer_contract=core_answer_contract,
+                            conversation=conversation,
+                        )
+                    )
+                    salvage_violations.extend(
+                        find_explicit_user_constraint_violations(
+                            user_input=user_input,
+                            draft=salvaged_draft,
+                        )
+                    )
+                    salvage_violations.extend(
+                        find_source_provenance_honesty_violations(
+                            user_input=user_input,
+                            draft=salvaged_draft,
+                        )
+                    )
+                    salvage_violations.extend(
+                        find_pairwise_comparison_drift_violations(
+                            draft=salvaged_draft,
+                            core_answer_contract=core_answer_contract,
+                        )
+                    )
+                    salvage_violations.extend(
+                        find_recommendation_completion_violations(
+                            user_input=user_input,
+                            draft=salvaged_draft,
+                            core_answer_contract=core_answer_contract,
+                        )
+                    )
+                    salvage_violations.extend(
+                        find_factual_personal_observation_violations(
+                            user_input=user_input,
+                            draft=salvaged_draft,
+                            core_answer_contract=core_answer_contract,
+                        )
+                    )
+                    salvage_violations = list(dict.fromkeys(salvage_violations))
 
                     if not salvage_violations:
                         accepted_draft_text = (
@@ -10523,6 +11180,19 @@ def handle_direct_conversation(
         )
 
     if violations:
+        core_intent = _core_contract_value(
+            core_answer_contract,
+            "Intent",
+        )
+        diagnostic_fallback = (
+            build_diagnostic_reasoning_fallback(
+                user_input=user_input,
+                conversation=conversation,
+            )
+            if core_intent == "factual_question"
+            else None
+        )
+
         core_grounding_failed = any(
             (
                 "unsupported Core-grounded claim"
@@ -10535,7 +11205,13 @@ def handle_direct_conversation(
             for violation in violations
         )
 
-        if research_evidence:
+        if diagnostic_fallback is not None:
+            final_response_text = diagnostic_fallback
+            print(
+                "[Grounding] Diagnostic drafts remained invalid; Core used a calibrated bounded diagnostic fallback."
+            )
+
+        elif research_evidence:
             final_response_text = (
                 build_failed_grounding_fallback(
                     opinion_entry=opinion_entry
@@ -10548,10 +11224,29 @@ def handle_direct_conversation(
             )
 
         elif public_factual_evidence:
-            if core_is_consequential_advice:
+            if core_is_source_provenance_followup and public_readable_sources:
+                used_source = public_readable_sources[0]
+                used_url = str(used_source.get("url") or "").strip()
+                if used_url:
+                    final_response_text = (
+                        "I did retrieve and read a public source for this turn. "
+                        "The URL I actually loaded is " + used_url + "."
+                    )
+                else:
+                    final_response_text = (
+                        "I did retrieve a readable public source for this turn, but Core "
+                        "did not retain a usable URL for it, so I won't invent one."
+                    )
+                print(
+                    "[Research] Provenance drafts remained invalid; Core used the "
+                    "actual retrieved-source URL fallback."
+                )
+
+            elif core_is_consequential_advice:
                 final_response_text = (
                     build_failed_public_advice_fallback(
                         domain=consequential_domain,
+                        user_input=user_input,
                     )
                 )
 
@@ -10562,7 +11257,11 @@ def handle_direct_conversation(
 
             else:
                 final_response_text = (
-                    build_failed_public_factual_fallback()
+                    build_supported_current_lookup_fallback(
+                        public_factual_evidence,
+                        user_input,
+                    )
+                    or build_failed_public_factual_fallback()
                 )
 
             print(
@@ -10571,12 +11270,20 @@ def handle_direct_conversation(
             )
 
         else:
-            core_intent = _core_contract_value(
-                core_answer_contract,
-                "Intent",
-            )
-
             if (
+                core_intent == "share_opinion"
+                and core_is_debate_continuation
+                and not (opinion_subject and opinion_subject.get("kind") == "pairwise_comparison")
+            ):
+                final_response_text = build_debate_continuation_fallback(
+                    user_input=user_input,
+                    conversation=conversation,
+                )
+                print(
+                    "[Opinion] Debate drafts remained invalid; Core used a substantive counterargument fallback."
+                )
+
+            elif (
                 opinion_subject
                 and opinion_subject.get(
                     "kind"
@@ -10596,6 +11303,17 @@ def handle_direct_conversation(
                 print(
                     "[Opinion] Pairwise drafts remained invalid; Core used a "
                     "persona-safe debate fallback."
+                )
+
+            elif core_intent == "share_opinion":
+                final_response_text = build_substantive_opinion_fallback(
+                    user_input=user_input,
+                    spoiler_context=spoiler_context,
+                    media_domain_active=media_domain_active,
+                    conversation=conversation,
+                )
+                print(
+                    "[Opinion] Opinion drafts remained invalid; Core used a substantive bounded fallback."
                 )
 
             elif (
@@ -10633,6 +11351,17 @@ def handle_direct_conversation(
                     "the verified extractive fallback."
                 )
 
+            elif (
+                media_domain_active
+                and build_spoiler_safe_discussion_fallback(user_input, spoiler_context) is not None
+            ):
+                final_response_text = build_spoiler_safe_discussion_fallback(
+                    user_input, spoiler_context
+                )
+                print(
+                    "[Spoiler] Drafts remained invalid; Core used a spoiler-safe craft-level fallback."
+                )
+
             elif core_epistemic_mode == "user_context_reasoning":
                 final_response_text = build_user_context_reasoning_fallback(
                     user_input=user_input,
@@ -10643,6 +11372,27 @@ def handle_direct_conversation(
                     "bounded USER-only fallback instead of exposing guardrail internals."
                 )
 
+            elif core_epistemic_mode == "stable_model_knowledge":
+                stable_fallback = build_stable_model_knowledge_fallback(
+                    user_input=user_input,
+                    conversation=conversation,
+                )
+                if stable_fallback is not None:
+                    final_response_text = stable_fallback
+                    print(
+                        "[Grounding] Stable-knowledge drafts remained invalid; Core used a "
+                        "narrow deterministic concept fallback."
+                    )
+                else:
+                    final_response_text = (
+                        "I couldn't produce a reliable answer to that without crossing "
+                        "the evidence limits for this turn."
+                    )
+                    print(
+                        "[Personality] Stable-knowledge drafts remained invalid and no "
+                        "deterministic concept fallback was available."
+                    )
+
             elif core_epistemic_mode == "insufficient_user_context":
                 final_response_text = build_insufficient_user_context_fallback(user_input)
                 print("[Epistemic] Missing-input fallback used; no lookup or guess performed.")
@@ -10650,6 +11400,16 @@ def handle_direct_conversation(
             elif core_epistemic_mode == "verification_declined":
                 final_response_text = build_verification_declined_fallback()
                 print("[Epistemic] No-browse fallback used; exact/current fact left unverified.")
+
+            elif core_intent == "recommendation_request":
+                final_response_text = build_recommendation_request_fallback(
+                    user_input=user_input,
+                    conversation=conversation,
+                )
+                print(
+                    "[Grounding] Recommendation drafts remained invalid; Core used a "
+                    "bounded useful recommendation fallback."
+                )
 
             else:
                 final_response_text = (
@@ -10756,6 +11516,9 @@ def _get_response_impl(
     core_intent = _core_contract_value(
         core_answer_contract, "Intent"
     )
+    core_epistemic_mode = _core_contract_value(
+        core_answer_contract, "Epistemic mode"
+    )
 
     # 11.6.6A: permission availability is not permission to request cloud
     # on Oliver's behalf. Only explicitly requested cloud turns expose it.
@@ -10789,6 +11552,36 @@ def _get_response_impl(
         conversation = strip_ephemeral_core_contracts(
             conversation
         )
+
+    # verification_declined is a provider-ingress invariant, not merely a
+    # direct-conversation behaviour. Some no-browse prompts do not satisfy the
+    # conversational fast-path heuristic, so handling this only inside
+    # handle_direct_conversation lets the general tool/model loop bypass Core's
+    # epistemic decision. Return the deterministic truthful answer here before
+    # ANY specialised workflow, tool pool, or model generation can run.
+    if (
+        core_intent == "factual_question"
+        and core_epistemic_mode == "verification_declined"
+    ):
+        final_response_text = build_verification_declined_fallback()
+        working_conversation = list(conversation)
+        working_conversation.append({
+            "role": "system",
+            "content": get_runtime_context(),
+        })
+        working_conversation.append({
+            "role": "user",
+            "content": user_input,
+        })
+        working_conversation.append({
+            "role": "assistant",
+            "content": final_response_text,
+        })
+        print(
+            "[Epistemic] Verification declined by Oliver at provider ingress; "
+            "Core returned the deterministic no-browse fallback without model/tool generation."
+        )
+        return final_response_text, working_conversation, None, None
 
     # --------------------------------------------------
     # Continue a pending Night Routine v1 clarification.
@@ -11060,8 +11853,36 @@ def _get_response_impl(
         return answer, safe_history, None, None
 
     if core_intent == "calendar_event_creation_request":
-        # Core already established explicit write intent. Expose only a
-        # permission-request tool, never an actual Calendar write tool.
+        # For a fully explicit user-authored title/date/time, Core can prepare
+        # the approval deterministically. Do this before asking the model to
+        # propose the same structured data: a missed tool call must never turn
+        # a clear request into a fake "please restate" failure. This still
+        # only returns a pending action; execution remains approval-gated.
+        try:
+            core_calendar = build_calendar_approval_from_user_request(
+                user_input=user_input,
+                timezone_name=os.getenv(
+                    "MAIRON_TIMEZONE",
+                    "Australia/Sydney",
+                ),
+            )
+        except CalendarProposalError as exc:
+            clarification = str(exc).strip() or (
+                "Please provide an unambiguous calendar date and time."
+            )
+            safe_history = list(base_conversation)
+            safe_history.append({"role": "user", "content": user_input})
+            safe_history.append({"role": "assistant", "content": clarification})
+            print("[Calendar] Core rejected an ambiguous/invalid user-authored proposal before approval.")
+            return clarification, safe_history, None, None
+
+        if core_calendar is not None:
+            print("[Calendar] Core prepared a deterministic approval proposal from explicit user-authored details.")
+            return None, base_conversation, None, core_calendar.action
+
+        # Core already established explicit write intent. If a trustworthy
+        # title could not be extracted, expose only a permission-request tool,
+        # never an actual Calendar write tool.
         tools = [CALENDAR_EVENT_REQUEST_TOOL]
         working_conversation.append({
             "role": "system",

@@ -109,6 +109,10 @@ class AnswerContractRuntime:
         default_factory=dict
     )
 
+    metadata: Dict[str, str] = field(
+        default_factory=dict
+    )
+
     source: str = "structured"
 
     def field_value(
@@ -343,6 +347,17 @@ def runtime_from_answer_contract(
             )
             or {}
         ),
+        metadata={
+            str(key): str(value)
+            for key, value in (
+                getattr(
+                    contract,
+                    "metadata",
+                    {},
+                )
+                or {}
+            ).items()
+        },
         source="structured",
     )
 
@@ -472,6 +487,51 @@ def _parse_resolved_referents(
     return resolved
 
 
+def _parse_forbidden_behaviours(
+    contract_text: str,
+) -> Tuple[str, ...]:
+    """Reconstruct rendered FORBIDDEN lines at the legacy provider seam."""
+
+    items = []
+    for raw_line in str(contract_text or "").splitlines():
+        stripped = raw_line.strip()
+        if not stripped.startswith("- FORBIDDEN:"):
+            continue
+        value = stripped[len("- FORBIDDEN:"):].strip()
+        if value:
+            items.append(value)
+    return tuple(items)
+
+
+def _parse_legacy_metadata(
+    forbidden_behaviours: Tuple[str, ...],
+) -> Dict[str, str]:
+    """Recover structured metadata encoded in rendered behavioural limits.
+
+    The live router/provider seam still transports rendered contract text.
+    Reconstruct only metadata with an explicit, Core-authored sentence shape so
+    provider validators receive the same comparison frame as structured tests.
+    """
+
+    metadata: Dict[str, str] = {}
+    for item in forbidden_behaviours:
+        match = re.search(
+            r"Preserve the requested comparison between "
+            r"(?P<left>[A-Za-z0-9][A-Za-z0-9+._ -]{0,40}?) and "
+            r"(?P<right>[A-Za-z0-9][A-Za-z0-9+._ -]{0,40}?) "
+            r"when Oliver narrows the criteria",
+            str(item or ""),
+            flags=re.IGNORECASE,
+        )
+        if match:
+            left = match.group("left").strip(" -")
+            right = match.group("right").strip(" -")
+            if left and right:
+                metadata["comparison_frame"] = f"{left} vs {right}"
+                break
+    return metadata
+
+
 def _parse_verified_evidence_claims(
     contract_text: str,
 ) -> Tuple[str, ...]:
@@ -572,6 +632,12 @@ def runtime_from_legacy_text(
     fields = _parse_field_lines(
         text
     )
+    forbidden_behaviours = _parse_forbidden_behaviours(
+        text
+    )
+    legacy_metadata = _parse_legacy_metadata(
+        forbidden_behaviours
+    )
 
     return AnswerContractRuntime(
         task=fields.get(
@@ -632,6 +698,8 @@ def runtime_from_legacy_text(
                 text
             )
         ),
+        forbidden_behaviours=forbidden_behaviours,
+        metadata=legacy_metadata,
         resolved_referents=(
             _parse_resolved_referents(
                 text

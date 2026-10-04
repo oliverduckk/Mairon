@@ -2052,6 +2052,8 @@ FACTUAL_PROCESS_COMMENTARY_PATTERNS = (
     r"\bI\s+(?:checked|looked up|searched|verified|consulted)\b.{0,80}\b(?:answer|fact|map|source|web|internet)\b",
     r"\b(?:hard[- ]coded|training data|model memory|system fact|correct answer)\b",
     r"\bI(?:'ll| will)\s+(?:stick|go)\s+with\b.{0,40}\b(?:answer|that|this)\b",
+    r"\bmy\s+(?:system\s+)?instructions?\b[^.!?]{0,100}\b(?:prevent|require|allow|forbid|stop|mean)\b",
+    r"\b(?:the|my)\s+(?:guardrails?|internal\s+rules?|system\s+rules?)\b[^.!?]{0,100}\b(?:prevent|require|allow|forbid|stop)\b",
 )
 
 

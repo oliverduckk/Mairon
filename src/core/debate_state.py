@@ -138,6 +138,18 @@ _DEBATE_CONTINUATION_PATTERNS = (
         r"\bargue\s+(?:it|that|your\s+case)\b",
         flags=re.IGNORECASE,
     ),
+    re.compile(
+        r"\b(?:give|make|offer)\s+(?:me\s+)?(?:an?\s+)?(?:actual\s+|real\s+)?counter(?:argument|point)\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:what(?:'s|\s+is)|give\s+me)\s+(?:the\s+)?(?:other|opposite)\s+side\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bpush\s+back\b",
+        flags=re.IGNORECASE,
+    ),
 )
 
 

@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -175,6 +176,31 @@ class AnswerContract:
         )
 
 
+def _extract_bounded_vs_frame(text: str):
+    """Extract a compact X-vs-Y frame from user-authored wording only.
+
+    This is continuity metadata, not an assertion that either side is better.
+    Keep the parser conservative so ordinary uses of "versus" in prose do not
+    become long-lived comparison state.
+    """
+    value = re.sub(r"\s+", " ", str(text or "").strip())
+    match = re.search(
+        r"\b(?P<left>[A-Za-z0-9][A-Za-z0-9+._ -]{0,40}?)\s+"
+        r"(?:vs\.?|versus)\s+"
+        r"(?P<right>[A-Za-z0-9][A-Za-z0-9+._ -]{0,40}?)"
+        r"(?=\s+(?:for|when|with|if|but|and|actually|overall)\b|[,.!?;:]|$)",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    left = match.group("left").strip(" -")
+    right = match.group("right").strip(" -")
+    if not left or not right:
+        return None
+    return left, right
+
+
 def build_answer_contract(
     turn: TurnState,
     route: EpistemicRoute,
@@ -308,6 +334,108 @@ def build_answer_contract(
                 "Do not start public research to solve a hypothetical or a question "
                 "about the task already described by Oliver.",
             ])
+
+            diagnostic_context = " ".join([
+                str(turn.raw_text or ""),
+                str(turn.entities.get("_conversation_context_user_text", "") or ""),
+                str(turn.entities.get("_user_task_history", "") or ""),
+            ])
+            if re.search(
+                r"\b(?:mbps|gbps|ping|latency|speed\s*test|signal|wi[- ]?fi|wireless|mesh|"
+                r"router|backhaul|flicker|refresh\s+rate|vrr|measurement|measured|tested|reading)\b",
+                diagnostic_context,
+                flags=re.IGNORECASE,
+            ):
+                contract.forbidden_behaviours.extend([
+                    "When Oliver supplies diagnostic measurements, distinguish what they "
+                    "actually rule out from what they merely make more or less likely.",
+                    "Do not say an unmeasured component, backhaul, band, adapter, topology, "
+                    "hardware path, wall material, or physical layout is proven merely from "
+                    "a nearby/far-away measurement unless Oliver explicitly tested it.",
+                ])
+                if re.search(r"\b(?:vrr|variable\s+refresh)\b", diagnostic_context, re.IGNORECASE):
+                    contract.forbidden_behaviours.extend([
+                        "VRR follows frame presentation cadence; do not claim scene brightness/luminance chooses the refresh rate.",
+                        "Do not invent Oliver's panel technology or dimming method (for example OLED/PWM) when he did not provide it.",
+                        "A symptom occurring with VRR enabled can support VRR as a possibility, not a proven root cause without further isolation.",
+                    ])
+                if re.search(
+                    r"\b(?:what|which)\b[^?]{0,50}\b(?:test|check|try)\b[^?]{0,25}\bfirst\b|"
+                    r"\bfirst\b[^?]{0,25}\b(?:test|check|thing)\b",
+                    str(turn.raw_text or ""),
+                    flags=re.IGNORECASE,
+                ):
+                    contract.forbidden_behaviours.append(
+                        "For the first diagnostic test, prefer a low-risk observation that isolates one variable "
+                        "before forcing a band/channel, changing configuration, or recommending new hardware."
+                    )
+        bounded_task_context = " ".join([
+            str(turn.raw_text or ""),
+            str(turn.entities.get("_conversation_context_user_text", "") or ""),
+            str(turn.entities.get("_user_task_history", "") or ""),
+        ])
+        if re.search(
+            r"def\s+[A-Za-z_]\w*\s*\([^)]*=\s*\[\s*\]",
+            bounded_task_context,
+            flags=re.IGNORECASE,
+        ):
+            contract.forbidden_behaviours.append(
+                "For Python mutable defaults: the default object is evaluated once and stored with the function's defaults; do not describe it as being stored in a closure."
+            )
+
+        if (
+            "scaler" in bounded_task_context.lower()
+            and re.search(r"train\s*/?\s*test", bounded_task_context, flags=re.IGNORECASE)
+        ):
+            contract.forbidden_behaviours.extend([
+                "If preprocessing is fit on the full dataset including the test set, the test set is no longer fully independent/unseen for evaluation.",
+                "Do not explain a leaking workflow and then claim that same workflow keeps evaluation realistic, unbiased, or not inflated.",
+            ])
+
+        comparison_context = " ".join([
+            str(turn.entities.get("_conversation_context_user_text", "") or ""),
+            str(turn.raw_text or ""),
+        ])
+        comparison_frame = _extract_bounded_vs_frame(comparison_context)
+        if comparison_frame:
+            left, right = comparison_frame
+            contract.metadata["comparison_frame"] = f"{left} vs {right}"
+            contract.forbidden_behaviours.extend([
+                f"Preserve the requested comparison between {left} and {right} when Oliver narrows the criteria; do not silently replace either side with a third option.",
+                "A third platform/tool may be mentioned as context only if useful, but it must not replace one of the two requested comparison sides.",
+            ])
+
+        current_user_text = str(turn.raw_text or "")
+        if re.search(
+            r"\b(?:don['’]?t|do\s+not)\s+(?:invent|assume|infer)\b[^.!?]{0,80}\b(?:my\s+)?budget\b",
+            current_user_text,
+            flags=re.IGNORECASE,
+        ):
+            contract.forbidden_behaviours.append(
+                "Oliver explicitly said not to infer his budget. You may discuss generic cost trade-offs, "
+                "but do not personalise them as 'your budget', 'if you're on a budget', or a claimed preference for saving money."
+            )
+
+        if re.search(
+            r"\b(?:don['’]?t|do\s+not)\s+(?:invent|assume|infer)\b[^.!?]{0,100}"
+            r"\b(?:which\s+one\s+i\s+(?:already\s+)?own|what\s+i\s+(?:already\s+)?own|my\s+current\s+(?:device|computer|machine))\b",
+            current_user_text,
+            flags=re.IGNORECASE,
+        ):
+            contract.forbidden_behaviours.append(
+                "Oliver explicitly said not to infer which platform/device he owns. Keep ownership/current-device assumptions out of the answer."
+            )
+
+        if re.search(
+            r"\b(?:nah\s+)?i\s+mean\b|\bnot\s+whether\b|\bwhat\s+i\s+mean\b",
+            str(turn.raw_text or ""),
+            flags=re.IGNORECASE,
+        ):
+            contract.forbidden_behaviours.append(
+                "Oliver corrected the requested answer frame. Answer the corrected request "
+                "directly; do not repeat or paraphrase the discarded interpretation before answering."
+            )
+
         contract.forbidden_behaviours.extend([
             "Answer the current factual question before doing anything conversational.",
             "Do not append callbacks to unrelated prior topics after the factual answer.",
@@ -333,6 +461,19 @@ def build_answer_contract(
             "Do not turn unverified predictions or future outcomes into personality filler; "
             "phrases such as likely to stay, expected to remain, not going anywhere, "
             "anytime soon, or for the foreseeable future are still factual claims.",
+        ])
+
+    if turn.intent == "recommendation_request":
+        contract.allow_recommendations = True
+        contract.allow_follow_up_question = False
+        contract.forbidden_behaviours.extend([
+            "Answer an explicit recommendation request with the requested recommendation; "
+            "do not replace it with a generic evidence-limit or capability refusal when a "
+            "broad, reversible recommendation can be given from stable knowledge.",
+            "If Oliver asks for ONE step, skill, item, or action, give exactly one primary "
+            "recommendation rather than expanding into a multi-step plan.",
+            "Keep supporting detail minimal and do not invent personal constraints Oliver did not state.",
+            "Do not justify a recommendation with a confident prediction that AI, automation, a market, employer, or technology can or cannot replace a role/skill unless verified evidence in this turn establishes that forecast.",
         ])
 
     if turn.intent == "share_opinion":

@@ -393,6 +393,9 @@ CONTEXTUAL_EMAIL_FOLLOWUP_PATTERNS = [
 DECLARATIVE_SHARE_PATTERNS = [
     r"^\s*(?:they|it|these|those|this)\s+(?:are|is|were|was)\b",
     r"^\s*i(?:'m| am| just| bought| got| have| own| use| read| watch| like| love| hate| reckon| think)\b",
+    # Explicitly clarifying that a message was only a social share is itself
+    # user-provided context, not a new shopping/advice request.
+    r"\b(?:i\s+)?just\s+wanted\s+to\s+(?:tell|share)\b",
 
     # First-person plural updates are also user-provided context:
     #
@@ -445,7 +448,19 @@ OPINION_PATTERNS = [
 ASSISTANT_OPINION_REQUEST_PATTERNS = [
     r"\bwhat(?:'s| is| are)\s+your\s+(?:top|favo(?:u)?rite)\b",
     r"\bwhat\s+(?:do|would)\s+you\s+(?:prefer|pick|choose)\b",
-    r"\bwhat\s+do\s+you\s+think\s+(?:of|about)\b",
+
+    # Direct requests for Mairon's own judgement. Optional conversational
+    # emphasis ("actually") must not turn an opinion request into a factual
+    # public-world lookup.
+    r"\bwhat\s+do\s+you\s+(?:actually\s+)?think\s+(?:of|about)\b",
+    r"\bwhat(?:'s|\s+is)\s+your\s+(?:take|opinion|view)\b",
+
+    # Elliptical self-evaluation addressed to Mairon, e.g.
+    # "reckon you're finally becoming useful?" Keep this evaluation-shaped
+    # rather than capturing every factual sentence beginning "reckon you're".
+    r"\breckon\s+you(?:'re|\s+are)\b[^?!.]{0,100}\b"
+    r"(?:useful|good|bad|better|worse|improving|competent|decent|solid|ready)\b",
+
     r"\bwhich\b.{0,80}\bdo\s+you\s+prefer\b",
     r"\bwhich\b.{0,80}\bwould\s+you\s+(?:pick|choose)\b",
     r"\bhow\s+would\s+you\s+rank\b",
@@ -490,6 +505,7 @@ CONVERSATION_RECALL_PATTERNS = [
 SELF_CORRECTION_PATTERNS = [
     r"\bscratch that\b",
     r"\bi meant\b",
+    r"^\s*(?:wait[\s,!-]*)?correction\b",
     r"\bcorrection\s*[:,]",
     r"\bi got that wrong\b",
     r"\bi said that wrong\b",
@@ -524,6 +540,21 @@ BANTER_PATTERNS = [
     r"\bdumb cunt\b",
     r"\byou idiot\b",
 ]
+
+COUNTERARGUMENT_REQUEST_PATTERNS = [
+    r"\b(?:give|show)\s+me\s+(?:an?\s+)?(?:(?:actual|real|proper)\s+)?counter[- ]?argument\b",
+    r"\b(?:give|show)\s+me\s+(?:an?\s+)?(?:(?:actual|real|proper)\s+)?counterpoint\b",
+    r"\bargue\s+(?:the\s+)?other\s+side\b",
+    r"\bpush\s+back\s+on\s+(?:that|this|me)\b",
+]
+
+
+TRADEOFF_ANALYSIS_REQUEST_PATTERNS = [
+    r"\b(?:give|gimme|show|tell)\s+(?:me|us)\b.{0,60}\btrade[- ]?offs?\b",
+    r"\b(?:real|actual|practical)\s+trade[- ]?offs?\b",
+    r"\bpros\s+(?:and|&)\s+cons\b",
+]
+
 
 RECOMMENDATION_REQUEST_PATTERNS = [
     r"\bone\s+(?:(?:actual|really)\s+)?(?:useful|practical|concrete|specific)\s+(?:next\s+)?step\b",
@@ -1098,6 +1129,21 @@ def _apply_pairwise_opinion_turn(
     return state
 
 
+def is_source_provenance_followup(user_input: str) -> bool:
+    """Whether the current turn asks which source/link was actually used.
+
+    This is intentionally surface-shaped. It does not trust a prior assistant
+    citation; callers must re-run the previous USER-authored factual request.
+    """
+    current = _strip_discourse_prefixes(_normalise(user_input))
+    return bool(re.search(
+        r"\b(?:which\s+(?:official\s+)?link|what\s+(?:official\s+)?source|"
+        r"source\s+url|did\s+you\s+(?:actually\s+)?(?:load|open|read|browse))\b",
+        current,
+        flags=re.IGNORECASE,
+    ))
+
+
 def reconstruct_bounded_factual_followup(
     user_input: str,
     previous_user_text: str | None,
@@ -1114,13 +1160,40 @@ def reconstruct_bounded_factual_followup(
         r"(?P<service>[a-z][a-z0-9+.-]{1,30})\s*[?.!]*",
         current,
     )
-    if not match:
-        return None
-    if (
-        re.search(r"\b(?:default|standard)\s+port\s+(?:for|of)\s+[a-z0-9+.-]+", previous)
-        or re.search(r"\bwhat\s+port\s+does\s+[a-z0-9+.-]+\s+(?:normally|usually)\s+use", previous)
-    ):
-        return f"What is the default port for {match.group('service').upper()}?"
+    if match:
+        if (
+            re.search(r"\b(?:default|standard)\s+port\s+(?:for|of)\s+[a-z0-9+.-]+", previous)
+            or re.search(r"\bwhat\s+port\s+does\s+[a-z0-9+.-]+\s+(?:normally|usually)\s+use", previous)
+        ):
+            return f"What is the default port for {match.group('service').upper()}?"
+
+    # Source-provenance follow-ups need to re-run the ORIGINAL user question,
+    # not search the web for the phrase "which official link is that from?".
+    # Prior assistant prose is deliberately not inherited; only the prior USER
+    # request is reconstructed and external verification must happen again.
+    if previous and is_source_provenance_followup(current):
+        return (
+            previous_user_text.strip()
+            + "\nVerify this again from the requested official/primary source and return the exact source URL."
+        )
+
+    return None
+
+
+def source_provenance_research_query(
+    user_input: str,
+    previous_user_text: str | None,
+) -> Optional[str]:
+    """Return only the prior USER-authored request for provenance re-verification.
+
+    ``reconstruct_bounded_factual_followup`` intentionally retains its older
+    model-facing contract (including a synthetic verification instruction).
+    Web search must not receive that synthetic text, so the provider uses this
+    separate helper for the actual research query.
+    """
+    previous = str(previous_user_text or "").strip()
+    if previous and is_source_provenance_followup(user_input):
+        return previous
     return None
 
 
@@ -2335,6 +2408,33 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
 
         return state
 
+    # A fully supplied scalar-threshold comparison (for example 9 kg against
+    # a user-provided 7 kg limit) is deterministic even when it continues a
+    # previous topic. Route it before generic user-grounded follow-up handling
+    # so Core answers only the supplied relation instead of inventing external
+    # consequences such as fees or enforcement.
+    supplied_reasoning = classify_supplied_reasoning(raw)
+    if (
+        supplied_reasoning is not None
+        and supplied_reasoning.kind == "threshold_comparison"
+    ):
+        state.speech_act = "question"
+        state.intent = "reason_from_supplied_premises"
+        state.factuality = "user_premise_reasoning"
+        state.preferred_authority = "user_turn_reasoning"
+        state.should_use_tools = False
+        state.should_recommend = False
+        state.should_answer_directly = False
+        state.should_continue_conversation = False
+        state.entities["reasoning_kind"] = supplied_reasoning.kind
+        if supplied_reasoning.direct_answer is not None:
+            state.entities["reasoning_direct_answer"] = supplied_reasoning.direct_answer
+        state.confidence = 0.98
+        state.add_reason(
+            "explicit same-unit threshold comparison is fully determined by user-supplied numbers"
+        )
+        return state
+
     # Genuine user-grounded questions (including a correction followed by a
     # question) should not be reduced to a correction ACK or public web search.
     # Only the user's own bounded recent turns can establish this dependency.
@@ -2513,7 +2613,8 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
 
         return state
 
-    supplied_reasoning = classify_supplied_reasoning(raw)
+    if supplied_reasoning is None:
+        supplied_reasoning = classify_supplied_reasoning(raw)
     if supplied_reasoning is not None:
         state.speech_act = "question"
         state.intent = "reason_from_supplied_premises"
@@ -2538,6 +2639,31 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.should_continue_conversation = False
         state.confidence = 0.98
         state.add_reason("gratitude/acknowledgement")
+        return state
+
+    if _matches_any(text, COUNTERARGUMENT_REQUEST_PATTERNS):
+        state.speech_act = "question"
+        state.intent = "share_opinion"
+        state.should_recommend = False
+        state.should_continue_conversation = True
+        state.factuality = "subjective"
+        state.confidence = 0.96
+        state.entities["_debate_continuation"] = "true"
+        state.add_reason(
+            "explicit counterargument/counterpoint request continues conversational debate"
+        )
+        return state
+
+    if _matches_any(text, TRADEOFF_ANALYSIS_REQUEST_PATTERNS):
+        state.speech_act = "question"
+        state.intent = "factual_question"
+        state.factuality = "requires_epistemic_routing"
+        state.should_recommend = False
+        state.should_continue_conversation = True
+        state.confidence = 0.95
+        state.add_reason(
+            "explicit trade-off analysis request is informational rather than casual banter"
+        )
         return state
 
     if _matches_any(text, RECOMMENDATION_REQUEST_PATTERNS):

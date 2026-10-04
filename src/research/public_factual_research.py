@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import datetime
 from urllib.parse import urlparse
 
 from tools.tool_registry import execute_tool
@@ -54,6 +55,9 @@ FRESHNESS_SENSITIVE_PATTERNS = [
     r"\bexchange rate\b",
     r"\bstock price\b",
     r"\bshare price\b",
+    r"\bnext year\b",
+    r"\bby next (?:year|month|week)\b",
+    r"\bthis year\b",
 ]
 
 FORECAST_REQUEST_PATTERNS = [
@@ -66,6 +70,9 @@ FORECAST_REQUEST_PATTERNS = [
     r"\b(?:likely|unlikely|expected|expect)\b.{0,80}\b(?:future|next|soon|remain|stay|continue|change|leave|happen|become)\b",
     r"\bchances? (?:of|that)\b",
     r"\bin the future\b",
+    r"\bnext year\b",
+    r"\bby next (?:year|month|week)\b",
+    r"\b(?:will|gonna|going to)\b.{0,100}\bnext year\b",
 ]
 
 
@@ -86,6 +93,10 @@ GENERIC_RESEARCH_IDENTITY_TERMS = {
     "products", "release", "released", "releases", "review", "reviews",
     "series", "specification", "specifications", "status", "the", "to",
     "update", "updates", "version", "versions", "vs", "what", "which",
+    # Calendar words are query constraints, not durable entity identity.
+    "january", "jan", "february", "feb", "march", "mar", "april", "apr",
+    "may", "june", "jun", "july", "jul", "august", "aug", "september",
+    "sept", "sep", "october", "oct", "november", "nov", "december", "dec",
 }
 
 
@@ -99,6 +110,9 @@ SOCIAL_OR_COMMUNITY_DOMAINS = {
     "x.com",
     "twitter.com",
     "quora.com",
+    "wattpad.com",
+    "archiveofourown.org",
+    "fanfiction.net",
 }
 
 RETAILER_OR_MARKETPLACE_DOMAINS = {
@@ -217,6 +231,330 @@ def _corpus_contains_anchor(corpus, anchor):
     )
 
 
+
+_MONTH_NAME_TO_NUMBER = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sept": 9, "sep": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+
+def _query_resolution_constraints(query):
+    """Extract literal query details that a source must actually resolve.
+
+    These are deliberately narrow. Their job is to stop search-result lexical
+    collisions from silently changing the user's referent (for example,
+    "September 9" becoming "Episode 9").
+    """
+
+    value = str(query or "")
+    constraints = []
+
+    month_names = (
+        "january|jan|february|feb|march|mar|april|apr|may|june|jun|"
+        "july|jul|august|aug|september|sept|sep|october|oct|"
+        "november|nov|december|dec"
+    )
+
+    patterns = [
+        rf"\b(?P<month>{month_names})\.?\s+(?P<day>[0-3]?\d)(?:st|nd|rd|th)?\b",
+        rf"\b(?P<day>[0-3]?\d)(?:st|nd|rd|th)?\s+(?:of\s+)?(?P<month>{month_names})\.?\b",
+    ]
+
+    seen = set()
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, value, flags=re.IGNORECASE):
+            month_token = str(match.group("month") or "").lower().rstrip(".")
+            month = _MONTH_NAME_TO_NUMBER.get(month_token)
+
+            try:
+                day = int(match.group("day"))
+            except (TypeError, ValueError):
+                continue
+
+            if month is None or not (1 <= day <= 31):
+                continue
+
+            key = ("month_day", month, day)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            constraints.append({
+                "kind": "month_day",
+                "month": month,
+                "day": day,
+                "label": match.group(0).strip(),
+            })
+
+    if re.search(
+        r"\b(?:wrong|incorrect|mistaken|accidental)\b[^.!?]{0,45}"
+        r"\b(?:bank\s+)?(?:account|recipient|transfer|payment)\b|"
+        r"\b(?:sent|transferred|wired|paid)\b[^.!?]{0,70}"
+        r"\b(?:wrong|incorrect|mistaken)\b",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        key = ("mistaken_payment",)
+        if key not in seen:
+            seen.add(key)
+            constraints.append({
+                "kind": "mistaken_payment",
+                "label": "mistaken payment/transfer",
+            })
+
+    # Short technical acronyms are dangerously ambiguous in web search. If
+    # Oliver's query clearly supplies a display/refresh context, require the
+    # readable source to resolve that domain rather than merely matching the
+    # acronym letters (for example, a company named VRR).
+    if (
+        re.search(r"\b(?:vrr|variable\s+refresh(?:\s+rate)?|adaptive\s+sync)\b", value, re.IGNORECASE)
+        and re.search(r"\b(?:monitor|display|screen|flicker|refresh|frame\s+rate|gpu)\b", value, re.IGNORECASE)
+    ):
+        key = ("display_refresh_context",)
+        if key not in seen:
+            seen.add(key)
+            constraints.append({
+                "kind": "display_refresh_context",
+                "label": "display/variable-refresh context",
+            })
+
+    # A current/latest driver question asks whether a software release exists,
+    # not whether the vendor is mentioned in a nearby technology story. Require
+    # evidence that actually talks about a driver release/version.
+    if (
+        re.search(r"\b(?:new|latest|current|recent|right\s+now|out\s+now)\b", value, re.IGNORECASE)
+        and re.search(r"\bdrivers?\b", value, re.IGNORECASE)
+    ):
+        key = ("current_driver_release",)
+        if key not in seen:
+            seen.add(key)
+            constraints.append({
+                "kind": "current_driver_release",
+                "label": "current driver release",
+            })
+
+    # Exact/latest software-version questions are freshness-sensitive lookups,
+    # not durable model-memory questions. Preserve the product identity and
+    # require an actual version/release token in the accepted evidence. This
+    # stops a nearby article about the product from being mistaken for the
+    # current version page.
+    version_match = re.search(
+        r"\b(?:latest|current|newest|most\s+recent)\s+(?:stable\s+)?(?:version|release|build)\s+(?:of|for)\s+(?P<subject>[^?!.]{2,120})",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if version_match and not re.search(r"\bdrivers?\b", value, re.IGNORECASE):
+        subject = re.sub(r"\s+", " ", str(version_match.group("subject") or "").strip())
+        subject_terms = [
+            token.lower()
+            for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9._+-]*", subject)
+            if len(token) >= 3
+            and token.lower() not in GENERIC_RESEARCH_IDENTITY_TERMS
+            and token.lower() not in {"edition", "software", "app", "application"}
+        ]
+        key = ("current_software_version", tuple(subject_terms[:6]))
+        if key not in seen:
+            seen.add(key)
+            constraints.append({
+                "kind": "current_software_version",
+                "label": "current software version",
+                "subject": subject,
+                "subject_terms": subject_terms[:6],
+            })
+
+    return constraints
+
+
+def _source_satisfies_resolution_constraint(source, constraint):
+    if not isinstance(source, dict) or not isinstance(constraint, dict):
+        return False
+
+    kind = constraint.get("kind")
+
+    if kind == "mistaken_payment":
+        corpus = _source_relevance_corpus(
+            source,
+            include_read_content=True,
+        )
+        has_payment_topic = bool(re.search(
+            r"\b(?:bank|account|transfer|payment|recipient|remittance|wire|funds|money)\b",
+            corpus,
+            flags=re.IGNORECASE,
+        ))
+        has_error_or_recovery = bool(re.search(
+            r"\b(?:wrong|incorrect|mistaken|mistake|error|accidental|mismatch|"
+            r"didn\s+t\s+match|did\s+not\s+match|recover|recovery|reverse|reversal|"
+            r"cancel|cancellation|trace|recall|recipient)\b",
+            corpus,
+            flags=re.IGNORECASE,
+        ))
+        return has_payment_topic and has_error_or_recovery
+
+    if kind == "display_refresh_context":
+        corpus = _source_relevance_corpus(
+            source,
+            include_read_content=True,
+        )
+        has_variable_refresh = bool(re.search(
+            r"\b(?:vrr|variable\s+refresh(?:\s+rate)?|adaptive\s+sync|g[- ]?sync|freesync)\b",
+            corpus,
+            flags=re.IGNORECASE,
+        ))
+        technical_markers = re.findall(
+            r"\b(?:monitor|display|screen|refresh\s+rate|frame\s+rate|flicker|luminance|gamma|gpu|tearing|stutter)\b",
+            corpus,
+            flags=re.IGNORECASE,
+        )
+        return has_variable_refresh and len(set(item.lower() for item in technical_markers)) >= 1
+
+    if kind == "current_driver_release":
+        # Current-driver identity must be visible in search-facing metadata,
+        # not buried somewhere in a loosely-related article body. A story about
+        # a vendor feature may mention drivers incidentally without answering
+        # whether a new driver release exists.
+        title = str(source.get("title") or "")
+        snippet = str(source.get("snippet") or "")
+        raw = " ".join([title, snippet])
+
+        if not re.search(r"\bdrivers?\b", raw, flags=re.IGNORECASE):
+            return False
+
+        has_version = bool(re.search(
+            r"\b\d{3}\.\d{2}\b|\bversion\s+\d+(?:\.\d+){1,3}\b",
+            raw,
+            flags=re.IGNORECASE,
+        ))
+        has_release_assertion = bool(re.search(
+            r"\b(?:released?|launch(?:ed|es)?|available|out\s+now|new)\b[^.!?]{0,100}\bdrivers?\b|"
+            r"\bdrivers?\b[^.!?]{0,100}\b(?:released?|launch(?:ed|es)?|available|out\s+now|whql)\b",
+            raw,
+            flags=re.IGNORECASE,
+        ))
+        title_identifies_driver = bool(re.search(r"\bdrivers?\b", title, flags=re.IGNORECASE))
+        return (title_identifies_driver and (has_version or has_release_assertion)) or (has_version and has_release_assertion)
+
+    if kind == "current_software_version":
+        corpus = _source_relevance_corpus(source, include_read_content=True)
+        subject_terms = [str(item or "").lower() for item in constraint.get("subject_terms") or []]
+        if subject_terms:
+            matched_terms = [
+                term
+                for term in subject_terms
+                if re.search(r"\b" + re.escape(term) + r"\b", corpus, flags=re.IGNORECASE)
+            ]
+            required_matches = min(2, len(subject_terms))
+            if len(set(matched_terms)) < required_matches:
+                return False
+
+        metadata = " ".join([
+            str(source.get("title") or ""),
+            str(source.get("snippet") or ""),
+        ])
+        has_version_token = bool(re.search(
+            r"\bv?\d+(?:\.\d+){1,4}(?:[-+._]?[A-Za-z0-9]+)*\b",
+            metadata,
+            flags=re.IGNORECASE,
+        ))
+        has_release_context = bool(re.search(
+            r"\b(?:version|release|released|update|build|edition|stable|snapshot|hotfix)\b",
+            metadata,
+            flags=re.IGNORECASE,
+        ))
+
+        published = str(source.get("published_date") or "")
+        year_match = re.search(r"\b(20\d{2})\b", published)
+        if year_match:
+            try:
+                published_year = int(year_match.group(1))
+                if published_year < datetime.now().year - 1:
+                    return False
+            except ValueError:
+                pass
+
+        return has_version_token and has_release_context
+
+    if kind != "month_day":
+        return True
+
+    month = int(constraint.get("month") or 0)
+    day = int(constraint.get("day") or 0)
+
+    month_variants = {
+        1: ("january", "jan"), 2: ("february", "feb"),
+        3: ("march", "mar"), 4: ("april", "apr"),
+        5: ("may",), 6: ("june", "jun"), 7: ("july", "jul"),
+        8: ("august", "aug"), 9: ("september", "sept", "sep"),
+        10: ("october", "oct"), 11: ("november", "nov"),
+        12: ("december", "dec"),
+    }.get(month, ())
+
+    corpus = _source_relevance_corpus(
+        source,
+        include_read_content=True,
+    )
+
+    raw_parts = [
+        str(source.get("title") or ""),
+        str(source.get("snippet") or ""),
+        str(source.get("published_date") or ""),
+    ]
+    read_result = source.get("read_result")
+    if isinstance(read_result, dict):
+        raw_parts.append(str(read_result.get("content") or ""))
+    raw = " ".join(raw_parts).lower()
+
+    day_pattern = rf"(?:{day}|{day}(?:st|nd|rd|th))"
+    month_pattern = "(?:" + "|".join(re.escape(item) for item in month_variants) + ")"
+
+    if re.search(
+        rf"\b{month_pattern}\.?\s+{day_pattern}\b|"
+        rf"\b{day_pattern}\s+(?:of\s+)?{month_pattern}\.?\b",
+        raw,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    # Structured publication dates commonly arrive as YYYY-MM-DD. They are
+    # valid evidence that the source itself is dated to the requested day.
+    if re.search(
+        rf"\b\d{{4}}[-/]0?{month}[-/]0?{day}\b",
+        raw,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    # Keep the normalised corpus read above intentional: source excerpts may
+    # have punctuation removed, but they still need a real month+day pairing.
+    if month_variants:
+        for variant in month_variants:
+            if (
+                f"{variant} {day}" in corpus
+                or f"{day} {variant}" in corpus
+            ):
+                return True
+
+    return False
+
+
+def _unresolved_query_constraints(source, query):
+    return [
+        item
+        for item in _query_resolution_constraints(query)
+        if not _source_satisfies_resolution_constraint(source, item)
+    ]
+
+
 def assess_public_source_relevance(
     source,
     *,
@@ -252,6 +590,23 @@ def assess_public_source_relevance(
                 + ",".join(constraints)
             ],
             "identity_anchors": _identity_anchors(research_identity),
+        }
+
+    unresolved_constraints = _unresolved_query_constraints(
+        source,
+        query,
+    )
+
+    if unresolved_constraints:
+        return {
+            "accepted": False,
+            "reasons": [
+                "unresolved_query_constraint:"
+                + str(item.get("label") or item.get("kind") or "constraint")
+                for item in unresolved_constraints
+            ],
+            "identity_anchors": _identity_anchors(research_identity),
+            "unresolved_query_constraints": unresolved_constraints,
         }
 
     anchors = _identity_anchors(
@@ -647,6 +1002,92 @@ def _question_is_freshness_sensitive(user_input):
     )
 
 
+
+def _fresh_lookup_kinds(query):
+    return {
+        str(item.get("kind") or "")
+        for item in _query_resolution_constraints(query)
+        if isinstance(item, dict)
+    }
+
+
+def _current_software_subject_terms(query):
+    for item in _query_resolution_constraints(query):
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") == "current_software_version":
+            return [
+                str(term or "").strip().lower()
+                for term in (item.get("subject_terms") or [])
+                if str(term or "").strip()
+            ]
+    return []
+
+
+def _augment_fresh_lookup_search_query(query):
+    """Bias live software/driver lookups toward actual release pages."""
+    value = _normalise(query)
+    kinds = _fresh_lookup_kinds(value)
+
+    if "current_software_version" in kinds:
+        return (value + " official release notes").strip()
+
+    if "current_driver_release" in kinds:
+        return (value + " official driver release").strip()
+
+    return value
+
+
+def _prefer_fresh_lookup_results(results, query):
+    """Stable-order ranking for freshness-sensitive release lookups."""
+    items = list(results or [])
+    if not items:
+        return items
+
+    kinds = _fresh_lookup_kinds(query)
+    if not ({"current_software_version", "current_driver_release"} & kinds):
+        return items
+
+    subject_terms = _current_software_subject_terms(query)
+    decorated = []
+
+    for index, result in enumerate(items):
+        host = str(result.get("source_host") or "").lower()
+        title = str(result.get("title") or "")
+        snippet = str(result.get("snippet") or "")
+        metadata = " ".join([title, snippet]).lower()
+
+        host_affinity = 1
+        if subject_terms:
+            distinctive = [
+                term for term in subject_terms
+                if len(term) >= 4 and term not in {"java", "edition", "software"}
+            ]
+            if distinctive and any(term in host for term in distinctive):
+                host_affinity = 0
+
+        authority = classify_public_source_authority(
+            result,
+            research_identity=query,
+        )
+        official_rank = 0 if authority.get("authority_tier") == "primary_official" else 1
+
+        release_shape = 1
+        if re.search(r"\bv?\d+(?:\.\d+){1,4}(?:[-+._]?[A-Za-z0-9]+)*\b", metadata):
+            if re.search(r"\b(?:release|released|version|driver|game ready|stable|hotfix)\b", metadata):
+                release_shape = 0
+
+        decorated.append((
+            min(host_affinity, official_rank),
+            release_shape,
+            index,
+            result,
+        ))
+
+    decorated.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in decorated]
+
+
 def _question_requests_forecast(user_input):
     text = _normalise(user_input).lower()
 
@@ -809,10 +1250,41 @@ def _compact_evidence_text(value, max_characters=3600):
     return candidate.rstrip() + "\n[Core excerpt truncated.]"
 
 
+def _explicit_official_documentation_requested(query):
+    text = _normalise(query).lower()
+    return bool(
+        re.search(r"\bofficial\b", text)
+        and re.search(
+            r"\b(?:docs?|documentation|manual|reference|source|page|link|website)\b",
+            text,
+        )
+    )
+
+
+def _prefer_primary_official_results(results, research_identity):
+    """Stable-order official-first ranking for explicit official-doc requests.
+
+    Search relevance remains the tie-breaker. We only move deterministic
+    ``primary_official`` matches ahead of secondary/independent pages.
+    """
+    decorated = []
+    for index, result in enumerate(list(results or [])):
+        authority = classify_public_source_authority(
+            result,
+            research_identity=research_identity,
+        )
+        official = authority.get("authority_tier") == "primary_official"
+        decorated.append((0 if official else 1, index, result))
+    decorated.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in decorated]
+
+
 def gather_public_factual_research(
     user_input,
     max_reads=2,
     research_identity=None,
+    require_query_resolution=False,
+    require_quality_evidence=False,
 ):
     """Gather bounded public-source evidence for a non-media factual turn."""
 
@@ -828,11 +1300,21 @@ def gather_public_factual_research(
     )
 
     strict_relevance = research_identity is not None
+    query_resolution_required = bool(require_query_resolution)
+    quality_evidence_required = bool(require_quality_evidence)
+    relevance_gate_enabled = bool(
+        strict_relevance
+        or query_resolution_required
+    )
 
     relevance_identity = (
         research_identity
         if strict_relevance
         else original_query
+    )
+
+    official_documentation_required = (
+        _explicit_official_documentation_requested(original_query)
     )
 
     time_range = _time_range_for_question(
@@ -845,10 +1327,33 @@ def gather_public_factual_research(
         original_query
     )
 
+    fresh_lookup_kinds = _fresh_lookup_kinds(original_query)
+
+    if (
+        time_range is None
+        and "current_software_version" in fresh_lookup_kinds
+    ):
+        time_range = "year"
+
+    search_query = _augment_fresh_lookup_search_query(query)
+
+    # A near-future horizon such as "next year" is still a live public-fact
+    # task even without "today"/"this month" wording. Constrain those forecast
+    # evidence lookups to the most recent year so an obsolete projection page
+    # cannot outrank an updated official source. Do NOT apply this blanketly to
+    # every "latest" lookup: an authoritative static page may have an old
+    # publication date while still describing the current state.
+    if time_range is None and re.search(
+        r"\bnext year\b|\bby next (?:year|month|week)\b",
+        _normalise(original_query).lower(),
+        flags=re.IGNORECASE,
+    ):
+        time_range = "year"
+
     search_result = execute_tool(
         "web_search",
         {
-            "query": query,
+            "query": search_query,
             "topic": "general",
             "time_range": time_range or "none",
         },
@@ -886,9 +1391,20 @@ def gather_public_factual_research(
 
         eligible_results.append(result)
 
+    eligible_results = _prefer_fresh_lookup_results(
+        eligible_results,
+        original_query,
+    )
+
+    if official_documentation_required:
+        eligible_results = _prefer_primary_official_results(
+            eligible_results,
+            research_identity=relevance_identity,
+        )
+
     requested_reads = max(1, int(max_reads))
 
-    if strict_relevance:
+    if relevance_gate_enabled:
         candidate_limit = min(
             len(eligible_results),
             max(
@@ -919,7 +1435,7 @@ def gather_public_factual_research(
     read_attempt_count = 0
 
     for result in ranked_results:
-        if strict_relevance:
+        if relevance_gate_enabled:
             if accepted_source_count >= requested_reads:
                 break
         elif raw_readable_source_count >= requested_reads:
@@ -949,7 +1465,7 @@ def gather_public_factual_research(
         if read_success:
             raw_readable_source_count += 1
 
-            if strict_relevance:
+            if relevance_gate_enabled:
                 assessment = assess_public_source_relevance(
                     item,
                     query=query,
@@ -982,6 +1498,31 @@ def gather_public_factual_research(
                     research_identity=relevance_identity,
                 )
 
+                if (
+                    accepted
+                    and official_documentation_required
+                    and item.get("authority_tier") != "primary_official"
+                ):
+                    accepted = False
+                    item["accepted_as_evidence"] = False
+                    item["relevance_status"] = "rejected"
+                    item["relevance_reasons"] = list(item.get("relevance_reasons") or []) + [
+                        "explicit_official_documentation_required"
+                    ]
+
+                if (
+                    accepted
+                    and quality_evidence_required
+                    and item.get("quality_eligible") is False
+                ):
+                    accepted = False
+                    item["accepted_as_evidence"] = False
+                    item["relevance_status"] = "rejected"
+                    item["relevance_reasons"] = list(item.get("relevance_reasons") or []) + [
+                        "insufficient_source_authority:"
+                        + str(item.get("authority_tier") or "unknown")
+                    ]
+
                 if accepted:
                     accepted_source_count += 1
                 else:
@@ -1003,7 +1544,42 @@ def gather_public_factual_research(
                     item,
                     research_identity=original_query,
                 )
-                accepted_source_count += 1
+
+                if (
+                    official_documentation_required
+                    and item.get("authority_tier") != "primary_official"
+                ):
+                    item["accepted_as_evidence"] = False
+                    item["relevance_status"] = "rejected"
+                    item["relevance_reasons"] = [
+                        "explicit_official_documentation_required"
+                    ]
+                    rejected_sources.append(
+                        _rejected_source_diagnostic(
+                            item,
+                            item["relevance_reasons"],
+                            "official_documentation_authority",
+                        )
+                    )
+                elif (
+                    quality_evidence_required
+                    and item.get("quality_eligible") is False
+                ):
+                    item["accepted_as_evidence"] = False
+                    item["relevance_status"] = "rejected"
+                    item["relevance_reasons"] = [
+                        "insufficient_source_authority:"
+                        + str(item.get("authority_tier") or "unknown")
+                    ]
+                    rejected_sources.append(
+                        _rejected_source_diagnostic(
+                            item,
+                            item["relevance_reasons"],
+                            "source_authority",
+                        )
+                    )
+                else:
+                    accepted_source_count += 1
 
         else:
             item["accepted_as_evidence"] = False
@@ -1044,11 +1620,15 @@ def gather_public_factual_research(
     return {
         "original_query": original_query,
         "query": query,
+        "search_query": search_query,
         "research_identity": relevance_identity,
         "strict_relevance": strict_relevance,
+        "query_resolution_required": query_resolution_required,
+        "quality_evidence_required": quality_evidence_required,
         "time_range": time_range,
         "freshness_sensitive": freshness_sensitive,
         "forecast_requested": forecast_requested,
+        "official_documentation_required": official_documentation_required,
         "search_result_count": len(results),
         "eligible_search_result_count": len(eligible_results),
         "read_attempt_count": read_attempt_count,
