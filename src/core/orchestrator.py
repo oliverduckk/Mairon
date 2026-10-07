@@ -5,6 +5,13 @@ from core.answer_contract import (
     AnswerContract,
     build_answer_contract,
 )
+from core.answer_candidate import CandidateOrigin
+from core.acceptance_shadow import (
+    AcceptanceShadowRecord,
+    observe_core_result,
+    observe_limitation_response,
+    observe_time_budget,
+)
 from core.conversation_state import (
     ConversationState,
 )
@@ -93,6 +100,9 @@ class CoreDecision:
 
     needs_clarification: bool = False
     clarification_question: Optional[str] = None
+
+    # Observational only: this record never controls direct_response.
+    acceptance_shadow: Optional[AcceptanceShadowRecord] = None
 
 
 class MaironCore:
@@ -347,10 +357,17 @@ class MaironCore:
                 )
                 route = route_epistemic_authority(turn)
                 contract = build_answer_contract(turn=turn, route=route)
+                acceptance_shadow = observe_time_budget(
+                    text=budget.answer,
+                    contract=contract,
+                    resolution=budget,
+                    path="time_budget",
+                )
                 self.conversation_state.update_from_turn(turn)
                 return CoreDecision(
                     turn=turn, epistemic_route=route,
                     answer_contract=contract, direct_response=budget.answer,
+                    acceptance_shadow=acceptance_shadow,
                 )
 
         # Only an explicit, uniquely extractable latest USER statement can be
@@ -405,6 +422,17 @@ class MaironCore:
                 )
 
             contract = build_answer_contract(turn=turn, route=route)
+            acceptance_shadow = observe_limitation_response(
+                text=direct_response,
+                contract=contract,
+                user_input=user_input,
+                user_history=getattr(
+                    self.conversation_state, "recent_user_turns", []
+                ),
+                path="private_state",
+                origin=CandidateOrigin.CRITICAL_CORE,
+                emit=False,
+            )
             self.conversation_state.update_from_turn(turn)
             return CoreDecision(
                 turn=turn,
@@ -412,6 +440,7 @@ class MaironCore:
                 answer_contract=contract,
                 workflow_result=None,
                 direct_response=direct_response,
+                acceptance_shadow=acceptance_shadow,
             )
 
         # --------------------------------------------------
@@ -537,6 +566,20 @@ class MaironCore:
                 )
             )
 
+            acceptance_shadow = None
+            if (
+                workflow_result
+                and workflow_result.success
+                and workflow_result.evidence is not None
+                and workflow_result.answer_fact
+            ):
+                acceptance_shadow = observe_core_result(
+                    text=direct_response,
+                    contract=contract,
+                    evidence=workflow_result.evidence,
+                    path="arithmetic",
+                )
+
             self.conversation_state.update_from_turn(
                 turn
             )
@@ -547,6 +590,7 @@ class MaironCore:
                 answer_contract=contract,
                 workflow_result=workflow_result,
                 direct_response=direct_response,
+                acceptance_shadow=acceptance_shadow,
             )
 
         # --------------------------------------------------

@@ -229,6 +229,7 @@ from core.answer_contract_runtime import (
     contract_field_value,
     render_answer_contract,
 )
+from core.acceptance_shadow import observe_limitation_response
 
 from routine.night_routine import (
     complete_night_routine_work_location,
@@ -8673,6 +8674,14 @@ def handle_direct_conversation(
     ):
         final_response_text = build_verification_declined_fallback()
 
+        observe_limitation_response(
+            text=final_response_text,
+            contract=core_answer_contract,
+            user_input=user_input,
+            conversation=conversation,
+            path="direct_verification_declined",
+        )
+
         working_conversation = list(conversation)
         working_conversation.append({
             "role": "system",
@@ -9188,6 +9197,16 @@ def handle_direct_conversation(
                     stable_public_fallback
                     or build_failed_public_factual_fallback()
                 )
+                if stable_public_fallback is None:
+                    observe_limitation_response(
+                        text=final_response_text,
+                        contract=core_answer_contract,
+                        user_input=user_input,
+                        conversation=conversation,
+                        path="direct_public_evidence_unavailable",
+                        failure_reason=public_research_result.get("failure_reason"),
+                        research_result=public_research_result,
+                    )
 
             working_conversation = list(conversation)
             working_conversation.append({
@@ -11410,10 +11429,24 @@ def handle_direct_conversation(
 
             elif core_epistemic_mode == "insufficient_user_context":
                 final_response_text = build_insufficient_user_context_fallback(user_input)
+                observe_limitation_response(
+                    text=final_response_text,
+                    contract=core_answer_contract,
+                    user_input=user_input,
+                    conversation=conversation,
+                    path="direct_missing_input_fallback",
+                )
                 print("[Epistemic] Missing-input fallback used; no lookup or guess performed.")
 
             elif core_epistemic_mode == "verification_declined":
                 final_response_text = build_verification_declined_fallback()
+                observe_limitation_response(
+                    text=final_response_text,
+                    contract=core_answer_contract,
+                    user_input=user_input,
+                    conversation=conversation,
+                    path="direct_verification_declined_fallback",
+                )
                 print("[Epistemic] No-browse fallback used; exact/current fact left unverified.")
 
             elif core_intent == "recommendation_request":
@@ -11579,6 +11612,13 @@ def _get_response_impl(
         and core_epistemic_mode == "verification_declined"
     ):
         final_response_text = build_verification_declined_fallback()
+        observe_limitation_response(
+            text=final_response_text,
+            contract=core_answer_contract,
+            user_input=user_input,
+            conversation=conversation,
+            path="provider_ingress_verification_declined",
+        )
         working_conversation = list(conversation)
         working_conversation.append({
             "role": "system",

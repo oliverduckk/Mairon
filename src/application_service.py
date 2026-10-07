@@ -12,6 +12,10 @@ from ai.provider import create_provider
 from core.action_manager import (
     describe_action,
 )
+from core.acceptance_shadow import (
+    acceptance_shadow_events,
+    emit_shadow_record,
+)
 from core.critical_response_safety import (
     deterministic_critical_response,
     replace_visible_answer_in_history,
@@ -1151,6 +1155,10 @@ class MaironApplication:
                 core_decision.direct_response
                 is not None
             ):
+                emit_shadow_record(
+                    getattr(core_decision, "acceptance_shadow", None),
+                    self._emit_event,
+                )
                 return self._finalize_direct_response(
                     user_text=text,
                     answer=(
@@ -1259,7 +1267,7 @@ class MaironApplication:
                 session_id=self.session_id,
                 channel=channel_value,
                 client="application",
-            ):
+            ), acceptance_shadow_events(self._emit_event):
                 result = route_message(
                     self.local_ai,
                     self.cloud_ai,
