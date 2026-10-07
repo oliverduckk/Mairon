@@ -439,30 +439,64 @@ def verify_media_draft(
             "media factual-support verifier could not validate the draft"
         ])
 
-    supported = (
-        parsed.get(
-            "supported"
-        ) is True
-    )
+    supported = parsed.get("supported")
+    scope_compliant = parsed.get("scope_compliant")
+    claims = parsed.get("unsupported_claims")
+    out_of_scope = parsed.get("out_of_scope_claims")
+    if (
+        type(supported) is not bool
+        or type(scope_compliant) is not bool
+        or not isinstance(claims, list)
+        or not isinstance(out_of_scope, list)
+        or any(not isinstance(claim, str) for claim in claims + out_of_scope)
+    ):
+        return MediaVerificationResult([
+            "media factual-support verifier returned invalid global verdicts"
+        ])
 
-    scope_compliant = (
-        parsed.get(
-            "scope_compliant",
-            True,
-        ) is True
-    )
+    # Core requires exactly one typed verdict for every numbered sentence.
+    # Incomplete or contradictory verifier output cannot authorize salvage.
+    raw_assessments = parsed.get("sentence_assessments")
+    if not isinstance(raw_assessments, list):
+        return MediaVerificationResult([
+            "media factual-support verifier omitted required sentence assessments"
+        ])
+
+    model_assessments = {}
+    for assessment in raw_assessments:
+        if not isinstance(assessment, dict):
+            return MediaVerificationResult([
+                "media factual-support verifier returned invalid sentence assessments"
+            ])
+        index = assessment.get("index")
+        if (
+            type(index) is not int
+            or not (1 <= index <= len(draft_sentences))
+            or index in model_assessments
+            or type(assessment.get("supported")) is not bool
+            or type(assessment.get("scope_compliant")) is not bool
+        ):
+            return MediaVerificationResult([
+                "media factual-support verifier returned invalid sentence assessments"
+            ])
+        model_assessments[index] = assessment
+
+    if set(model_assessments) != set(range(1, len(draft_sentences) + 1)):
+        return MediaVerificationResult([
+            "media factual-support verifier returned incomplete sentence assessments"
+        ])
+
+    if (
+        supported != all(item["supported"] for item in model_assessments.values())
+        or scope_compliant != all(item["scope_compliant"] for item in model_assessments.values())
+        or (supported and claims)
+        or (scope_compliant and out_of_scope)
+    ):
+        return MediaVerificationResult([
+            "media factual-support verifier returned contradictory verdicts"
+        ])
 
     violations = []
-
-    claims = parsed.get(
-        "unsupported_claims"
-    )
-
-    if not isinstance(
-        claims,
-        list,
-    ):
-        claims = []
 
     cleaned = []
 
@@ -490,16 +524,6 @@ def verify_media_draft(
         for claim in cleaned
     ])
 
-    out_of_scope = parsed.get(
-        "out_of_scope_claims"
-    )
-
-    if not isinstance(
-        out_of_scope,
-        list,
-    ):
-        out_of_scope = []
-
     cleaned_scope = []
 
     for claim in out_of_scope[
@@ -526,31 +550,10 @@ def verify_media_draft(
         for claim in cleaned_scope
     ])
 
-    raw_assessments = parsed.get(
-        "sentence_assessments"
-    )
-
-    if not isinstance(
-        raw_assessments,
-        list,
-    ):
-        raw_assessments = []
-
     sentence_assessments = []
     accepted_sentences = []
 
-    for assessment in raw_assessments:
-        if not isinstance(assessment, dict):
-            continue
-
-        try:
-            index = int(assessment.get("index"))
-        except (TypeError, ValueError):
-            continue
-
-        if not (1 <= index <= len(draft_sentences)):
-            continue
-
+    for index, assessment in sorted(model_assessments.items()):
         sentence_supported = assessment.get("supported") is True
         sentence_scope_compliant = assessment.get("scope_compliant") is True
 
@@ -563,25 +566,11 @@ def verify_media_draft(
         if sentence_supported and sentence_scope_compliant:
             accepted_sentences.append(draft_sentences[index - 1])
 
-    assessed_indexes = {
-        item["index"]
-        for item in sentence_assessments
-    }
-
-    expected_indexes = set(
-        range(1, len(draft_sentences) + 1)
-    )
-
-    # Fail closed on incomplete sentence accounting. Core may salvage only
-    # when the verifier explicitly assessed every sentence in the draft.
-    if assessed_indexes != expected_indexes:
-        accepted_sentences = []
-
     if not violations:
         if supported and scope_compliant:
             return MediaVerificationResult(
                 [],
-                accepted_sentences=(draft_sentences if draft_sentences else []),
+                accepted_sentences=accepted_sentences,
                 sentence_assessments=sentence_assessments,
             )
 

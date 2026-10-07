@@ -61,7 +61,12 @@ class _VerifierClient:
         return _FakeResult(
             json.dumps({
                 "supported": True,
+                "scope_compliant": True,
                 "unsupported_claims": [],
+                "out_of_scope_claims": [],
+                "sentence_assessments": [
+                    {"index": 1, "supported": True, "scope_compliant": True},
+                ],
             })
         )
 

@@ -10602,6 +10602,7 @@ def handle_direct_conversation(
             repair_unjustified_lexical_denial(
                 user_input=user_input,
                 draft=draft_text,
+                epistemic_mode=core_epistemic_mode,
             )
         )
         if lexical_calibration_applied:

@@ -904,11 +904,57 @@ def verify_public_factual_draft(
             "public factual-support verifier could not validate the draft"
         ])
 
-    supported = parsed.get("supported") is True
+    supported = parsed.get("supported")
     claims = parsed.get("unsupported_claims")
+    if (
+        type(supported) is not bool
+        or not isinstance(claims, list)
+        or any(not isinstance(claim, str) for claim in claims)
+    ):
+        return PublicFactualVerificationResult([
+            "public factual-support verifier returned invalid global verdicts"
+        ])
 
-    if not isinstance(claims, list):
-        claims = []
+    # Core requires exactly one typed verdict for every numbered sentence.
+    # Incomplete or contradictory verifier output cannot authorize salvage.
+    raw_assessments = parsed.get("sentence_assessments")
+    if not isinstance(raw_assessments, list):
+        return PublicFactualVerificationResult([
+            "public factual-support verifier omitted required sentence assessments"
+        ])
+
+    model_assessments = {}
+    for assessment in raw_assessments:
+        if not isinstance(assessment, dict):
+            return PublicFactualVerificationResult([
+                "public factual-support verifier returned invalid sentence assessments"
+            ])
+        index = assessment.get("index")
+        if (
+            type(index) is not int
+            or not (1 <= index <= len(draft_sentences))
+            or index in model_assessments
+            or type(assessment.get("supported")) is not bool
+        ):
+            return PublicFactualVerificationResult([
+                "public factual-support verifier returned invalid sentence assessments"
+            ])
+        model_assessments[index] = assessment
+
+    if set(model_assessments) != set(range(1, len(draft_sentences) + 1)):
+        return PublicFactualVerificationResult([
+            "public factual-support verifier returned incomplete sentence assessments"
+        ])
+
+    # Compare the model's global/unit verdicts before Core's deterministic
+    # exclusions. A Core rejection is not a contradictory model payload.
+    if (
+        supported != all(item["supported"] for item in model_assessments.values())
+        or (supported and claims)
+    ):
+        return PublicFactualVerificationResult([
+            "public factual-support verifier returned contradictory verdicts"
+        ])
 
     cleaned_claims = []
     for claim in claims[:6]:
@@ -982,25 +1028,10 @@ def verify_public_factual_draft(
             + draft_sentences[index - 1]
         )
 
-    raw_assessments = parsed.get("sentence_assessments")
-    if not isinstance(raw_assessments, list):
-        raw_assessments = []
-
     sentence_assessments = []
     accepted_sentences = []
 
-    for assessment in raw_assessments:
-        if not isinstance(assessment, dict):
-            continue
-
-        try:
-            index = int(assessment.get("index"))
-        except (TypeError, ValueError):
-            continue
-
-        if not (1 <= index <= len(draft_sentences)):
-            continue
-
+    for index, assessment in sorted(model_assessments.items()):
         sentence_supported = (
             assessment.get("supported") is True
             and index not in unsolicited_projection_indexes
@@ -1022,17 +1053,11 @@ def verify_public_factual_draft(
         if sentence_supported:
             accepted_sentences.append(draft_sentences[index - 1])
 
-    assessed_indexes = {item["index"] for item in sentence_assessments}
-    expected_indexes = set(range(1, len(draft_sentences) + 1))
-
-    if assessed_indexes != expected_indexes:
-        accepted_sentences = []
-
     if not violations:
         if supported:
             return PublicFactualVerificationResult(
                 [],
-                accepted_sentences=(draft_sentences if draft_sentences else []),
+                accepted_sentences=accepted_sentences,
                 sentence_assessments=sentence_assessments,
             )
 

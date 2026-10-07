@@ -117,6 +117,11 @@ def run():
             "later alias and pursuer relationship detail",
             "separate closing joke after the synopsis",
         ],
+        "sentence_assessments": [
+            {"index": 1, "supported": True, "scope_compliant": True},
+            {"index": 2, "supported": True, "scope_compliant": False},
+            {"index": 3, "supported": True, "scope_compliant": False},
+        ],
     })
 
     violations = verify_media_draft(
@@ -165,6 +170,9 @@ def run():
         "scope_compliant": True,
         "unsupported_claims": [],
         "out_of_scope_claims": [],
+        "sentence_assessments": [
+            {"index": 1, "supported": True, "scope_compliant": True},
+        ],
     })
 
     clean = verify_media_draft(

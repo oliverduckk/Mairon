@@ -143,12 +143,19 @@ def contains_unjustified_lexical_denial(user_input: str, draft: str) -> bool:
 def repair_unjustified_lexical_denial(
     user_input: str,
     draft: str,
+    *,
+    epistemic_mode: Optional[str] = None,
 ) -> Tuple[str, bool]:
     """Fail closed instead of publishing an unsupported categorical denial.
 
     Repair only when the drafted response actually crosses this boundary;
     ordinary definitions and properly qualified uncertainty pass untouched.
     """
+    # Core's established missing-input task takes precedence over an incidental
+    # phrase that resembles a definition query. Do not replace attachment or
+    # other missing-input responses with a definition of a captured word.
+    if epistemic_mode == "insufficient_user_context":
+        return draft, False
     if not contains_unjustified_lexical_denial(user_input, draft):
         return draft, False
     term = extract_lexical_query_term(user_input)
