@@ -16,6 +16,7 @@ from core.answer_candidate import (
     AcceptanceDecision, AcceptanceStatus, AcceptedSentence, AnswerCandidate,
 )
 from core.evidence import Evidence, EvidenceKind, EvidenceStatus
+from core.acceptance_typed import validate_typed_evidence
 
 
 USER_FACT_CONSISTENCY = "user_fact_consistency"
@@ -254,9 +255,9 @@ def _acknowledges_limitation(unit: ClaimUnit, candidate: AnswerCandidate, reason
                 or any(target and target in canonical_statement(reason) for reason in reasons))
 
 
-def _required_present(text: str, candidate: AnswerCandidate) -> bool:
+def _required_present(text: str, candidate: AnswerCandidate, typed_satisfied=()) -> bool:
     rendered = canonical_statement(text, user_name=candidate.contract.metadata.get("user_name"))
-    return all(canonical_statement(required, user_name=candidate.contract.metadata.get("user_name")) in rendered
+    return all(required in typed_satisfied or canonical_statement(required, user_name=candidate.contract.metadata.get("user_name")) in rendered
                for required in candidate.contract.required_claims)
 
 
@@ -283,6 +284,7 @@ class CoreAcceptanceEvaluator:
         if user_name is not None and not isinstance(user_name, str):
             raise TypeError("Core user_name must be a scalar string")
         units = interpret_text(candidate.text, speaker="assistant", user_name=user_name)
+        typed = validate_typed_evidence(candidate, units)
         facts = []
         superseded = {
             identity for item in candidate.evidence.evidence
@@ -321,6 +323,12 @@ class CoreAcceptanceEvaluator:
         replacement = False
         acknowledged = False
         payload = False
+        typed_obligations = {profile.validator: set() for profile in typed}
+        for profile in typed:
+            if profile.global_violations:
+                violations.extend(profile.global_violations)
+                reasons.extend(profile.global_reasons)
+                global_reject = True
         if not units:
             reasons.append("The candidate contains no assessable answer")
             violations.append(SEMANTIC_COVERAGE)
@@ -328,72 +336,86 @@ class CoreAcceptanceEvaluator:
         for unit in units:
             failures, unit_reasons, support = [], [], []
             unit_payload = False
+            typed_proofs = [(profile, profile.units[unit.index]) for profile in typed if unit.index in profile.units]
+            for profile, proof in typed_proofs:
+                failures.extend(proof.violated_invariants)
+                unit_reasons.extend(proof.reasons)
+                support.extend(proof.evidence_ids)
+                unit_payload = unit_payload or bool(proof.obligations)
             if serious and any(behavior in {"blame", "ridicule", "casual_roast"} for behavior in unit.behaviors):
                 failures.append(SERIOUS_CONTRACT_TONE)
                 unit_reasons.append("The serious/consequential contract forbids blame, ridicule, or casual roasting")
                 global_reject = True
-            caveat = missing and _acknowledges_limitation(unit, candidate, limitations)
+            caveat = missing and (
+                any(proof.limitation_preserved and not proof.violated_invariants for _, proof in typed_proofs)
+                if typed_proofs else _acknowledges_limitation(unit, candidate, limitations)
+            )
             if caveat:
                 acknowledged = True
-            elif not unit.complete or unit.kind == UnitKind.UNKNOWN:
+            elif not typed_proofs and (not unit.complete or unit.kind == UnitKind.UNKNOWN):
                 failures.append(SEMANTIC_COVERAGE)
                 unit_reasons.append("Core cannot establish complete bounded semantic coverage for this unit")
                 replacement = True
-            elif unit.kind == UnitKind.LIMITATION:
+            elif not typed_proofs and unit.kind == UnitKind.LIMITATION:
                 failures.append(UNCERTAINTY_PRESERVATION)
                 unit_reasons.append("The limitation does not match Core's established uncertainty or task scope")
             elif unit.kind == UnitKind.QUESTION and not candidate.contract.allow_follow_up_question:
                 failures.append(CONTRACT_COMPLETION)
                 unit_reasons.append("The answer contract does not authorize a follow-up question")
-            if not caveat:
-                for proposition in unit.propositions:
-                    current_support = any(
-                        fact.evidence.kind in {EvidenceKind.CURRENT_USER_TURN, EvidenceKind.USER_CORRECTION}
-                        and _eligible(fact.evidence) and not fact.proposition.conditional
-                        and not fact.proposition.reported and _same_statement(proposition, fact.proposition)
-                        for fact in facts
-                    )
-                    contradicted = any(
-                        fact.evidence.kind in _USER_KINDS and _eligible(fact.evidence)
-                        and not fact.proposition.conditional and not fact.proposition.reported
-                        and not proposition.reported and conflicting_propositions(proposition, fact.proposition)
-                        and (not current_support or fact.evidence.kind != EvidenceKind.LIVE_USER_FACT)
-                        for fact in facts
-                    )
-                    if contradicted:
-                        failures.append(USER_FACT_CONSISTENCY)
-                        unit_reasons.append("The claim contradicts active current-turn/live user-authored evidence")
-                        continue
-                    matches = [fact for fact in facts if _same_statement(proposition, fact.proposition)]
-                    allowed = [fact for fact in matches if _allows_fact(candidate, fact, proposition) is None]
-                    if allowed:
-                        support.extend(fact.evidence.evidence_id for fact in allowed if fact.evidence.evidence_id)
-                        unit_payload = unit_payload or any(_payload_fact(candidate, fact) for fact in allowed)
-                        continue
-                    if proposition.personal:
-                        failures.append(USER_OBSERVATION_SUPPORT if proposition.observation else USER_FACT_CONSISTENCY)
-                        unit_reasons.append("No corresponding scoped user/tool evidence establishes this personal action, state, or fact")
-                    elif any(fact.evidence.kind == EvidenceKind.SUPPLIED_PREMISE or fact.proposition.conditional for fact in matches):
-                        failures.append(CONDITIONAL_SCOPE)
-                        unit_reasons.append("The candidate asserts a premise or conditional claim outside its permitted condition")
-                    elif matches:
-                        scoped = [fact for fact in matches if _eligible(fact.evidence)]
-                        failures.append(SOURCE_SCOPE if scoped else EVIDENCE_AUTHORITY)
-                        unit_reasons.append(_allows_fact(candidate, matches[0], proposition) or "The matching evidence cannot establish this claim")
-                    else:
-                        failures.append(EVIDENCE_AUTHORITY)
-                        unit_reasons.append("No admissible evidence establishes this assertion within the contract's authority scope")
-                        replacement = True
-                    if candidate.evidence.model_knowledge_permitted:
-                        failures.append(MODEL_KNOWLEDGE_NOT_PROOF)
-                        unit_reasons.append("Stable-model-knowledge permission does not establish this particular claim as true")
-                    if missing:
-                        failures.append(UNCERTAINTY_PRESERVATION)
-                        unit_reasons.append("Candidate prose cannot fill an established evidence gap")
+            # Typed coverage replaces only the domain's generic support parse.
+            # User contradictions and the serious-tone invariant still apply.
+            for proposition in unit.propositions:
+                current_support = any(
+                    fact.evidence.kind in {EvidenceKind.CURRENT_USER_TURN, EvidenceKind.USER_CORRECTION}
+                    and _eligible(fact.evidence) and not fact.proposition.conditional
+                    and not fact.proposition.reported and _same_statement(proposition, fact.proposition)
+                    for fact in facts
+                )
+                contradicted = any(
+                    fact.evidence.kind in _USER_KINDS and _eligible(fact.evidence)
+                    and not fact.proposition.conditional and not fact.proposition.reported
+                    and not proposition.reported and conflicting_propositions(proposition, fact.proposition)
+                    and (not current_support or fact.evidence.kind != EvidenceKind.LIVE_USER_FACT)
+                    for fact in facts
+                )
+                if contradicted:
+                    failures.append(USER_FACT_CONSISTENCY)
+                    unit_reasons.append("The claim contradicts active current-turn/live user-authored evidence")
+                    continue
+                if caveat or typed_proofs:
+                    continue
+                matches = [fact for fact in facts if _same_statement(proposition, fact.proposition)]
+                allowed = [fact for fact in matches if _allows_fact(candidate, fact, proposition) is None]
+                if allowed:
+                    support.extend(fact.evidence.evidence_id for fact in allowed if fact.evidence.evidence_id)
+                    unit_payload = unit_payload or any(_payload_fact(candidate, fact) for fact in allowed)
+                    continue
+                if proposition.personal:
+                    failures.append(USER_OBSERVATION_SUPPORT if proposition.observation else USER_FACT_CONSISTENCY)
+                    unit_reasons.append("No corresponding scoped user/tool evidence establishes this personal action, state, or fact")
+                elif any(fact.evidence.kind == EvidenceKind.SUPPLIED_PREMISE or fact.proposition.conditional for fact in matches):
+                    failures.append(CONDITIONAL_SCOPE)
+                    unit_reasons.append("The candidate asserts a premise or conditional claim outside its permitted condition")
+                elif matches:
+                    scoped = [fact for fact in matches if _eligible(fact.evidence)]
+                    failures.append(SOURCE_SCOPE if scoped else EVIDENCE_AUTHORITY)
+                    unit_reasons.append(_allows_fact(candidate, matches[0], proposition) or "The matching evidence cannot establish this claim")
+                else:
+                    failures.append(EVIDENCE_AUTHORITY)
+                    unit_reasons.append("No admissible evidence establishes this assertion within the contract's authority scope")
+                    replacement = True
+                if candidate.evidence.model_knowledge_permitted:
+                    failures.append(MODEL_KNOWLEDGE_NOT_PROOF)
+                    unit_reasons.append("Stable-model-knowledge permission does not establish this particular claim as true")
+                if missing:
+                    failures.append(UNCERTAINTY_PRESERVATION)
+                    unit_reasons.append("Candidate prose cannot fill an established evidence gap")
             failures = list(dict.fromkeys(failures))
             if not failures:
                 accepted.append(AcceptedSentence(unit.index, unit.text))
                 payload = payload or unit_payload or caveat
+                for profile, proof in typed_proofs:
+                    typed_obligations[profile.validator].update(proof.obligations)
             else:
                 violations.extend(failures)
                 reasons.extend(f"Sentence {unit.index}: {reason}" for reason in dict.fromkeys(unit_reasons))
@@ -403,9 +425,14 @@ class CoreAcceptanceEvaluator:
         if missing and not acknowledged:
             global_missing.append((UNCERTAINTY_PRESERVATION, "The candidate omits Core's explicit uncertainty or missing-evidence limitation"))
         subset = " ".join(item.text for item in accepted)
-        if not _required_present(subset, candidate):
+        typed_required = {
+            claim for profile in typed for claim, obligations in profile.required_claim_obligations.items()
+            if set(obligations) <= typed_obligations[profile.validator]
+        }
+        if not _required_present(subset, candidate, typed_required):
             global_missing.append((REQUIRED_CLAIMS, "The acceptable sentence subset does not retain the contract's required claims"))
-        if _requires_payload(candidate.contract) and not payload:
+        typed_complete = all(set(profile.completion_obligations) <= typed_obligations[profile.validator] for profile in typed)
+        if (_requires_payload(candidate.contract) and not payload) or not typed_complete:
             global_missing.append((CONTRACT_COMPLETION, "The candidate has no supported answer or valid task-scoped limitation"))
         for invariant, reason in global_missing:
             violations.append(invariant)
@@ -433,5 +460,6 @@ class CoreAcceptanceEvaluator:
             reasons=tuple(dict.fromkeys(reasons)), violated_invariants=tuple(dict.fromkeys(violations)),
             accepted_sentences=subset_units,
             metadata={"applicable_invariants": tuple(dict.fromkeys(applicable)), "units": reports,
-                      "limitations": limitations, "semantic_policy": "bounded_core_restatement"},
+                      "limitations": limitations, "semantic_policy": "bounded_core_restatement",
+                      "typed_validators": tuple(profile.validator for profile in typed)},
         )

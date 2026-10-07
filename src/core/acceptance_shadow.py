@@ -166,6 +166,9 @@ def _time_budget_evidence(resolution: TimeBudgetResolution) -> EvidenceBundle:
         "remaining_minutes": str(resolution.budget_minutes - resolution.used_minutes),
         "items": [{"name": name, "minutes": str(minutes)} for name, minutes in resolution.items],
         "conditional_on_supplied_inputs": True,
+        "delay_minutes": str(resolution.delay_minutes),
+        "delay_target": resolution.delay_target,
+        "required_outputs": ("used", "comparison", "remaining"),
     }
     # Atomic claims are rendered from retained calculation fields. In
     # particular, resolution.answer and the published text are never evidence.
@@ -208,6 +211,27 @@ def _limitation_evidence(*, contract, user_input, conversation, user_history, fa
         reason = "The requested private state is not observable from the supplied context."
     else:
         reason = "Required public evidence is unavailable."
+    availability = {"version": 1, "scope": runtime.subject}
+    if mode == "insufficient_user_context":
+        # Reuse the existing Core extractor of explicitly omitted input. It
+        # reads the user turn and never infers absence from response wording.
+        from core.claim_grounding import _extract_explicit_missing_items
+        availability.update({
+            "kind": "missing_input", "input_available": False,
+            "missing_inputs": _extract_explicit_missing_items(user_input),
+        })
+    elif mode == "verification_declined":
+        availability.update({
+            "kind": "verification_declined", "verification_required": True,
+            "verification_declined": True,
+        })
+    elif mode in {"private_state_uncertain", "unobserved_private_state"}:
+        availability.update({"kind": "private_state", "observation_available": False})
+    else:
+        availability.update({
+            "kind": "public_evidence_unavailable", "verification_required": True,
+            "retrieval_failed": True, "supporting_evidence_available": False,
+        })
     limitations = (reason,)
     if isinstance(failure_reason, str) and failure_reason.strip():
         limitations += (failure_reason.strip(),)
@@ -218,7 +242,7 @@ def _limitation_evidence(*, contract, user_input, conversation, user_history, fa
             kind=EvidenceKind.UNCERTAINTY, status=EvidenceStatus.UNAVAILABLE,
             authority_scope="evidence_availability", limitations=limitations,
             evidence_id="limitation:" + mode,
-            data={"epistemic_mode": mode, "research_failed": research_failed},
+            data={"epistemic_mode": mode, "research_failed": research_failed, "availability": availability},
         )],
     ).snapshot()
     bundles = [normalize_user_turn(user_input), normalize_live_conversation(conversation), limitation]

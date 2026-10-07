@@ -56,6 +56,8 @@ class TimeBudgetResolution:
     budget_minutes: Decimal
     used_minutes: Decimal
     items: tuple[tuple[str, Decimal], ...]
+    delay_minutes: Decimal = Decimal(0)
+    delay_target: Optional[str] = None
 
 
 def _minutes(number: str, unit: str | None) -> Optional[Decimal]:
@@ -184,4 +186,4 @@ def resolve_time_budget(
         answer = f"Yes, exactly. {detail}, with no extra time left."
     if delay_target:
         answer = f"With the {_fmt(new_delay)}-minute delay: {answer}"
-    return TimeBudgetResolution(answer, budget, used, tuple(durations.items()))
+    return TimeBudgetResolution(answer, budget, used, tuple(durations.items()), new_delay, delay_target)
