@@ -9121,18 +9121,26 @@ def handle_direct_conversation(
         # In that case Core owns the narrow extractive answer instead of asking
         # Qwen to reinterpret a title/date and potentially invent exclusions or
         # a different episode number.
-        supported_exact_lookup = (
-            build_supported_current_lookup_fallback(
-                public_factual_evidence,
-                user_input,
+        supported_exact_lookup = None
+        if (
+            public_factual_research_success
+            and core_intent == "factual_question"
+            and not core_is_source_provenance_followup
+        ):
+            # Prefer Core's still-structured research result. The rendered
+            # evidence packet is intentionally a text envelope for model
+            # isolation, and deterministic identity extraction should not
+            # depend on reparsing that transport representation.
+            supported_exact_lookup = (
+                build_supported_current_lookup_fallback(
+                    public_research_result,
+                    user_input,
+                )
+                or build_supported_current_lookup_fallback(
+                    public_factual_evidence,
+                    user_input,
+                )
             )
-            if (
-                public_factual_research_success
-                and core_intent == "factual_question"
-                and not core_is_source_provenance_followup
-            )
-            else None
-        )
         if supported_exact_lookup is not None:
             final_response_text = supported_exact_lookup
             working_conversation = list(conversation)
@@ -10699,6 +10707,7 @@ def handle_direct_conversation(
                 find_unknown_media_opinion_overreach_violations(
                     user_input=user_input,
                     draft=draft_text,
+                    conversation=conversation,
                 )
             )
 
@@ -11065,6 +11074,7 @@ def handle_direct_conversation(
         if (
             grounded_research_evidence
             and active_research_verification is not None
+            and not core_is_consequential_advice
         ):
             approved_sentences = list(
                 getattr(
@@ -11258,6 +11268,10 @@ def handle_direct_conversation(
             else:
                 final_response_text = (
                     build_supported_current_lookup_fallback(
+                        public_research_result,
+                        user_input,
+                    )
+                    or build_supported_current_lookup_fallback(
                         public_factual_evidence,
                         user_input,
                     )

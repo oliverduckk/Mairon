@@ -341,9 +341,13 @@ def find_consequential_role_violations(
         # A sender no longer controls funds that reached the unintended
         # recipient. Instructions to avoid spending/touching/moving those
         # funds silently turn Oliver into the recipient.
+        sender_control_pattern = (
+            r"\b(?:do\s+not|don't|dont|stop|avoid|be\s+careful\s+not\s+to|"
+            r"make\s+sure\s+you\s+do\s+not|make\s+sure\s+you\s+don't)\b"
+        )
         if re.search(
-            r"\b(?:do\s+not|don't|dont|stop|avoid)\b[^.!?]{0,55}"
-            r"\b(?:touch|touching|spend|spending|move|moving|withdraw|"
+            sender_control_pattern
+            + r"[^.!?]{0,55}\b(?:touch|touching|spend|spending|move|moving|withdraw|"
             r"withdrawing|use|using|freeze)\b[^.!?]{0,70}"
             r"\b(?:money|funds|transfer|it|accounts?|affected\s+accounts?)\b",
             value,
@@ -354,14 +358,39 @@ def find_consequential_role_violations(
             value,
             flags=re.IGNORECASE,
         ) or re.search(
-            r"\b(?:do\s+not|don't|dont|stop|avoid)\b[^.!?]{0,55}"
-            r"\b(?:touch|move|withdraw|use|freeze)\b[^.!?]{0,70}"
+            sender_control_pattern
+            + r"[^.!?]{0,55}\b(?:touch|move|withdraw|use|freeze)\b[^.!?]{0,70}"
             r"\b(?:your\s+|the\s+|any\s+)?(?:affected\s+)?(?:bank\s+)?accounts?\b",
             value,
             flags=re.IGNORECASE,
         ):
             violations.append(
                 "consequential advice flipped Oliver from mistaken sender to recipient/control-holder"
+            )
+
+        # Provider-neutral first action for a mistaken outgoing transfer is to
+        # contact the bank/payment provider that sent it. Directly contacting
+        # the unintended recipient may be appropriate for some rails/providers,
+        # but it must not displace the sender-side provider as the first recovery
+        # channel when provider/jurisdiction details are unknown.
+        recipient_contact = re.search(
+            r"\b(?:contact|call|message|reach\s+out\s+to)\b[^.!?]{0,45}"
+            r"\b(?:the\s+)?(?:recipient|person\s+you\s+sent\s+(?:it|money|funds)\s+to)\b",
+            value,
+            flags=re.IGNORECASE,
+        )
+        provider_contact = re.search(
+            r"\b(?:contact|call|report\s+(?:it\s+)?to|reach\s+out\s+to)\b[^.!?]{0,55}"
+            r"\b(?:your\s+)?(?:bank|payment\s+provider|financial\s+institution|provider)\b",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if recipient_contact and (
+            provider_contact is None
+            or recipient_contact.start() < provider_contact.start()
+        ):
+            violations.append(
+                "mistaken-sender advice told Oliver to contact the recipient before the sending bank/payment provider"
             )
 
     elif role == "mistaken_recipient":
@@ -408,7 +437,9 @@ def build_consequential_advice_instruction(
             "payment/transfer. Preserve that actor direction. Do not tell him not "
             "to spend, touch, withdraw, move, or freeze money/accounts as though the "
             "mistaken funds were sitting in his account. A mistaken outgoing transfer "
-            "does not by itself mean his own bank accounts must be frozen or left untouched.\n"
+            "does not by itself mean his own bank accounts must be frozen or left untouched. "
+            "Make the sending bank/payment provider the first recovery contact when provider "
+            "or jurisdiction details are unknown; do not lead with contacting the unintended recipient.\n"
         )
     elif actor_role == "mistaken_recipient":
         role_instruction = (
@@ -497,6 +528,13 @@ def find_consequential_tone_violations(
 
     blame_patterns = (
         r"\boh,?\s+great\b",
+        r"\byou(?:'re| are)\b[^.!?]{0,80}\bpanic(?:king|ked)?\b",
+        r"\bdon['’]?t\s+worry\b",
+        r"\bnot\s+a\s+good\s+(?:start|look)\b",
+        r"\bi\s+hope\s+it(?:'s| is)\s+not\b[^.!?]{0,90}"
+        r"\b(?:massive|huge|large|life[- ]?changing|rainy\s+day|savings)\b",
+        r"\b(?:massive|huge|large)\s+(?:sum|amount)\b[^.!?]{0,90}"
+        r"\b(?:rainy\s+day|savings)\b",
         r"\bclassic\s+(?:way|move|mistake)\b[^.!?]{0,80}\b(?:lose|lost|send|transfer|money|payment)\b",
         r"\b(?:hit|clicked|pressed|sent|transferred|paid)\b[^.!?]{0,90}\bbefore\b[^.!?]{0,50}\b(?:check|checking|double[- ]?check|verify|verifying)\b",
         r"\byou\b[^.!?]{0,60}\b(?:should(?:'ve| have)|could(?:'ve| have))\b[^.!?]{0,60}\b(?:check|verify|notice|catch)\b",

@@ -2,7 +2,7 @@ import re
 
 
 OPINION_PATTERNS = [
-    r"\bwhat do you think\b",
+    r"\bwhat do you (?:actually\s+|really\s+)?think\b",
     r"\bwhat's your opinion\b",
     r"\bwhat is your opinion\b",
     r"\byour opinion\b",
@@ -294,6 +294,28 @@ def find_conversation_policy_violations(
                 "generic conversational follow-up"
             )
             break
+
+    # Visible answers should be syntactically complete enough to stand on
+    # their own. A model can occasionally terminate normally while leaving a
+    # dangling fragment (for example, "Nothing makes"). Mechanical min-length
+    # checks will miss that, so reject only high-confidence incomplete tails.
+    if (
+        re.search(
+            r"\b(?:nothing|something|that|this|it|which|who|what)\s+"
+            r"(?:makes?|gets?|means?|needs?|is|are|was|were|has|have|had|"
+            r"can|could|would|should|will|might|may)\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        or re.search(
+            r"\b(?:because|although|while|unless|and|or|but|to|of|for|with|from|than)\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+    ):
+        violations.append(
+            "visible response ended in an incomplete/truncated sentence"
+        )
 
     human_experience_patterns = [
         r"\bwhen i watched\b",

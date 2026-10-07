@@ -1092,6 +1092,32 @@ def find_grounded_opinion_response_violations(
             "grounded public opinion mirrored Oliver's reaction instead of forming an evidence-based judgement"
         ]
 
+    # A direct evaluative question needs an evaluative answer, not merely a
+    # source-supported recap of what happened. This is intentionally limited
+    # to explicit judgement wording such as "handled it well", "good/bad
+    # decision", etc.; factual questions remain untouched.
+    user = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
+    asks_direct_judgement = bool(re.search(
+        r"\bdo\s+you\s+think\b[^?]{0,100}\b(?:handled|did|made|was|is)\b"
+        r"[^?]{0,100}\b(?:well|badly|right|wrong|good|bad)\b|"
+        r"\bwas\s+(?:that|it|this)\b[^?]{0,80}\b(?:good|bad|right|wrong)\b",
+        user,
+        flags=re.IGNORECASE,
+    ))
+    if asks_direct_judgement:
+        has_judgement = bool(re.search(
+            r"\b(?:yes|no|mostly|partly|mixed|not\s+really|i\s+(?:do|don't|dont|think|would)|"
+            r"handled\s+it\s+(?:well|badly|poorly)|good\s+(?:call|decision|move)|"
+            r"bad\s+(?:call|decision|move)|right\s+call|wrong\s+call|"
+            r"worked\s+well|didn['’]?t\s+handle\s+it\s+well)\b",
+            value,
+            flags=re.IGNORECASE,
+        ))
+        if not has_judgement:
+            return [
+                "grounded public opinion recapped events but did not answer the explicit evaluative judgement"
+            ]
+
     return []
 
 
@@ -1145,6 +1171,21 @@ def build_supported_current_lookup_fallback(
     directly from a single source-supported episode identity instead of throwing
     away good evidence and returning a generic failure message.
     """
+    if isinstance(packet, str):
+        # Public factual research currently renders its internal packet as a
+        # text envelope followed by JSON. Older callers passed a dict directly.
+        # Accept both forms so deterministic extractive fallbacks do not become
+        # silently dead when packet transport changes representation.
+        start = packet.find("{")
+        end = packet.rfind("}")
+        if start != -1 and end > start:
+            try:
+                parsed_packet = json.loads(packet[start:end + 1])
+            except Exception:
+                parsed_packet = None
+            if isinstance(parsed_packet, dict):
+                packet = parsed_packet
+
     if not isinstance(packet, dict):
         return None
     sources = packet.get("sources")
@@ -1181,12 +1222,27 @@ def build_supported_current_lookup_fallback(
     for source in sources:
         if not isinstance(source, dict):
             continue
+
+        # Accept either the rendered evidence-packet source shape or the raw
+        # structured research-result source shape. Deterministic extraction
+        # must never revive a source Core already rejected.
+        if source.get("accepted_as_evidence") is False:
+            continue
+        if str(source.get("relevance_status") or "").strip().lower() == "rejected":
+            continue
+        if "read_success" in source and not bool(source.get("read_success")):
+            continue
+
         metadata = re.sub(
             r"\s+",
             " ",
             " ".join([
                 str(source.get("title") or ""),
-                str(source.get("search_snippet") or ""),
+                str(
+                    source.get("search_snippet")
+                    or source.get("snippet")
+                    or ""
+                ),
             ]).strip(),
         )
         metadata_low = metadata.lower()
@@ -1320,6 +1376,6 @@ def build_failed_public_advice_fallback(
 
 def build_failed_public_factual_fallback():
     return (
-        "I couldn't verify that cleanly enough from the public sources I could read, "
+        "I couldn't find enough reliable public evidence to verify that cleanly, "
         "so I'm not going to make up an answer."
     )

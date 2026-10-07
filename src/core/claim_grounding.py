@@ -1302,6 +1302,7 @@ MAIRON_OFF_TURN_ACTIVITY = re.compile(
 
 MAIRON_FUTURE_AUTONOMOUS_ACTION = re.compile(
     r"\bI(?:'ll| will)\s+(?:probably\s+|maybe\s+|definitely\s+)?"
+    r"(?:make\s+sure\s+to\s+)?"
     r"(?:watch|read|listen\s+to|play|research|check|look\s+up|browse|search|"
     r"visit|buy|order|call|email|message|contact|download|install)\b"
     r"|\bI(?:'m| am)\s+going\s+to\s+"
@@ -1619,6 +1620,7 @@ def _unsupported_user_physical_action_claims(
         # nothing, you're ...". Treat those as the same observable-state
         # claim without broadening to generic imperative "look" phrasing.
         reversed_scene_match = False
+        cross_sentence_scene_match = False
         ing_variants = [
             item
             for item in variants
@@ -1632,8 +1634,16 @@ def _unsupported_user_physical_action_claims(
                 value,
                 flags=re.IGNORECASE,
             ))
+            cross_sentence_scene_match = bool(re.search(
+                r"\b(?:"
+                + "|".join(re.escape(item) for item in ing_variants)
+                + r")\b[^.!?]{0,80}[?!]\s*you(?:\b|'re|'ve|'ll|'d)",
+                value,
+                flags=re.IGNORECASE,
+            ))
 
         indirect_scene_match = False
+        sentence_initial_scene_match = False
         if ing_variants:
             indirect_scene_match = bool(re.search(
                 r"\byou\b[^.!?]{0,65}\b(?:stop|stopped|keep|kept|start|started|continue|continued)\s+(?:"
@@ -1643,7 +1653,27 @@ def _unsupported_user_physical_action_claims(
                 flags=re.IGNORECASE,
             ))
 
-        if not (direct_match or reversed_scene_match or indirect_scene_match):
+            # Conversational fragments can omit the explicit second-person
+            # subject while still asserting an observed physical state:
+            # "Sitting there staring at nothing? ..." is still a claim about
+            # Oliver. Keep this narrow so abstract phrases such as
+            # "looking at it another way" are not swept in.
+            if family in {"stare", "look", "watch"}:
+                sentence_initial_scene_match = bool(re.search(
+                    r"(?:^|[.!?]\s+)(?:sitting\s+there\s+|standing\s+there\s+)?(?:"
+                    + "|".join(re.escape(item) for item in ing_variants)
+                    + r")\s+(?:at|out|around)\b",
+                    value,
+                    flags=re.IGNORECASE,
+                ))
+
+        if not (
+            direct_match
+            or reversed_scene_match
+            or cross_sentence_scene_match
+            or indirect_scene_match
+            or sentence_initial_scene_match
+        ):
             continue
 
         if _grounding_mentions_action_family(
@@ -1744,6 +1774,7 @@ def _unsupported_relationship_history_claims(
     patterns = (
         r"\bi(?:'ve| have)\s+(?:known|been\s+(?:helping|processing|dealing\s+with|putting\s+up\s+with))\s+you\b[^.!?]{0,100}\b(?:since|for)\b",
         r"\bi(?:'ve| have)\s+been\b[^.!?]{0,120}\bsince\s+day\s+one\b",
+        r"\bi(?:'ve| have)\s+been\b[^.!?]{0,120}\bsince\s+(?:the\s+)?(?:moment|time|day)\b[^.!?]{0,90}\byou\b",
         r"\bi(?:'ve| have)\s+been\b[^.!?]{0,100}\bsince\s+before\s+you\b",
         r"\bsince\s+before\s+you\s+(?:had|got|were|became|started)\b",
         r"\bwe(?:'ve| have)\s+been\b[^.!?]{0,90}\bfor\s+(?:years?|months?|ages?)\b",
@@ -1760,6 +1791,8 @@ def _unsupported_relationship_history_claims(
         phrase = _normalise_for_grounding(match.group(0))
         if phrase and phrase in grounding:
             continue
+        if "since" in phrase and re.search(r"\bsince\b", grounding, flags=re.IGNORECASE):
+            continue
         return ["Mairon invented unsupported relationship/conversation history"]
 
     return []
@@ -1769,6 +1802,7 @@ def _unsupported_relationship_history_claims(
 def find_unknown_media_opinion_overreach_violations(
     user_input: str,
     draft: str,
+    conversation=None,
 ) -> List[str]:
     """Reject invented work-specific takes after Mairon admits it lacks familiarity.
 
@@ -1782,15 +1816,80 @@ def find_unknown_media_opinion_overreach_violations(
     response = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
 
     if not re.search(
-        r"\bwhat\s+do\s+you\s+(?:actually\s+)?think\s+(?:of|about)\b|"
-        r"\bwhat(?:'s| is)\s+your\s+(?:take|opinion|view)\b",
+        r"\bwhat\s+do\s+you\s+(?:actually\s+|really\s+)?think\s+(?:of|about)\b|"
+        r"\bwhat(?:'s| is)\s+your\s+(?:actual\s+)?(?:take|opinion|view)\b",
         user,
         flags=re.IGNORECASE,
     ):
         return []
 
+    recent_user_context = str(
+        build_recent_user_grounding_context(
+            conversation,
+            max_user_messages=4,
+        )
+        or ""
+    ).lower()
+    allowed_user_grounding = user + "\n" + recent_user_context
+
+    knowledge_qualifier = bool(re.search(
+        r"\b(?:from|based\s+on)\s+what\s+i\s+know\b|"
+        r"\bmy\s+knowledge\s+(?:of|about)\b|"
+        r"\bi\s+(?:am|'m)\s+not\s+(?:deeply\s+)?familiar\b|"
+        r"\bi\s+can\s+only\s+speak\s+(?:broadly|generally)\b|"
+        r"\bi\s+don['’]?t\s+know\s+enough\b|"
+        r"\bi\s+(?:haven['’]?t|have\s+not|didn['’]?t|did\s+not)\s+"
+        r"(?:actually\s+|personally\s+)?"
+        r"(?:read|watch|see|play|finish|consume|experience)\b|"
+        r"\bi\s+won['’]?t\s+pretend\s+i(?:['’]?ve|\s+have)\s+"
+        r"(?:read|watched|played|finished)\b",
+        response,
+        flags=re.IGNORECASE,
+    ))
+
+    media_dimension_patterns = {
+        "pacing": r"\bpacing\b",
+        "worldbuilding": r"\bworld[- ]?building\b",
+        "characters": r"\b(?:character\s+(?:development|writing|work)|characters?|npcs?)\b",
+        "plot": r"\bplot\b",
+        "prose": r"\b(?:prose|writing\s+style)\b",
+        "themes": r"\bthemes?\b",
+        "dialogue": r"\bdialogue\b",
+        "exposition": r"\bexposition\b",
+        "ending": r"\bending\b",
+        "combat": r"\b(?:combat|fights?|battles?)\b",
+        "romance": r"\bromance\b",
+    }
+    novel_dimensions = [
+        label
+        for label, pattern in media_dimension_patterns.items()
+        if (
+            re.search(pattern, response, flags=re.IGNORECASE)
+            and not re.search(pattern, allowed_user_grounding, flags=re.IGNORECASE)
+        )
+    ]
+    concrete_familiarity_shape = bool(re.search(
+        r"\b(?:the\s+author|the\s+writer)\b[^.!?]{0,90}\b(?:spends?|uses?|keeps?|returns?|switches?)\b|"
+        r"\b\d+\s+chapters?\b|"
+        r"\b(?:minor|side)\s+(?:characters?|npcs?)\b|"
+        r"\b(?:we(?:'re| are)|you(?:'re| are))\s+back\s+to\b",
+        response,
+        flags=re.IGNORECASE,
+    ))
+    if (
+        not knowledge_qualifier
+        and (
+            len(set(novel_dimensions)) >= 3
+            or concrete_familiarity_shape
+        )
+    ):
+        return [
+            "unknown-media opinion presented detailed work-specific familiarity without a knowledge qualifier or user-supplied grounding"
+        ]
+
     admits_limited_familiarity = bool(re.search(
         r"\bi\s+(?:haven['’]?t|have\s+not|didn['’]?t|did\s+not)\s+"
+        r"(?:actually\s+|personally\s+)?"
         r"(?:read|watch|see|play|finish|consume|experience)\b|"
         r"\bi\s+don['’]?t\s+know\s+enough\b|"
         r"\bi\s+can['’]?t\s+give\s+(?:you\s+)?(?:a\s+)?real\s+take\b",
@@ -1808,7 +1907,7 @@ def find_unknown_media_opinion_overreach_violations(
         r"[^.!?]{0,80}\b(?:sucks?|bad|good|great|weak|strong|dense|boring|slow|"
         r"amazing|excellent|poor|messy|bloated|thin|deep|shallow|impressive|"
         r"trying\s+too\s+hard|works?|doesn['’]?t\s+work)\b|"
-        r"\b(?:sucks?|bad|good|great|weak|strong|dense|boring|amazing|excellent|"
+        r"\b(?:sucks?|bad|good|great|weak|strong|dense|boring|slow|amazing|excellent|"
         r"poor|messy|bloated|thin|deep|shallow)\b[^.!?]{0,80}"
         r"\b(?:pacing|world[- ]?building|characters?|plot|prose|writing|story|themes?)\b",
         response,
@@ -1817,6 +1916,49 @@ def find_unknown_media_opinion_overreach_violations(
     if work_specific_guess:
         violations.append(
             "unknown-media opinion admitted insufficient familiarity but then invented work-specific evaluative details"
+        )
+
+    # A first-hand-knowledge disclaimer does not license model-memory guesses
+    # about the work immediately afterwards. If Mairon says it has not consumed
+    # the work, any title-specific property still needs user grounding or
+    # researched evidence.
+    admitted_but_specific = False
+    if admits_limited_familiarity:
+        ungrounded_dimension_claim = any(
+            re.search(
+                pattern,
+                response,
+                flags=re.IGNORECASE,
+            )
+            and not re.search(
+                pattern,
+                allowed_user_grounding,
+                flags=re.IGNORECASE,
+            )
+            for pattern in media_dimension_patterns.values()
+        )
+        ungrounded_scale_or_cast = bool(re.search(
+            r"\b(?:sheer\s+)?volume\b|"
+            r"\b(?:very\s+)?long[- ](?:running|form)\b|"
+            r"\bprotagonists?\b[^.!?]{0,90}\b(?:inevitably|always|often|usually|tend(?:s)?\s+to|make|makes|do|does)\b",
+            response,
+            flags=re.IGNORECASE,
+        )) and not bool(re.search(
+            r"\b(?:sheer\s+)?volume\b|"
+            r"\b(?:very\s+)?long[- ](?:running|form)\b|"
+            r"\bprotagonists?\b",
+            allowed_user_grounding,
+            flags=re.IGNORECASE,
+        ))
+
+        admitted_but_specific = bool(
+            ungrounded_dimension_claim
+            or ungrounded_scale_or_cast
+        )
+
+    if admitted_but_specific:
+        violations.append(
+            "unknown-media opinion admitted insufficient familiarity but still asserted ungrounded work-specific properties"
         )
 
     if re.search(
@@ -2261,6 +2403,11 @@ def find_user_diagnostic_overclaim_violations(
                 text,
                 flags=re.IGNORECASE,
             )
+            if not same_device_near_source:
+                violations.append(
+                    "diagnostic first-test answer did not perform the clean same-device near-source versus problem-location isolation"
+                )
+
             if band_check and (
                 not same_device_near_source
                 or band_check.start() < same_device_near_source.start()
@@ -2630,14 +2777,27 @@ def find_user_diagnostic_overclaim_violations(
             )
         if (
             re.search(r"\bdark\s+scenes?\b", current_user, re.IGNORECASE)
-            and re.search(
-                r"\b(?:strong|clear|definite)\s+(?:indicator|sign)\b",
-                text,
-                flags=re.IGNORECASE,
+            and (
+                re.search(
+                    r"\b(?:strong|clear|definite)\s+(?:indicator|sign|clue|evidence)\b",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                or re.search(
+                    r"\b(?:points?|pointing)\s+(?:strongly\s+)?(?:toward|towards|to)\b"
+                    r"[^.!?]{0,70}\b(?:vrr|variable\s+refresh|culprit)\b",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                or re.search(
+                    r"\bclassic\s+(?:symptom|sign)\b[^.!?]{0,70}\b(?:vrr|variable\s+refresh)\b",
+                    text,
+                    flags=re.IGNORECASE,
+                )
             )
         ):
             violations.append(
-                "VRR diagnosis treated dark-scene correlation as a strong/definite indicator instead of compatible evidence"
+                "VRR diagnosis treated dark-scene correlation as a strong/definite indicator or strong/diagnostic evidence instead of merely compatible evidence"
             )
 
         if (
@@ -3116,6 +3276,21 @@ def find_recommendation_completion_violations(
     )
 
     if concrete:
+        first_sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0]
+        if re.match(r"^\s*(?:it|this|that)\b", first_sentence, flags=re.IGNORECASE):
+            first_has_candidate = bool(
+                re.search(
+                    r"\b(?i:watch|read|play|try|start\s+with|go\s+with|pick)\s+"
+                    r"(?:\*{0,2}|[\"'“‘])?"
+                    r"[A-Z0-9][A-Za-z0-9&:’'._!+\-]*(?:\s+[A-Z0-9][A-Za-z0-9&:’'._!+\-]*){0,8}",
+                    first_sentence,
+                )
+                or re.search(r"[\"“][^\"”]{2,80}[\"”]", first_sentence)
+            )
+            if not first_has_candidate:
+                return [
+                    "explicit media recommendation opened with an unresolved candidate pronoun before naming a concrete title"
+                ]
         return []
 
     return ["explicit media recommendation did not name a concrete candidate"]
@@ -3348,6 +3523,20 @@ def find_tcp_udp_semantics_violations(
     if not tcp_near_handshake:
         violations.append("TCP/UDP explanation did not clearly assign connection establishment/handshake to TCP")
 
+    udp_role_clear = bool(
+        re.search(r"\budp\b[^.!?]{0,100}\bconnectionless\b", text)
+        or re.search(r"\bconnectionless\b[^.!?]{0,100}\budp\b", text)
+        or re.search(
+            r"\budp\b[^.!?]{0,100}\b(?:does\s+not|doesn't|doesnt|no)\b"
+            r"[^.!?]{0,50}\bhandshake\b",
+            text,
+        )
+    )
+    if not udp_role_clear:
+        violations.append(
+            "TCP/UDP pairwise correction did not clearly state that UDP is connectionless / has no connection-establishment handshake"
+        )
+
     return list(dict.fromkeys(violations))
 
 
@@ -3462,16 +3651,16 @@ def find_python_mutable_default_semantics_violations(
                 )
 
     if re.search(
-        r"\bbecause\b[^.!?]{0,80}\b(?:inefficient|unnecessary)\b",
-        text,
-        flags=re.IGNORECASE,
-    ) and not re.search(
-        r"\bdefault(?:s|\s+arguments?)?\b[^.!?]{0,90}\bevaluated\b[^.!?]{0,50}\bonce\b",
+        r"\b(?:doesn['’]?t|does\s+not|won['’]?t|will\s+not)\b[^.!?]{0,100}"
+        r"\b(?:create|make)\b[^.!?]{0,80}\b(?:new\s+)?(?:list|object|default)\b"
+        r"[^.!?]{0,80}\bbecause\b[^.!?]{0,80}\b(?:inefficient|unnecessary)\b|"
+        r"\bbecause\b[^.!?]{0,80}\b(?:inefficient|unnecessary)\b[^.!?]{0,80}"
+        r"\b(?:default|list|object)\b",
         text,
         flags=re.IGNORECASE,
     ):
         violations.append(
-            "Python mutable-default explanation substituted an unsupported efficiency rationale for the language's once-at-definition semantics"
+            "Python mutable-default explanation incorrectly presented efficiency/necessity as the reason defaults are evaluated once"
         )
 
     if re.search(
@@ -3574,15 +3763,33 @@ def find_scaler_leakage_contradiction_violations(
             ))
             leakage_mechanism = bool(re.search(
                 r"\b(?:future\s+(?:information|data)|target[- ]derived|label[- ]derived|"
+                r"outcome[- ]derived|post[- ]outcome|after\s+the\s+outcome|after\s+the\s+event|"
                 r"held[- ]?out\s+(?:test|validation)|test\s+(?:set|data)\b[^.!?]{0,100}"
                 r"(?:used|seen|included|fit|influence)|validation\s+(?:set|data)\b[^.!?]{0,100}"
-                r"(?:used|seen|included|fit|influence)|unavailable\s+at\s+(?:prediction|inference)\s+time)\b",
+                r"(?:used|seen|included|fit|influence)|unavailable\s+at\s+(?:prediction|inference)\s+time|"
+                r"not\s+available\s+at\s+(?:prediction|inference)\s+time)\b",
                 example,
                 flags=re.IGNORECASE,
             ))
             if distribution_shift_shape and not leakage_mechanism:
                 bad.append(
                     "data-leakage tutoring example described distribution shift/spurious correlation without an actual leakage mechanism"
+                )
+
+            # If the answer chooses to teach with a concrete example, the
+            # example itself must contain the boundary violation. A merely
+            # predictive feature (for example a date) is not leakage just
+            # because the target is unknown; the leaked information has to be
+            # unavailable/target-derived/held-out/post-outcome in the stated
+            # workflow.
+            concrete_example = bool(re.search(
+                r"\b(?:include|including|use|using|feature|column|variable|fit|fitting|train|training)\b",
+                example,
+                flags=re.IGNORECASE,
+            ))
+            if concrete_example and not leakage_mechanism:
+                bad.append(
+                    "data-leakage tutoring concrete example did not identify any information that is unavailable, target-derived, held-out, or post-outcome"
                 )
 
         for unit in re.split(r"(?<=[.!?])\s+", text):
@@ -4213,7 +4420,7 @@ def find_explicit_user_constraint_violations(
         flags=re.IGNORECASE,
     ):
         if re.search(
-            r"\banime(?:['’]s)?\b[^.!?]{0,100}\b(?:catch(?:es)?\s+up|sequel|future\s+self|better|worse|ignore|watch|episode|adaptation|pacing|filler|art|animation|ending|source\s+material|team|studio|version|character|plot|story|antics|comparable)\b|"
+            r"\banime(?:['’]s)?\b[^.!?]{0,100}\b(?:catch(?:es)?\s+up|sequel|future\s+self|better|worse|ignore|watch|episode|adaptation|pacing|filler|art|animation|ending|source\s+material|team|studio|version|character|plot|story|antics|comparable|add(?:ed|s|ing)?|chang(?:ed|es|ing)|remov(?:ed|es|ing)|cut(?:s|ting)?)\b|"
             r"\b(?:pacing|filler|watch|episode|adaptation|animation|team|studio|version|character|plot|story|antics)\b[^.!?]{0,80}\banime\b|"
             r"\b(?:different|alternate|changed?)\s+ending\b|"
             r"\b(?:weird|bad|good|better|worse|different)\s+adaptation\b|"
