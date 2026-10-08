@@ -10,6 +10,7 @@ from voice.stt import load_model, record_until_enter, transcribe_audio
 from voice.tts import load_tts, speak
 from core.action_manager import describe_action
 from core.acceptance_shadow import emit_shadow_record
+from core.acceptance_publication import emit_publication_record
 from core.orchestrator import MaironCore
 from core.conversation_state import (
     append_visible_turn_to_model_history,
@@ -1028,6 +1029,10 @@ while True:
         ):
             emit_shadow_record(
                 getattr(core_decision, "acceptance_shadow", None),
+                print,
+            )
+            emit_publication_record(
+                getattr(core_decision, "acceptance_publication", None),
                 print,
             )
             emit_final_response(

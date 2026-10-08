@@ -1,4 +1,4 @@
-"""Shadow acceptance exercises real Core/provider paths without enforcement.
+"""Shadow APIs remain observational; bounded production paths now enforce acceptance.
 
 Provider functions are compiled from their production AST with inert globals,
 as in the existing provider-boundary regressions. No model, tool, account,
@@ -30,6 +30,9 @@ from core.acceptance_shadow import (
     observe_core_result,
     observe_limitation_response,
     observe_time_budget,
+)
+from core.acceptance_publication import (
+    emit_publication_record, publish_limitation_response,
 )
 from core.answer_candidate import AcceptanceDecision, AcceptanceStatus, CandidateOrigin
 from core.answer_contract_runtime import (
@@ -95,6 +98,7 @@ def _provider_globals():
         "build_failed_public_advice_fallback": lambda **kwargs: "Legacy serious fallback.",
         "build_failed_public_opinion_fallback": lambda: "Legacy opinion fallback.",
         "observe_limitation_response": observe_limitation_response,
+        "publish_limitation_response": publish_limitation_response,
     }
 
 
@@ -156,7 +160,7 @@ def _execute_fragment(path, body, namespace):
 
 
 class ShadowIntegrationTests(unittest.TestCase):
-    def _capture(self, action, *, result=None, error=None):
+    def _capture(self, action, *, result=None, error=None, expected_calls=1):
         candidates = []
         real_evaluate = CoreAcceptanceEvaluator.evaluate
 
@@ -170,7 +174,7 @@ class ShadowIntegrationTests(unittest.TestCase):
 
         with patch.object(CoreAcceptanceEvaluator, "evaluate", evaluate):
             returned = action()
-        self.assertEqual(len(candidates), 1)
+        self.assertEqual(len(candidates), expected_calls)
         return returned, candidates[0]
 
     def test_arithmetic_real_core_path_constructs_supported_candidate(self):
@@ -186,36 +190,41 @@ class ShadowIntegrationTests(unittest.TestCase):
         self.assertEqual(facts[0].kind, EvidenceKind.CORE_RESULT)
         self.assertEqual(facts[0].provenance, "core_arithmetic")
         self.assertEqual(facts[0].data["result"], "42")
-        self.assertEqual(decision.acceptance_shadow.decision.status, AcceptanceStatus.ACCEPTED)
+        self.assertEqual(decision.acceptance_publication.decision.status, AcceptanceStatus.ACCEPTED)
 
-    def test_rejected_shadow_never_changes_arithmetic_publication(self):
+    def test_rejected_production_arithmetic_fails_closed_after_one_replacement(self):
         decision, candidate = self._capture(
-            lambda: MaironCore().prepare_turn("multiply 8 by 7"), result=_reject,
+            lambda: MaironCore().prepare_turn("multiply 8 by 7"), result=_reject, expected_calls=2,
         )
-        self.assertEqual(decision.direct_response, "The result is 56.")
-        self.assertEqual(candidate.text, decision.direct_response)
-        self.assertEqual(decision.acceptance_shadow.decision.status, AcceptanceStatus.REJECTED)
-        self.assertIn("REJECTED", decision.acceptance_shadow.event)
+        self.assertEqual(candidate.text, "The result is 56.")
+        self.assertEqual(decision.direct_response, "I cannot safely provide the requested calculation result.")
+        self.assertNotEqual(candidate.text, decision.direct_response)
+        self.assertTrue(decision.acceptance_publication.replacement_used)
+        self.assertEqual(decision.acceptance_publication.outcome, "fail_closed")
+        self.assertEqual(decision.acceptance_publication.decision.status, AcceptanceStatus.REJECTED)
+        self.assertIn("REJECTED", decision.acceptance_publication.event)
 
-    def test_evaluator_exception_never_changes_arithmetic_publication(self):
+    def test_evaluator_exception_never_publishes_unaccepted_arithmetic(self):
         decision, _ = self._capture(
             lambda: MaironCore().prepare_turn("subtract 9 from 40"),
-            error=RuntimeError("private exception payload"),
+            error=RuntimeError("private exception payload"), expected_calls=2,
         )
-        self.assertEqual(decision.direct_response, "The result is 31.")
-        self.assertTrue(decision.acceptance_shadow.evaluation_failed)
-        self.assertIsNone(decision.acceptance_shadow.decision)
-        self.assertNotIn("private exception payload", decision.acceptance_shadow.event)
+        self.assertEqual(decision.direct_response, "I cannot safely provide the requested calculation result.")
+        self.assertTrue(decision.acceptance_publication.replacement_used)
+        self.assertTrue(decision.acceptance_publication.evaluation_failed)
+        self.assertIsNone(decision.acceptance_publication.decision)
+        self.assertNotIn("private exception payload", decision.acceptance_publication.event)
 
-    def test_evidence_adapter_failure_never_changes_arithmetic_publication(self):
+    def test_evidence_adapter_failure_fails_closed_before_arithmetic_publication(self):
         with patch("core.acceptance_shadow.normalize_core_evidence",
                    side_effect=ValueError("private adapter payload")):
             decision = MaironCore().prepare_turn("multiply 6 by 9")
-        self.assertEqual(decision.direct_response, "The result is 54.")
-        self.assertTrue(decision.acceptance_shadow.evaluation_failed)
-        self.assertIsNone(decision.acceptance_shadow.decision)
-        self.assertIn("EVALUATION_ERROR", decision.acceptance_shadow.event)
-        self.assertNotIn("private adapter payload", decision.acceptance_shadow.event)
+        self.assertEqual(decision.direct_response, "I cannot safely provide the requested calculation result.")
+        self.assertFalse(decision.acceptance_publication.replacement_used)
+        self.assertTrue(decision.acceptance_publication.evaluation_failed)
+        self.assertIsNone(decision.acceptance_publication.decision)
+        self.assertIn("EVALUATION_ERROR", decision.acceptance_publication.event)
+        self.assertNotIn("private adapter payload", decision.acceptance_publication.event)
 
     def test_unsuccessful_arithmetic_is_not_promoted_to_verified_result(self):
         decision = MaironCore().prepare_turn("divide 8 by 0")
@@ -419,7 +428,7 @@ class ShadowIntegrationTests(unittest.TestCase):
             returned, candidate = self._capture(lambda: entry(
                 client=None, user_input="Give the current count without browsing.",
                 instructions=runtime, conversation=history,
-            ), result=_reject)
+            ))
         expected = build_verification_declined_fallback()
         self.assertEqual(returned, (
             expected,
@@ -432,9 +441,9 @@ class ShadowIntegrationTests(unittest.TestCase):
         self.assertEqual(candidate.epistemic_mode, "verification_declined")
         self.assertFalse(any(item.claim == history[0]["content"]
                              for item in candidate.evidence.authoritative_evidence))
-        self.assertEqual(len(events), 2)
-        self.assertIn("REJECTED", events[0])
-        self.assertIn("evidence_authority", events[1])
+        self.assertEqual(len(events), 1)
+        self.assertIn("Acceptance enforced: ACCEPTED", events[0])
+        self.assertIn("replacement=no", events[0])
 
     def test_direct_declined_real_function_survives_evaluator_failure(self):
         direct = _compile_provider("handle_direct_conversation")
@@ -443,8 +452,9 @@ class ShadowIntegrationTests(unittest.TestCase):
             returned, candidate = self._capture(lambda: direct(
                 client=None, user_input="Do not verify the exact current count.", conversation=[],
                 core_answer_contract=_contract("verification_declined"),
-            ), error=RuntimeError("private evaluator exception"))
-        self.assertEqual(returned[0], build_verification_declined_fallback())
+            ), error=RuntimeError("private evaluator exception"), expected_calls=2)
+        self.assertEqual(returned[0], "I cannot reliably provide the exact current answer without verification. I will not guess.")
+        self.assertNotEqual(returned[0], candidate.text)
         self.assertEqual(returned[1][-1], {"role": "assistant", "content": returned[0]})
         self.assertEqual(returned[2:], (None, None))
         self.assertTrue(candidate.limitations or candidate.evidence.uncertainty)
@@ -452,17 +462,20 @@ class ShadowIntegrationTests(unittest.TestCase):
         self.assertIn("EVALUATION_ERROR", events[0])
         self.assertNotIn("private evaluator exception", events[0])
 
-    def test_real_missing_fallback_and_publication_tail_ignore_shadow_rejection(self):
+    def test_real_missing_fallback_and_publication_tail_preserve_core_replacement(self):
         run_branch, namespace = _compile_provider_branch(
             "handle_direct_conversation",
             lambda condition: condition == "core_epistemic_mode == 'insufficient_user_context'",
             publish_tail=True,
         )
         namespace["user_input"] = "Please inspect the image; I forgot to upload it."
-        expected = build_insufficient_user_context_fallback(namespace["user_input"])
+        original_candidate = build_insufficient_user_context_fallback(namespace["user_input"])
+        expected = "I cannot determine the requested answer until you provide the required information."
         events = []
         with acceptance_shadow_events(events.append):
-            returned, candidate = self._capture(run_branch, result=_reject)
+            returned, candidate = self._capture(run_branch, result=_reject, expected_calls=2)
+        self.assertEqual(candidate.text, original_candidate)
+        self.assertNotEqual(returned[0], original_candidate)
         self.assertEqual(returned[0], expected)
         self.assertEqual(returned[1][-1]["content"], expected)
         self.assertEqual(returned[2:], (None, None))
@@ -470,6 +483,8 @@ class ShadowIntegrationTests(unittest.TestCase):
         self.assertTrue(any(item.kind == EvidenceKind.UNCERTAINTY
                             for item in candidate.evidence.evidence))
         self.assertEqual(len(events), 2)
+        self.assertIn("Acceptance enforced: REJECTED", events[0])
+        self.assertIn("replacement=yes", events[0])
         self.assertIn("evidence_authority", events[1])
 
     def test_real_remaining_declined_fallback_preserves_output(self):
@@ -479,29 +494,30 @@ class ShadowIntegrationTests(unittest.TestCase):
             publish_tail=True,
         )
         namespace["core_answer_contract"] = _contract("verification_declined")
-        returned, candidate = self._capture(run_branch, result=_reject)
+        returned, candidate = self._capture(run_branch)
         self.assertEqual(returned[0], build_verification_declined_fallback())
         self.assertEqual(returned[1][-1]["content"], returned[0])
         self.assertEqual(candidate.epistemic_mode, "verification_declined")
 
-    def test_public_unavailable_fallback_only_shadows_pure_limitation(self):
+    def test_public_unavailable_fallback_only_enforces_pure_limitation(self):
         run_branch, namespace = _compile_provider_branch(
             "handle_direct_conversation",
             lambda condition: condition == "not public_factual_research_success",
         )
         namespace["build_stable_model_knowledge_fallback"] = lambda **kwargs: None
         namespace["core_answer_contract"] = replace(_contract("public_source_verified"),
-                                                    authority="public_source")
+                                                    authority="public_web")
         events = []
         with acceptance_shadow_events(events.append):
-            returned, candidate = self._capture(run_branch, result=_reject)
+            returned, candidate = self._capture(run_branch)
         self.assertEqual(returned[0], build_failed_public_factual_fallback())
         self.assertEqual(returned[1][-1]["content"], returned[0])
         self.assertTrue(candidate.limitations or candidate.evidence.uncertainty)
         self.assertFalse(any(item.kind == EvidenceKind.STABLE_MODEL_KNOWLEDGE_PERMISSION
                              for item in candidate.evidence.evidence))
-        self.assertEqual(len(events), 2)
-        self.assertIn("evidence_authority", events[1])
+        self.assertEqual(len(events), 1)
+        self.assertIn("Acceptance enforced: ACCEPTED", events[0])
+        self.assertIn("replacement=no", events[0])
 
     def test_public_unavailable_does_not_migrate_stable_opinion_or_advice(self):
         run_branch, namespace = _compile_provider_branch(
@@ -526,6 +542,7 @@ class ShadowIntegrationTests(unittest.TestCase):
                 decision = MaironCore().prepare_turn(prompt)
                 evaluate.assert_not_called()
                 self.assertIsNone(decision.acceptance_shadow)
+                self.assertIsNone(decision.acceptance_publication)
 
     def test_time_budget_evidence_never_uses_rendered_answer(self):
         resolution = resolve_time_budget(
@@ -620,9 +637,9 @@ class ShadowIntegrationTests(unittest.TestCase):
         self.assertIn("request.second", second_events[0])
         self.assertNotIn("request.first", second_events[0])
 
-    def test_application_core_publication_forwards_record_without_enforcement(self):
+    def test_application_core_publication_forwards_enforced_result_and_record(self):
         decision, _ = self._capture(
-            lambda: MaironCore().prepare_turn("add 17 and 25"), result=_reject,
+            lambda: MaironCore().prepare_turn("add 17 and 25"), result=_reject, expected_calls=2,
         )
         path, method = _method_node("application_service.py", "MaironApplication", "submit_text")
         branch = next(node for node in ast.walk(method)
@@ -633,6 +650,8 @@ class ShadowIntegrationTests(unittest.TestCase):
             "self": SimpleNamespace(_emit_event=events.append,
                 _finalize_direct_response=lambda **kwargs: published.append(kwargs)),
             "core_decision": decision, "emit_shadow_record": emit_shadow_record,
+            "emit_publication_record": emit_publication_record,
+            "emit_publication_record": emit_publication_record,
             "text": "add 17 and 25", "response_timer": object(), "channel_value": "text",
             "intent": decision.turn.intent, "authority": decision.epistemic_route.authority,
             "route_mode": decision.epistemic_route.mode, "workflow": "arithmetic",
@@ -645,8 +664,10 @@ class ShadowIntegrationTests(unittest.TestCase):
         _execute_fragment(path, [wrapper], namespace)
         namespace["publish"]()
         self.assertEqual([item["answer"] for item in published], [decision.direct_response])
-        self.assertEqual(events, list(decision.acceptance_shadow.events))
-        self.assertIn("REJECTED", events[0])
+        self.assertEqual(events, list(decision.acceptance_publication.events))
+        self.assertIn("Acceptance enforced: REJECTED", events[0])
+        self.assertIn("replacement=yes", events[0])
+        self.assertEqual(decision.direct_response, "I cannot safely provide the requested calculation result.")
 
     def test_application_provider_context_forwards_event_and_preserves_router_result(self):
         from contextlib import nullcontext
@@ -685,9 +706,9 @@ class ShadowIntegrationTests(unittest.TestCase):
         for invariant in ("evidence_authority", "uncertainty_preservation", "contract_completion"):
             self.assertIn(invariant, emitted)
 
-    def test_terminal_core_publication_emits_diagnostic_then_original_answer(self):
+    def test_terminal_core_publication_emits_enforced_diagnostic_then_final_answer(self):
         decision, _ = self._capture(
-            lambda: MaironCore().prepare_turn("add 16 and 8"), result=_reject,
+            lambda: MaironCore().prepare_turn("add 16 and 8"), result=_reject, expected_calls=2,
         )
         path = SRC / "main.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -697,6 +718,7 @@ class ShadowIntegrationTests(unittest.TestCase):
         events, published = [], []
         namespace = {
             "core_decision": decision, "emit_shadow_record": emit_shadow_record,
+            "emit_publication_record": emit_publication_record,
             "print": events.append, "emit_final_response": lambda **kwargs: published.append(kwargs),
             "user_input": "add 16 and 8", "response_timer": object(),
             "local_state": [], "mairon_instructions": "runtime context",
@@ -712,7 +734,9 @@ class ShadowIntegrationTests(unittest.TestCase):
         _execute_fragment(path, [loop], namespace)
         self.assertEqual([item["answer"] for item in published], [decision.direct_response])
         self.assertEqual(namespace["local_state"][-1]["content"], decision.direct_response)
-        self.assertEqual(events, list(decision.acceptance_shadow.events))
+        self.assertEqual(events, list(decision.acceptance_publication.events))
+        self.assertIn("Acceptance enforced: REJECTED", events[0])
+        self.assertEqual(decision.direct_response, "I cannot safely provide the requested calculation result.")
 
     def test_shadow_event_is_visible_through_existing_desktop_diagnostics(self):
         record = observe_core_result(

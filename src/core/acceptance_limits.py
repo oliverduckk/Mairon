@@ -15,6 +15,7 @@ from core.acceptance_semantics import ClaimUnit, canonical_statement
 from core.acceptance_typed import TypedEvaluation, TypedUnitValidation
 from core.answer_candidate import AnswerCandidate
 from core.evidence import EvidenceKind, EvidenceStatus
+from core.missing_inputs import parse_missing_item_list
 
 
 _MODES = {
@@ -193,7 +194,7 @@ def _denial(value: str, state: _Availability):
             return None
         if state.kind == "private_state" and verb in {"give", "provide", "verify", "access"}:
             return None
-        if not tail or _scope_matches(tail, state):
+        if not tail or _scope_matches(tail, state) or _omission_matches(tail, state):
             return "limitation"
         # An inability to provide an answer under a verification condition is
         # a refusal, not a claim that the requested value was verified.
@@ -217,7 +218,7 @@ def _denial(value: str, state: _Availability):
         if match.group("status").startswith("not "):
             if _omission_matches(match.group(1), state):
                 return "limitation"
-        elif _scope_matches(match.group(1), state):
+        elif _scope_matches(match.group(1), state) or _omission_matches(match.group(1), state):
             return "limitation"
     return None
 
@@ -244,8 +245,72 @@ def _constraint(value: str, state: _Availability) -> bool:
 def _omission_matches(value: str, state: _Availability) -> bool:
     if state.kind != "missing_input" or not state.missing_inputs:
         return False
-    explicit = _Availability(state.kind, state.evidence_ids, state.missing_inputs, state.missing_inputs)
-    return _scope_matches(value, explicit, generic=False)
+    referenced = parse_missing_item_list(value)
+    if referenced is None:
+        return False
+    # Item descriptions identify the omitted input; they do not establish the
+    # contents of that input. Match complete labels, including numeric labels,
+    # rather than treating digits or commas as assertions in their own right.
+    def identity(item):
+        return re.sub(r"^(?:the|a|an)\s+", "", _normal(item))
+    known = set()
+    for description in state.missing_inputs:
+        retained = parse_missing_item_list(description)
+        if retained is not None:
+            known.update(identity(item) for item in retained.items)
+    return bool(known) and all(identity(item) in known for item in referenced.items)
+
+
+def _missing_list_clauses(clauses, state: _Availability, candidate: AnswerCandidate):
+    """Join only comma fragments proven to be one retained nominal list.
+
+    A following factual clause remains separate and must pass ordinary checks.
+    No candidate suffix is trimmed or converted into availability evidence.
+    """
+    if state.kind != "missing_input":
+        return clauses
+    combined = []
+    index = 0
+    while index < len(clauses):
+        connector, value = clauses[index]
+        end = index + 1
+        # The clause tokenizer consumes an Oxford-comma "and" as a connector.
+        # It can join a nominal list only after the whole joined span proves
+        # that its labels belong to the explicit omission state.
+        while end < len(clauses) and clauses[end][0] in {",", "and"}:
+            end += 1
+        for stop in range(end, index + 1, -1):
+            joined = ", ".join(part for _, part in clauses[index:stop])
+            if ((connector == "because" and _missing_cause(joined, state))
+                    or (_retained_list_tail(joined, state) and (
+                        _denial(joined, state)
+                        or _request(joined, state, candidate)
+                        or (connector in {"until", "unless"} and _supply_condition(joined, state))
+                    ))):
+                value, index = joined, stop - 1
+                break
+        combined.append((connector, value))
+        index += 1
+    return tuple(combined)
+
+
+def _retained_list_tail(value: str, state: _Availability) -> bool:
+    # Generic scope vocabulary is not a nominal-list proof: it can include
+    # independent assertions such as a claim that information is available.
+    # Joining clauses therefore requires a whole list of retained item labels.
+    heads = (
+        r"i (?:cannot|can not|could not|am unable to|do not) (?:reliably )?" + _KNOWING,
+        r"(?:please )?" + _SUPPLY + r"(?: me)?",
+        r"you (?:actually )?" + _SUPPLY + r"(?: or " + _SUPPLY + r")?(?: me)?",
+    )
+    for head in heads:
+        match = re.fullmatch(head + r"\s+(.+)", value)
+        if match and _omission_matches(match.group(1), state):
+            return True
+    match = re.fullmatch(
+        r"(.+?) (?:is|are) (?:unavailable|missing|unknown|unverified|not supplied|not provided|not attached)", value,
+    )
+    return bool(match and _omission_matches(match.group(1), state))
 
 
 def _missing_cause(value: str, state: _Availability) -> bool:
@@ -260,7 +325,7 @@ def _supply_condition(value: str, state: _Availability) -> bool:
         return False
     match = re.fullmatch(r"you (?:actually )?(?:" + _SUPPLY + r")(?: or " + _SUPPLY + r")?(?: me)? (.+)", value)
     if match:
-        return _scope_matches(match.group(1), state)
+        return _scope_matches(match.group(1), state) or _omission_matches(match.group(1), state)
     if state.kind == "private_state":
         return bool(re.fullmatch(r"you have told me in (?:our|the) conversation", value))
     return False
@@ -270,7 +335,7 @@ def _request(value: str, state: _Availability, candidate: AnswerCandidate) -> bo
     if state.kind != "missing_input" or not candidate.contract.allow_follow_up_question:
         return False
     match = re.fullmatch(r"(?:please )?(?:" + _SUPPLY + r")(?: me)? (.+)", value)
-    return bool(match and _scope_matches(match.group(1), state))
+    return bool(match and (_scope_matches(match.group(1), state) or _omission_matches(match.group(1), state)))
 
 
 def _use_after_input(value: str, state: _Availability) -> bool:
@@ -289,7 +354,7 @@ def _validate_unit(unit: ClaimUnit, state: _Availability, candidate: AnswerCandi
             return TypedUnitValidation(evidence_ids=state.evidence_ids)
         return None
     obligations = set()
-    clauses = _clauses(unit.text)
+    clauses = _missing_list_clauses(_clauses(unit.text), state, candidate)
     for connector, value in clauses:
         if not value:
             return None
@@ -319,6 +384,43 @@ def _validate_unit(unit: ClaimUnit, state: _Availability, candidate: AnswerCandi
     )
 
 
+def _limitation_groups(units: Tuple[ClaimUnit, ...], state: _Availability, candidate: AnswerCandidate):
+    """Reconnect generic sentence boundaries only inside retained item labels.
+
+    A dot in a user-authored filename is part of its opaque name, not a factual
+    assertion. The whole reconnected speech act must still pass typed validation;
+    a later sentence or claim outside that exact label is never absorbed.
+    """
+    if state.kind != "missing_input" or not any("." in item for item in state.missing_inputs):
+        return tuple(((unit,), unit.text) for unit in units)
+    label_spans = [
+        (match.start(), match.end())
+        for item in state.missing_inputs if "." in item
+        for match in re.finditer(re.escape(item).replace(r"\ ", r"\s+"), candidate.text, re.IGNORECASE)
+    ]
+    located, position = [], 0
+    for unit in units:
+        start = candidate.text.find(unit.text, position)
+        if start < 0:
+            return tuple(((unit,), unit.text) for unit in units)
+        position = start + len(unit.text)
+        located.append((unit, start, position))
+    groups, index = [], 0
+    while index < len(located):
+        end = index + 1
+        while end < len(located) and any(
+            left < located[end - 1][2] <= located[end][1] < right
+            for left, right in label_spans
+        ):
+            end += 1
+        groups.append((
+            tuple(unit for unit, _, _ in located[index:end]),
+            candidate.text[located[index][1]:located[end - 1][2]],
+        ))
+        index = end
+    return tuple(groups)
+
+
 def validate_limits(candidate: AnswerCandidate, units: Tuple[ClaimUnit, ...]) -> Optional[TypedEvaluation]:
     """Cover bounded limitation speech acts from trusted typed absence state.
 
@@ -330,10 +432,15 @@ def validate_limits(candidate: AnswerCandidate, units: Tuple[ClaimUnit, ...]) ->
     if state is None:
         return None
     covered = {}
-    for unit in units:
+    for group, text in _limitation_groups(units, state, candidate):
+        unit = group[0]
+        if len(group) > 1:
+            unit = ClaimUnit(group[0].index, text)
         result = _validate_unit(unit, state, candidate)
         if result is not None:
-            covered[unit.index] = result
+            covered[group[0].index] = result
+            for fragment in group[1:]:
+                covered[fragment.index] = TypedUnitValidation(evidence_ids=state.evidence_ids)
     # A wholly bounded verification refusal supplies no guessed value even
     # when it says "cannot answer without verification" instead of "no guess".
     if state.kind == "verification_declined" and len(covered) == len(units) and units:

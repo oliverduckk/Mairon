@@ -6,11 +6,12 @@ from core.answer_contract import (
     build_answer_contract,
 )
 from core.answer_candidate import CandidateOrigin
-from core.acceptance_shadow import (
-    AcceptanceShadowRecord,
-    observe_core_result,
-    observe_limitation_response,
-    observe_time_budget,
+from core.acceptance_shadow import AcceptanceShadowRecord
+from core.acceptance_publication import (
+    AcceptancePublicationRecord,
+    publish_core_result,
+    publish_limitation_response,
+    publish_time_budget,
 )
 from core.conversation_state import (
     ConversationState,
@@ -103,6 +104,9 @@ class CoreDecision:
 
     # Observational only: this record never controls direct_response.
     acceptance_shadow: Optional[AcceptanceShadowRecord] = None
+
+    # Authoritative only for the bounded typed Core paths integrated below.
+    acceptance_publication: Optional[AcceptancePublicationRecord] = None
 
 
 class MaironCore:
@@ -357,8 +361,12 @@ class MaironCore:
                 )
                 route = route_epistemic_authority(turn)
                 contract = build_answer_contract(turn=turn, route=route)
-                acceptance_shadow = observe_time_budget(
-                    text=budget.answer,
+                try:
+                    budget_answer = budget.answer
+                except Exception:
+                    budget_answer = None
+                publication = publish_time_budget(
+                    text=budget_answer,
                     contract=contract,
                     resolution=budget,
                     path="time_budget",
@@ -366,8 +374,8 @@ class MaironCore:
                 self.conversation_state.update_from_turn(turn)
                 return CoreDecision(
                     turn=turn, epistemic_route=route,
-                    answer_contract=contract, direct_response=budget.answer,
-                    acceptance_shadow=acceptance_shadow,
+                    answer_contract=contract, direct_response=publication.text,
+                    acceptance_publication=publication.record,
                 )
 
         # Only an explicit, uniquely extractable latest USER statement can be
@@ -422,7 +430,7 @@ class MaironCore:
                 )
 
             contract = build_answer_contract(turn=turn, route=route)
-            acceptance_shadow = observe_limitation_response(
+            publication = publish_limitation_response(
                 text=direct_response,
                 contract=contract,
                 user_input=user_input,
@@ -439,8 +447,8 @@ class MaironCore:
                 epistemic_route=route,
                 answer_contract=contract,
                 workflow_result=None,
-                direct_response=direct_response,
-                acceptance_shadow=acceptance_shadow,
+                direct_response=publication.text,
+                acceptance_publication=publication.record,
             )
 
         # --------------------------------------------------
@@ -539,13 +547,8 @@ class MaironCore:
                 ),
             )
 
-            if (
-                workflow_result
-                and workflow_result.answer_fact
-            ):
-                contract.required_claims.append(
-                    workflow_result.answer_fact
-                )
+            # Result completion is checked against the structured Core result.
+            # Candidate prose must not become an authoritative required claim.
 
             direct_response = (
                 workflow_result.answer_fact
@@ -566,19 +569,18 @@ class MaironCore:
                 )
             )
 
-            acceptance_shadow = None
-            if (
-                workflow_result
-                and workflow_result.success
-                and workflow_result.evidence is not None
-                and workflow_result.answer_fact
-            ):
-                acceptance_shadow = observe_core_result(
-                    text=direct_response,
+            acceptance_publication = None
+            if workflow_result and workflow_result.success:
+                # A successful Core calculation always crosses this boundary,
+                # including malformed or missing candidate/evidence transports.
+                publication = publish_core_result(
+                    text=workflow_result.answer_fact,
                     contract=contract,
                     evidence=workflow_result.evidence,
                     path="arithmetic",
                 )
+                direct_response = publication.text
+                acceptance_publication = publication.record
 
             self.conversation_state.update_from_turn(
                 turn
@@ -590,7 +592,7 @@ class MaironCore:
                 answer_contract=contract,
                 workflow_result=workflow_result,
                 direct_response=direct_response,
-                acceptance_shadow=acceptance_shadow,
+                acceptance_publication=acceptance_publication,
             )
 
         # --------------------------------------------------

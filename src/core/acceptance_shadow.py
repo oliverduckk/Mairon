@@ -215,10 +215,11 @@ def _limitation_evidence(*, contract, user_input, conversation, user_history, fa
     if mode == "insufficient_user_context":
         # Reuse the existing Core extractor of explicitly omitted input. It
         # reads the user turn and never infers absence from response wording.
-        from core.claim_grounding import _extract_explicit_missing_items
+        from core.missing_inputs import extract_missing_inputs
+        missing = extract_missing_inputs(user_input)
         availability.update({
             "kind": "missing_input", "input_available": False,
-            "missing_inputs": _extract_explicit_missing_items(user_input),
+            "missing_inputs": missing.items if missing is not None else (),
         })
     elif mode == "verification_declined":
         availability.update({

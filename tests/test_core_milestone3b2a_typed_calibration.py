@@ -1,4 +1,4 @@
-"""Typed calibration preserves authority and shadow-only publication.
+"""Typed calibration preserves authority across shadow APIs and bounded publication.
 
 Neutral result values and absent-input states exercise actual Core evidence
 adapters. Candidate origins and diagnostic paths are varied independently of
@@ -256,7 +256,7 @@ class TypedCalibrationTests(unittest.TestCase):
             with self.subTest(prompt=prompt):
                 decision, candidate = self._capture(lambda: MaironCore().prepare_turn(prompt))
                 self.assertEqual(candidate.text, decision.direct_response)
-                self.assertEqual(decision.acceptance_shadow.decision.status, AcceptanceStatus.ACCEPTED)
+                self.assertEqual(decision.acceptance_publication.decision.status, AcceptanceStatus.ACCEPTED)
                 self._assert_origins(candidate, True)
 
     def test_actual_correction_and_delay_fields_support_legacy_answer(self):
@@ -266,7 +266,7 @@ class TypedCalibrationTests(unittest.TestCase):
         core.prepare_turn("Correction: transit is 26 minutes not 24. Does it fit?")
         decision, candidate = self._capture(lambda: core.prepare_turn("Transit is delayed by 7 minutes. Does it fit?"))
         self.assertEqual(candidate.text, decision.direct_response)
-        self.assertEqual(decision.acceptance_shadow.decision.status, AcceptanceStatus.ACCEPTED)
+        self.assertEqual(decision.acceptance_publication.decision.status, AcceptanceStatus.ACCEPTED)
         self.assertTrue(any(item.data.get("delay_minutes") == "7" for item in candidate.evidence.authoritative_evidence))
         self._assert_origins(candidate, True)
         changed = replace(candidate, text=candidate.text.replace("7-minute delay", "8-minute delay"))
@@ -430,7 +430,7 @@ class TypedCalibrationTests(unittest.TestCase):
             with self.subTest(prompt=prompt):
                 decision, candidate = self._capture(lambda: MaironCore().prepare_turn(prompt))
                 self.assertEqual(candidate.text, decision.direct_response)
-                self.assertEqual(decision.acceptance_shadow.decision.status, AcceptanceStatus.ACCEPTED)
+                self.assertEqual(decision.acceptance_publication.decision.status, AcceptanceStatus.ACCEPTED)
                 self._assert_origins(candidate, True)
 
     def test_private_state_limitation_does_not_authorize_observation(self):
@@ -491,13 +491,13 @@ class TypedCalibrationTests(unittest.TestCase):
     def test_existing_verified_arithmetic_core_answer_remains_accepted(self):
         decision, candidate = self._capture(lambda: MaironCore().prepare_turn("multiply 12 by 6"))
         self.assertEqual(decision.direct_response, "The result is 72.")
-        self.assertEqual(decision.acceptance_shadow.decision.status, AcceptanceStatus.ACCEPTED)
+        self.assertEqual(decision.acceptance_publication.decision.status, AcceptanceStatus.ACCEPTED)
         self._assert_origins(candidate, True)
 
     def test_existing_large_arithmetic_rendering_and_ungrouped_equivalent_are_accepted(self):
         decision, candidate = self._capture(lambda: MaironCore().prepare_turn("add 1700 and 1900"))
         self.assertEqual(decision.direct_response, "The total is 3,600.")
-        self.assertEqual(decision.acceptance_shadow.decision.status, AcceptanceStatus.ACCEPTED)
+        self.assertEqual(decision.acceptance_publication.decision.status, AcceptanceStatus.ACCEPTED)
         self._assert_origins(candidate, True)
         self._assert_origins(replace(candidate, text="The result is 3600."), True)
         self._assert_origins(replace(candidate, text="The total is 36,00."), False)
@@ -585,16 +585,35 @@ class TypedCalibrationTests(unittest.TestCase):
         self.assertEqual(records[0].decision, records[2].decision)
         self.assertNotEqual(records[0].metadata["path"], records[1].metadata["path"])
 
-    def test_calibration_stays_shadow_when_real_evaluator_requests_replacement(self):
+    def test_calibrated_real_budget_replaces_invalid_candidate_from_typed_result(self):
         valid = resolve_time_budget("I have 72 minutes, checking 17 minutes, setup 13 minutes, filing 19 minutes. Does it fit?")
         altered = replace(valid, answer="The total is 999 minutes.")
-        events = []
-        with patch("core.orchestrator.resolve_time_budget", return_value=altered), acceptance_shadow_events(events.append):
+        captured = []
+        evaluate = CoreAcceptanceEvaluator.evaluate
+
+        def record(evaluator, candidate):
+            captured.append(candidate)
+            return evaluate(evaluator, candidate)
+
+        with patch("core.orchestrator.resolve_time_budget", return_value=altered), patch.object(
+            CoreAcceptanceEvaluator, "evaluate", record,
+        ):
             decision = MaironCore().prepare_turn("Can these durations fit?")
-        self.assertEqual(decision.direct_response, "The total is 999 minutes.")
-        self.assertNotEqual(decision.acceptance_shadow.decision.status, AcceptanceStatus.ACCEPTED)
-        self.assertEqual(decision.acceptance_shadow.decision.evaluated_text, decision.direct_response)
-        self.assertNotIn("The total is 999", decision.acceptance_shadow.event)
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0].text, altered.answer)
+        self.assertNotEqual(decision.direct_response, altered.answer)
+        self.assertEqual(decision.direct_response, "The total is 49 minutes. The budget is 72 minutes. The remaining time is 23 minutes. It fits.")
+        self.assertIsNone(decision.acceptance_shadow)
+        publication = decision.acceptance_publication
+        self.assertNotEqual(publication.decision.status, AcceptanceStatus.ACCEPTED)
+        self.assertEqual(publication.decision.evaluated_text, altered.answer)
+        self.assertEqual(publication.replacement_decision.status, AcceptanceStatus.ACCEPTED)
+        self.assertEqual(publication.replacement_decision.evaluated_text, decision.direct_response)
+        self.assertTrue(publication.replacement_used)
+        self.assertEqual(publication.outcome, "replaced")
+        self.assertNotIn("The total is 999", "\n".join(publication.events))
+        for candidate in captured:
+            self.assertTrue(all(item.data["used_minutes"] == "49" for item in candidate.evidence.authoritative_evidence))
 
 
 if __name__ == "__main__":

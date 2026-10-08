@@ -6,6 +6,8 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+from core.missing_inputs import extract_missing_inputs, resolve_missing_inputs
+
 from core.answer_contract_runtime import (
     coerce_answer_contract_runtime,
     render_answer_contract,
@@ -5475,27 +5477,13 @@ def build_core_grounding_retry_instruction(
 
 
 def _extract_explicit_missing_items(text: str) -> Optional[str]:
-    """Extract only a user-authored description of omitted task input.
+    """Compatibility rendering of Core's normalized user-authored omissions.
 
-    This deliberately does not infer what a task *usually* needs. It merely
-    reuses the missing material Oliver explicitly named in his own turn.
+    The initial fallback and USER-only follow-up share this extraction; neither
+    can infer a requirement or copy a trailing request into a material label.
     """
-    value = str(text or "").strip()
-    patterns = (
-        r"\bi\s+(?:haven['’]?t|have\s+not|havent)\s+"
-        r"(?:attached|uploaded|provided|sent|given)\s+(?:you\s+)?(?P<items>[^?.!]{1,180})",
-        r"\bi\s+(?:haven['’]?t|have\s+not|havent)\s+told\s+you\s+(?P<items>[^?.!]{1,180})",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, value, flags=re.IGNORECASE)
-        if not match:
-            continue
-        items = " ".join(match.group("items").strip(" ,;:-").split())
-        items = re.sub(r"\s+yet\s*$", "", items, flags=re.IGNORECASE)
-        items = re.sub(r"\bmy\b", "your", items, flags=re.IGNORECASE)
-        if items:
-            return items
-    return None
+    missing = extract_missing_inputs(text)
+    return missing.description if missing is not None else None
 
 
 def build_insufficient_user_context_fallback(user_input: str) -> str:
@@ -5679,12 +5667,9 @@ def build_user_context_reasoning_fallback(
         current,
         flags=re.IGNORECASE,
     ):
-        for item in reversed(list(conversation or [])):
-            if not isinstance(item, dict) or str(item.get("role") or "").lower() != "user":
-                continue
-            missing = _extract_explicit_missing_items(str(item.get("content") or ""))
-            if missing:
-                return "Send me " + missing + ". That's what I need to check it properly."
+        missing = resolve_missing_inputs(conversation, user_input=current)
+        if missing is not None:
+            return "Send me " + missing.description + ". That's what I need to check it properly."
 
     if (
         re.search(r"def\s+[A-Za-z_]\w*\s*\([^)]*=\s*\[\s*\]", user_context)
