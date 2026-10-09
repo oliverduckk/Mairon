@@ -1630,6 +1630,10 @@ def gather_public_factual_research(
         "forecast_requested": forecast_requested,
         "official_documentation_required": official_documentation_required,
         "search_result_count": len(results),
+        # Retain discovery independently of reads. A search hit is provenance,
+        # not readable evidence, and observational adapters must keep that
+        # distinction even when the bounded read loop stops early.
+        "discovered_sources": [dict(result) for result in results],
         "eligible_search_result_count": len(eligible_results),
         "read_attempt_count": read_attempt_count,
         "raw_readable_source_count": raw_readable_source_count,

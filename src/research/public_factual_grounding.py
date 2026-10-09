@@ -1,6 +1,10 @@
+import hashlib
 import json
 import os
 import re
+from types import MappingProxyType
+
+from core.evidence import freeze_metadata
 
 
 PUBLIC_FACTUAL_VERIFIER_RESPONSE_SCHEMA = {
@@ -34,10 +38,21 @@ PUBLIC_FACTUAL_VERIFIER_RESPONSE_SCHEMA = {
 
 
 class PublicFactualVerificationResult(list):
-    def __init__(self, violations=None, accepted_sentences=None, sentence_assessments=None):
+    def __init__(self, violations=None, accepted_sentences=None, sentence_assessments=None,
+                 verification_state=None):
         super().__init__(list(violations or []))
         self.accepted_sentences = list(accepted_sentences or [])
         self.sentence_assessments = list(sentence_assessments or [])
+        try:
+            self._verification_state = freeze_metadata(verification_state or {})
+        except Exception:
+            # Observational transport cannot change the legacy verifier verdict.
+            self._verification_state = MappingProxyType({})
+
+    @property
+    def verification_state(self):
+        """Immutable verifier provenance, independent of legacy list decisions."""
+        return self._verification_state
 
 
 def _verification_debug_enabled():
@@ -1053,23 +1068,47 @@ def verify_public_factual_draft(
         if sentence_supported:
             accepted_sentences.append(draft_sentences[index - 1])
 
+    def retained_result(current_violations):
+        # Only a complete, internally consistent typed model assessment reaches
+        # this point. Keep raw and Core-effective verdicts separately; source
+        # counts or candidate prose cannot stand in for either verdict.
+        verification_state = {}
+        try:
+            verification_state = {
+                "version": 1,
+                "assessed_draft_digest": hashlib.sha256(
+                    str(draft or "").encode("utf-8")
+                ).hexdigest(),
+                "packet_digest": hashlib.sha256(
+                    str(research_evidence or "").encode("utf-8")
+                ).hexdigest(),
+                "assessed_sentences": tuple(draft_sentences),
+                "global_supported": supported,
+                "unsupported_claim_count": len(claims),
+                "assessment_complete": True,
+                "sentence_assessments": raw_assessments,
+                "effective_sentence_assessments": sentence_assessments,
+                "effective_supported": not current_violations,
+            }
+        except Exception:
+            # A failed metadata snapshot leaves support unproven in shadow only.
+            pass
+        return PublicFactualVerificationResult(
+            current_violations,
+            accepted_sentences=accepted_sentences,
+            sentence_assessments=sentence_assessments,
+            verification_state=verification_state,
+        )
+
     if not violations:
         if supported:
-            return PublicFactualVerificationResult(
-                [],
-                accepted_sentences=accepted_sentences,
-                sentence_assessments=sentence_assessments,
-            )
+            return retained_result([])
 
         violations = [
             "public factual response contained unsupported claims"
         ]
 
-    return PublicFactualVerificationResult(
-        violations,
-        accepted_sentences=accepted_sentences,
-        sentence_assessments=sentence_assessments,
-    )
+    return retained_result(violations)
 
 
 

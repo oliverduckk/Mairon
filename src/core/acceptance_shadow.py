@@ -20,7 +20,7 @@ from core.acceptance_evaluator import (
     UNCERTAINTY_PRESERVATION, USER_FACT_CONSISTENCY, USER_OBSERVATION_SUPPORT,
     CoreAcceptanceEvaluator,
 )
-from core.answer_candidate import AcceptanceDecision, AnswerCandidate, CandidateOrigin
+from core.answer_candidate import AcceptanceDecision, AcceptanceStatus, AnswerCandidate, CandidateOrigin
 from core.answer_contract_runtime import coerce_answer_contract_runtime
 from core.evidence import Evidence, EvidenceBundle, EvidenceKind, EvidenceStatus
 from core.evidence_normalization import (
@@ -36,11 +36,68 @@ _INVARIANTS = frozenset({
     MODEL_KNOWLEDGE_NOT_PROOF, ORIGIN_AUTHORITY, REQUIRED_CLAIMS,
     SEMANTIC_COVERAGE, SERIOUS_CONTRACT_TONE, SOURCE_SCOPE,
     UNCERTAINTY_PRESERVATION, USER_FACT_CONSISTENCY, USER_OBSERVATION_SUPPORT,
+    "public_verifier_consistency", "public_sentence_support", "public_global_support",
+    "source_identity", "source_read_provenance", "official_source_support", "insufficient_scope_support",
+    "insufficient_currentness_support",
 })
 _LIMITATION_MODES = frozenset({
     "insufficient_user_context", "verification_declined",
     "private_state_uncertain", "unobserved_private_state",
 })
+_PUBLIC_DIAGNOSTIC_LIMITS = frozenset({"scope_verifier_only", "source_bindings_unavailable"})
+_BINDING_STATUSES = frozenset({"complete", "incomplete", "malformed", "unavailable"})
+_BINDING_ISSUES = frozenset({
+    "transport_unavailable", "evaluation_failed", "invalid_output", "incomplete_output",
+    "input_limit", "invalid_binding", "unread_source", "wrong_inputs", "missing_annotations",
+})
+_BINDING_FAILURE_DOMAINS = frozenset({"annotation_capability", "integrity"})
+_BINDING_FAILURE_CODES = frozenset({
+    "wrong_inputs", "invalid_packet_shape", "invalid_packet_identity", "input_limit",
+    "transport_unavailable", "transport_failure", "infrastructure_failure",
+    "invalid_annotation_shape", "invalid_annotation_index", "invalid_annotation_semantics",
+    "invalid_source_id", "factual_source_missing", "invalid_witness_shape",
+    "invalid_literal_witness", "factual_witness_missing", "incomplete_annotations",
+    "unread_source", "missing_annotations",
+})
+_PUBLIC_SENTENCE_FAILURE_CODES = frozenset({
+    "legacy_sentence_unsupported", "annotation_limitation_mismatch",
+    "annotation_non_factual_mismatch", "factual_witness_missing",
+})
+_PUBLIC_ANNOTATION_KINDS = frozenset({"factual", "limitation", "non_factual", "unknown"})
+
+
+def _public_sentence_failures(decision):
+    """Filter only bounded public-validator identifiers for developer events.
+
+    Never consume unit text, reasons, witnesses or source contents. A wrong or
+    hostile diagnostic payload cannot acquire authority or expose its prose.
+    """
+    if not isinstance(decision, AcceptanceDecision):
+        return ()
+    typed = decision.metadata.get("typed_diagnostics", {})
+    typed = typed if isinstance(typed, Mapping) else {}
+    public = typed.get("public_factual_verifier_provenance", {})
+    public = public if isinstance(public, Mapping) else {}
+    records = public.get("public_sentence_failures", ())
+    if not isinstance(records, (tuple, list)):
+        return ()
+    safe, seen = [], set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        index, kind, code = (record.get("sentence_index"), record.get("annotation_kind"), record.get("code"))
+        if (type(index) is not int or not 1 <= index <= 16
+                or not isinstance(kind, str) or kind not in _PUBLIC_ANNOTATION_KINDS
+                or not isinstance(code, str) or code not in _PUBLIC_SENTENCE_FAILURE_CODES):
+            continue
+        key = (index, kind, code)
+        if key in seen:
+            continue
+        seen.add(key)
+        safe.append({"sentence_index": index, "annotation_kind": kind, "code": code})
+        if len(safe) == 16:
+            break
+    return tuple(safe)
 
 
 @dataclass(frozen=True)
@@ -51,6 +108,11 @@ class AcceptanceShadowRecord:
     origin: CandidateOrigin
     decision: Optional[AcceptanceDecision] = None
     evaluation_failed: bool = False
+    diagnostic_limits: tuple[str, ...] = ()
+    binding_status: Optional[str] = None
+    binding_issue: Optional[str] = None
+    binding_failure_domain: Optional[str] = None
+    binding_failure_code: Optional[str] = None
 
     @property
     def metadata(self) -> dict:
@@ -60,13 +122,29 @@ class AcceptanceShadowRecord:
             value if value in _INVARIANTS else "unknown_invariant"
             for value in (self.decision.violated_invariants if self.decision else ())
         ))
-        return {
+        metadata = {
             "path": self.path,
             "candidate_origin": self.origin.value,
             "status": self.decision.status.value if self.decision else "evaluation_error",
             "violated_invariants": invariants,
             "evaluation_failed": self.evaluation_failed,
         }
+        limits = tuple(dict.fromkeys(value for value in self.diagnostic_limits
+                                     if value in _PUBLIC_DIAGNOSTIC_LIMITS))
+        if limits:
+            metadata["diagnostic_limits"] = limits
+        if self.binding_status in _BINDING_STATUSES:
+            metadata["source_binding_status"] = self.binding_status
+        if self.binding_issue in _BINDING_ISSUES:
+            metadata["source_binding_issue"] = self.binding_issue
+        if self.binding_failure_domain in _BINDING_FAILURE_DOMAINS:
+            metadata["source_binding_failure_domain"] = self.binding_failure_domain
+        if self.binding_failure_code in _BINDING_FAILURE_CODES:
+            metadata["source_binding_failure_code"] = self.binding_failure_code
+        failures = _public_sentence_failures(self.decision)
+        if failures:
+            metadata["public_sentence_failures"] = failures
+        return metadata
 
     @property
     def event(self) -> str:
@@ -85,11 +163,38 @@ class AcceptanceShadowRecord:
         # bounded identifier lines retain every violation without prose or
         # relying on a discarded provider record remaining inspectable.
         invariants = self.metadata["violated_invariants"]
-        return (self.event,) + tuple(
+        events = (self.event,) + tuple(
             "[Core] Acceptance shadow invariants: " + self.path + ": "
             + ",".join(invariants[index:index + 2])
             for index in range(0, len(invariants), 2)
         )
+        limits = self.metadata.get("diagnostic_limits", ())
+        binding_status = self.metadata.get("source_binding_status")
+        if binding_status:
+            event = ("[Core] Acceptance shadow bindings: " + self.path
+                     + "; status=" + binding_status.upper())
+            issue = self.metadata.get("source_binding_issue")
+            if issue:
+                event += "; issue=" + issue
+            events += (event[:180],)
+        domain = self.metadata.get("source_binding_failure_domain")
+        code = self.metadata.get("source_binding_failure_code")
+        if domain or code:
+            event = "[Core] Acceptance shadow binding failure: " + self.path
+            if domain:
+                event += "; domain=" + domain
+            if code:
+                event += "; code=" + code
+            events += (event[:180],)
+        for failure in self.metadata.get("public_sentence_failures", ()):
+            events += (("[Core] Acceptance shadow sentence: " + self.path
+                        + "; index=" + str(failure["sentence_index"])
+                        + "; kind=" + failure["annotation_kind"]
+                        + "; code=" + failure["code"])[:180],)
+        if limits:
+            return events + (("[Core] Acceptance shadow limits: " + self.path + ": "
+                              + ",".join(limits))[:180],)
+        return events
 
 
 @contextmanager
@@ -266,3 +371,63 @@ def observe_limitation_response(*, text, contract, user_input, conversation=(), 
             failure_reason=failure_reason, research_result=research_result,
         ), emit=emit,
     )
+
+
+def observe_public_factual_response(*, text, contract, research_result, evidence_packet,
+                                    verification_result, origin=CandidateOrigin.GENERATED,
+                                    emit=True, user_input="", client=None, model=None,
+                                    source_bindings=None) -> AcceptanceShadowRecord:
+    """Observe a selected full public factual draft without publication authority.
+
+    Only retained Core research and verifier state enters the adapter. There is
+    deliberately no conversation argument, publication callback or replacement
+    API. Infrastructure and diagnostics failures leave the caller's text alone.
+    """
+    path = "public_generated_factual"
+    safe_origin = origin if isinstance(origin, CandidateOrigin) else CandidateOrigin.GENERATED
+    try:
+        from core.public_answer_evidence import build_public_answer_candidate
+        if source_bindings is None and client is not None and model:
+            from core.public_source_bindings import collect_public_source_bindings
+            source_bindings = collect_public_source_bindings(
+                client=client, model=model, user_input=user_input, text=text,
+                evidence_packet=evidence_packet,
+            )
+        candidate = build_public_answer_candidate(
+            text=text, contract=contract, research_result=research_result,
+            evidence_packet=evidence_packet, verification_result=verification_result,
+            origin=origin, source_bindings=source_bindings, user_input=user_input,
+        )
+        decision = CoreAcceptanceEvaluator().evaluate(candidate)
+        # Do not let malformed/wrong-bound decision objects enter diagnostics.
+        if (not isinstance(decision, AcceptanceDecision)
+                or not isinstance(decision.status, AcceptanceStatus)
+                or decision.evaluated_text != candidate.text
+                or not isinstance(decision.violated_invariants, tuple)
+                or any(not isinstance(value, str) for value in decision.violated_invariants)):
+            raise TypeError("Invalid public shadow decision")
+        limits = []
+        requirements = candidate.evidence.metadata.get("public_requirements", {})
+        if isinstance(requirements, Mapping) and requirements.get("scope_support") == "verifier_only":
+            limits.append("scope_verifier_only")
+        if candidate.evidence.metadata.get("verifier_source_bindings") == "unavailable":
+            limits.append("source_bindings_unavailable")
+        bindings = candidate.evidence.metadata.get("public_source_bindings", {})
+        status = bindings.get("status") if isinstance(bindings, Mapping) else None
+        issue = bindings.get("failure") if isinstance(bindings, Mapping) else None
+        domain = bindings.get("failure_domain") if isinstance(bindings, Mapping) else None
+        code = bindings.get("failure_code") if isinstance(bindings, Mapping) else None
+        record = AcceptanceShadowRecord(
+            path, safe_origin, decision, diagnostic_limits=tuple(limits),
+            binding_status=status, binding_issue=issue,
+            binding_failure_domain=domain, binding_failure_code=code,
+        )
+    except Exception:
+        record = AcceptanceShadowRecord(path, safe_origin, evaluation_failed=True)
+    if emit:
+        try:
+            emit_shadow_record(record)
+        except Exception:
+            # Also protect against a replaced/broken diagnostic implementation.
+            pass
+    return record

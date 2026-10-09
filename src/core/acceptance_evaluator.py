@@ -461,5 +461,9 @@ class CoreAcceptanceEvaluator:
             accepted_sentences=subset_units,
             metadata={"applicable_invariants": tuple(dict.fromkeys(applicable)), "units": reports,
                       "limitations": limitations, "semantic_policy": "bounded_core_restatement",
-                      "typed_validators": tuple(profile.validator for profile in typed)},
+                      "typed_validators": tuple(profile.validator for profile in typed),
+                      **({"typed_diagnostics": {
+                          profile.validator: profile.diagnostic_metadata
+                          for profile in typed if profile.diagnostic_metadata
+                      }} if any(profile.diagnostic_metadata for profile in typed) else {})},
         )

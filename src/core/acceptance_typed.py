@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Tuple
 
+from core.evidence import freeze_metadata
+
 
 @dataclass(frozen=True)
 class TypedUnitValidation:
@@ -36,6 +38,9 @@ class TypedEvaluation:
     completion_obligations: Tuple[str, ...] = ()
     global_violations: Tuple[str, ...] = ()
     global_reasons: Tuple[str, ...] = ()
+    # Request-local calibration identifiers only. No acceptance policy reads
+    # this transport; diagnostic sinks must independently allowlist its data.
+    diagnostic_metadata: Mapping = field(default_factory=dict)
 
     def __post_init__(self):
         if not isinstance(self.validator, str) or not self.validator:
@@ -54,6 +59,9 @@ class TypedEvaluation:
             requirements[claim] = tuple(obligations)
         object.__setattr__(self, "units", MappingProxyType(dict(self.units)))
         object.__setattr__(self, "required_claim_obligations", MappingProxyType(requirements))
+        if not isinstance(self.diagnostic_metadata, Mapping):
+            raise TypeError("Typed diagnostics must be a mapping")
+        object.__setattr__(self, "diagnostic_metadata", freeze_metadata(self.diagnostic_metadata))
         for name in ("completion_obligations", "global_violations", "global_reasons"):
             value = getattr(self, name)
             if not isinstance(value, (tuple, list)) or any(not isinstance(item, str) for item in value):
@@ -65,6 +73,8 @@ def validate_typed_evidence(candidate, units) -> Tuple[TypedEvaluation, ...]:
     # Domain modules depend on this small model, not on evaluator internals.
     from core.acceptance_results import validate_results
     from core.acceptance_limits import validate_limits
+    from core.acceptance_public import validate_public
     return tuple(result for result in (
         validate_results(candidate, units), validate_limits(candidate, units),
+        validate_public(candidate, units),
     ) if result is not None)

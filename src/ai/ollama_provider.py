@@ -230,6 +230,8 @@ from core.answer_contract_runtime import (
     render_answer_contract,
 )
 from core.acceptance_publication import publish_limitation_response
+from core.acceptance_shadow import observe_public_factual_response
+from core.answer_candidate import CandidateOrigin
 
 from routine.night_routine import (
     complete_night_routine_work_location,
@@ -9783,6 +9785,8 @@ def handle_direct_conversation(
     violations = []
     retry_violations = []
     accepted_draft_text = None
+    accepted_public_factual_verification = None
+    accepted_public_factual_origin = CandidateOrigin.GENERATED
     truncation_retry_count = 0
 
     core_grounding_required = (
@@ -11084,6 +11088,25 @@ def handle_direct_conversation(
             accepted_draft_text = (
                 draft_text
             )
+            # Retain only full-draft verification from the existing successful
+            # generated factual lane. Salvage/extractive selection never sets
+            # this marker, and origin supplies no evidence authority.
+            if (
+                core_intent == "factual_question"
+                and factual_epistemic_mode == "public_source_verified"
+                and _core_contract_value(core_answer_contract, "Factual authority") == "public_web"
+                and public_factual_research_success
+                and public_factual_evidence
+                and public_factual_verification is not None
+                and not research_evidence
+                and not media_domain_active
+                and not core_is_grounded_opinion
+                and not core_is_consequential_advice
+            ):
+                accepted_public_factual_verification = public_factual_verification
+                accepted_public_factual_origin = (
+                    CandidateOrigin.GENERATED if attempt == 1 else CandidateOrigin.RETRY
+                )
             break
 
         # Phase 10.7.8 — deterministic sentence salvage.
@@ -11494,6 +11517,21 @@ def handle_direct_conversation(
                 or ""
             ).strip()
         )
+
+    if accepted_public_factual_verification is not None:
+        try:
+            # Observational only: ignore the record and preserve legacy text,
+            # history, retries and publication for every verdict or failure.
+            observe_public_factual_response(
+                text=final_response_text, contract=core_answer_contract,
+                research_result=public_research_result,
+                evidence_packet=public_factual_evidence,
+                verification_result=accepted_public_factual_verification,
+                origin=accepted_public_factual_origin,
+                user_input=user_input, client=client, model=active_local_model,
+            )
+        except Exception:
+            pass
 
     # Store only the accepted/final turn. Rejected drafts and runtime
     # personality repair prompts do not pollute the conversation history.
