@@ -1,5 +1,6 @@
 import json
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -1647,7 +1648,74 @@ def gather_public_factual_research(
     }
 
 
-def build_internal_public_factual_packet(research_result):
+def actual_read_url(source):
+    """Return only the identity retained by a successful admitted page read.
+
+    A discovered URL is not an observed redirect/canonical identity. The web
+    reader retains its returned URL; absent that value, do not invent it.
+    """
+    from core.public_answer_evidence import normalize_source_url
+    if not isinstance(source, Mapping):
+        return None
+    read = source.get("read_result")
+    if (not isinstance(read, Mapping) or source.get("read_success") is not True
+            or read.get("success") is not True or not str(read.get("content") or "").strip()
+            or source.get("accepted_as_evidence") is False
+            or source.get("relevance_status") == "rejected"):
+        return None
+    return normalize_source_url(read.get("url"))
+
+
+def build_public_factual_authority_context(research_result, user_input):
+    """Snapshot the real research state for the existing producer/verifier.
+
+    This is a production grounding capability, independent of the observational
+    acceptance evaluator. Candidate prose, prior assistant prose, search dates
+    and search success cannot create any of the retained source properties.
+    """
+    from core.evidence import freeze_metadata
+    from core.public_answer_evidence import normalize_source_url
+    from core.public_source_requirements import public_source_requirements
+    if not isinstance(research_result, Mapping) or research_result.get("success") is not True:
+        return None
+    sources = []
+    for source in research_result.get("sources", ()):
+        if not isinstance(source, Mapping):
+            continue
+        read = source.get("read_result")
+        if (not isinstance(read, Mapping) or source.get("read_success") is not True
+                or read.get("success") is not True
+                or source.get("accepted_as_evidence") is False
+                or source.get("relevance_status") == "rejected"
+                or not str(read.get("content") or "").strip()):
+            continue
+        item = {
+            "source_id": "S" + str(len(sources) + 1),
+            "title": str(source.get("title") or ""),
+            "discovered_url": normalize_source_url(source.get("url")),
+            "read_url": actual_read_url(source),
+            "read_success": True,
+            "accepted_as_evidence": True,
+            "authority_tier": source.get("authority_tier"),
+            "quality_eligible": source.get("quality_eligible") is True,
+        }
+        for key in ("published_date", "source_scope", "current_as_of", "currentness_established",
+                    "unresolved_query_constraints"):
+            if key in source:
+                item[key] = source[key]
+        sources.append(item)
+    return freeze_metadata({
+        "version": 1,
+        "sources": sources,
+        "requirements": public_source_requirements(user_input),
+        "freshness_required": research_result.get("freshness_sensitive") is True,
+        "required_source_scope": research_result.get("required_source_scope"),
+        "required_current_as_of": research_result.get("required_current_as_of"),
+        "unresolved_query_constraints": research_result.get("unresolved_query_constraints", ()),
+    })
+
+
+def build_internal_public_factual_packet(research_result, include_read_provenance=False):
     """Build a provenance-preserving evidence packet without an LLM synthesis hop."""
 
     if not research_result.get("success"):
@@ -1686,6 +1754,12 @@ def build_internal_public_factual_packet(research_result):
             "source_id": f"S{index}",
             "title": str(source.get("title") or "Untitled source"),
             "url": str(source.get("url") or ""),
+            **({
+                "read_url": actual_read_url(source),
+                "read_success": source.get("read_success") is True and read_result.get("success") is True,
+                "accepted_as_evidence": source.get("accepted_as_evidence") is not False,
+                "relevance_status": source.get("relevance_status"),
+            } if include_read_provenance else {}),
             "source_host": source.get("source_host") or _source_host(source.get("url")),
             "source_quality": source.get("source_quality") or _source_quality_class(source.get("url")),
             "authority_tier": source.get("authority_tier"),
@@ -1696,6 +1770,9 @@ def build_internal_public_factual_packet(research_result):
                 max_characters=700,
             ),
             "content_excerpt": content,
+            **({key: source[key] for key in ("source_scope", "current_as_of", "currentness_established",
+                                            "unresolved_query_constraints") if key in source}
+               if include_read_provenance else {}),
         })
 
     if not sources:

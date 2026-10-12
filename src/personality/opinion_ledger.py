@@ -15,6 +15,7 @@ from core.debate_state import (
     pairwise_response_is_explicitly_uncertain,
     pairwise_subject_from_hint,
 )
+from core.stance_ownership import is_user_stance_acknowledgement
 
 
 # --------------------------------------------------
@@ -517,6 +518,11 @@ def _looks_like_matching_historical_prompt(
     text,
     subject,
 ):
+    # An acknowledgement of the USER's preference is not an independently
+    # accepted Mairon opinion, even if its old prose mirrored first person.
+    if is_user_stance_acknowledgement(text):
+        return False
+
     value = _normalise(
         text
     )
@@ -933,6 +939,12 @@ def record_opinion_if_needed(
 
     if not subject:
         return None
+
+    # Preserve existing persona state; USER opinion ownership cannot be
+    # changed by acknowledgement wording. No ledger format or write semantics
+    # change is needed: this turn simply supplies no assistant-stance update.
+    if is_user_stance_acknowledgement(user_input):
+        return dict(existing_entry) if existing_entry else None
 
     response_value = str(
         response_text or ""

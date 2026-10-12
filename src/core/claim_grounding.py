@@ -7,6 +7,11 @@ import re
 from typing import Any, Dict, List, Optional
 
 from core.missing_inputs import extract_missing_inputs, resolve_missing_inputs
+from core.opinion_knowledge import (
+    asserted_opinion_clauses,
+    find_opinion_knowledge_violations,
+    has_admitted_work_research_basis,
+)
 
 from core.answer_contract_runtime import (
     coerce_answer_contract_runtime,
@@ -1445,18 +1450,23 @@ def _unsupported_mairon_perception_claims(
     text = str(
         draft
         or ""
-    )
+    ).replace("’", "'")
 
     patterns = (
         r"\bi(?:'ve| have)\s+seen\s+(?:it|that|this|your|the)\b",
         r"\bi\s+saw\s+(?:it|that|this|your|the)\b",
         r"\bi\s+can\s+see\s+(?:your|the|that|this)\b",
+        # USER text may establish a state, but cannot establish that Mairon
+        # visually observed it. Understanding 'why/how' is not this shape.
+        r"\bi\s+(?:can\s+)?see\s+(?:that\s+)?you(?:\b|'re|'ve)",
         r"\bi(?:'ve| have)\s+watched\s+you\b",
         r"\bi\s+watched\s+you\b",
+        r"\bi(?:'m| am)\s+(?:just\s+)?(?:here\s+)?(?:watching|looking\s+at|staring\s+at)\s+you\b",
         r"\bi(?:'m| am)\s+(?:just\s+)?(?:here\s+)?(?:watching|looking\s+at|staring\s+at)\s+(?:your|the|that|this)\s+(?:clock|timer|screen|monitor|cursor|room|window|door|desk|table)\b",
         r"\bi(?:'ve| have)\s+heard\s+you\b",
         r"\bi\s+heard\s+you\b",
         r"\bi\s+can\s+hear\s+you\b",
+        r"\bi\s+can\s+hear\s+(?:your|the|that|this)\b",
         r"\bi(?:'ve| have)\s+noticed\s+(?:your|the|that|this)\b",
         r"\bi\s+noticed\s+(?:your|the|that|this)\b",
     )
@@ -1478,6 +1488,81 @@ def _unsupported_mairon_perception_claims(
                 )
             )
             break
+
+    # Observation can also be claimed by a current/future monitoring
+    # commitment or by Mairon's own figurative sensory apparatus. Calling
+    # the eyes 'digital' does not create a sensor, and a USER-supplied object
+    # location does not authorize Mairon to keep watching that object.
+    # These are bounded first-person/possessive predicate projections, not
+    # a list of particular physical objects or a multimodal evidence adapter.
+    target = r"(?P<target>you\b|it\b|(?:your|the|that|this|these|those|a|an)\s+[^.!?;,]{1,100})"
+    agency = (
+        r"\bi(?:'m| am|'ll| will|'ve| have)?\s+"
+        r"(?:can\s+|have\s+|been\s+)?"
+        r"(?:(?:currently|still|just|always|already)\s+){0,2}"
+    )
+    monitoring_patterns = (
+        agency + r"(?:keep\s+|keeping\s+)?(?:watch(?:ing)?|monitor(?:ing)?|track(?:ing)?)\s+" + target,
+        agency + r"(?:keep(?:ing)?|have|got|have\s+got)\s+"
+        r"(?:an?\s+eye|(?:my\s+)?(?:[a-z]+\s+){0,2}(?:eyes?|gaze)|tabs|(?:a\s+)?watch)\s+"
+        r"(?:(?:trained|fixed|focused|locked)\s+)?on\s+" + target,
+        r"\bmy\s+(?:[a-z]+\s+){0,2}(?:eyes?|gaze)\s+"
+        r"(?:(?:are|is|remain(?:s)?)\s+)?(?:trained|fixed|focused|locked)\s+on\s+" + target,
+        r"\bmy\s+(?:[a-z]+\s+){0,2}(?:eyes?|gaze)\s+(?:are|is)\s+on\s+" + target,
+        agency + r"(?:keep(?:ing)?|maintain(?:ing)?)\s+(?:a\s+)?"
+        r"(?:visual\s+)?watch\s+over\s+" + target,
+    )
+
+    def monitoring_is_asserted(match) -> bool:
+        # Explicit quoted examples/reporting do not claim that the action is
+        # being performed. Mere quotation marks around Mairon's own promise
+        # cannot erase that promise. Contraction apostrophes are not delimiters.
+        for quoted in re.finditer(
+            r'"[^"\n]*"|`[^`\n]*`|“[^”\n]*”|(?<!\w)[\'‘][^\n]*?\'(?=\s|[.,!?;:]|$)', text,
+        ):
+            if quoted.start() <= match.start() < quoted.end():
+                intro = re.split(r"[.!?;]", text[:quoted.start()])[-1]
+                if re.search(
+                    r"\b(?:example|sample|quotation|quoted\s+text|phrase|wording|sentence|line)\b[^.!?;]{0,60}$|"
+                    r"\b(?:you|he|she|they)\s+(?:said|wrote|asked)\b[^.!?;]{0,60}$", intro, re.I,
+                ):
+                    return False
+        sentence_start = max(text.rfind(mark, 0, match.start()) for mark in ".!?;") + 1
+        before = text[sentence_start:match.start()]
+        if re.search(
+            r"\bi\s+(?:don't|do\s+not|can't|cannot|won't|will\s+not)\s+"
+            r"(?:claim|assert|promise|pretend|mean|say)\b[^.!?;]*$", before, re.I,
+        ):
+            return False
+        # An actual conditional promise still claims a capability: 'if you
+        # ask, I'll watch the door'. Only explicit non-actual/counterfactual
+        # agency is excluded, rather than treating every 'if' as permission.
+        if re.search(
+            r"\b(?:imagine|suppose|hypothetically)\b[^.!?;]*$|"
+            r"\bif\s+i\s+(?:had|were|could)\b[^.!?;]*$", before, re.I,
+        ):
+            return False
+        # The new class concerns sensory/world monitoring, not abstract
+        # conversational attention or consuming a media item. This small
+        # semantic-class exclusion is not a physical-object allowlist.
+        head = re.sub(r"^(?:your|the|that|this|these|those|a|an)\s+", "", match.group("target"), flags=re.I)
+        if re.match(
+            r"(?:argument|reasoning|meaning|point|progress|idea|suggestion|"
+            r"explanation|reply|response|conversation|discussion|logic|"
+            r"video|film|movie|episode|tutorial|documentary|show)\b", head, re.I,
+        ):
+            return False
+        return True
+
+    if not violations and any(
+        monitoring_is_asserted(match)
+        for pattern in monitoring_patterns
+        for match in re.finditer(pattern, text, re.IGNORECASE)
+    ):
+        violations.append(
+            "Mairon claimed physical observation/monitoring "
+            "without sensor/image evidence"
+        )
 
     return violations
 
@@ -1542,8 +1627,24 @@ def _unsupported_user_physical_object_claims(
             for unit in re.split(r"(?<=[.!?])\s+", text)
             if re.search(r"\b" + re.escape(term) + r"s?\b", unit, flags=re.IGNORECASE)
         ]
+
+        def nonassertive_body_reference(unit: str) -> bool:
+            # A body-state question/hypothesis does not observe that state.
+            # Reuse the physical guard's local scope, rather than allowing the
+            # noun guard to turn a non-assertive predicate into a scene claim.
+            # Every occurrence must be accounted for; a second actual/plain
+            # body reference in the same unit keeps the existing object check.
+            from core.physical_observations import detect_user_physical_observations
+            references = [item for item in detect_user_physical_observations(
+                unit, speaker="assistant", action_families=USER_PHYSICAL_ACTION_FAMILIES,
+            ) if item.kind == "body_state" and item.body_part in {term, term + "s"}]
+            return bool(references) and len(references) == len(re.findall(
+                r"\b" + re.escape(term) + r"s?\b", unit, flags=re.IGNORECASE,
+            )) and all(item.mode != "actual" for item in references)
+
         if unit_candidates and all(
             re.search(r"\b(?:if|imagine|suppose|hypothetically|for example|could be|might be)\b", unit, flags=re.IGNORECASE)
+            or nonassertive_body_reference(unit)
             for unit in unit_candidates
         ):
             continue
@@ -1577,119 +1678,24 @@ def _grounding_mentions_action_family(
 def _unsupported_user_physical_action_claims(
     draft: str,
     grounding_text: str,
+    *,
+    user_sources: Optional[Dict[str, str]] = None,
 ) -> List[str]:
+    """Check each bounded USER physical predicate against USER-only witnesses.
+
+    Production supplies raw Core-assigned current/prior USER sources. The
+    two-argument compatibility interface treats its grounding text as a single
+    USER source; rendered contract instructions are never used by production
+    to establish a personal physical observation.
     """
-    Reject high-confidence claims about Oliver's physical actions/state when
-    the supplied grounding packet never established that activity.
+    from core.physical_observations import find_user_physical_state_violations
 
-    This is an embodiment/source-authority boundary, not a domain rule.
-    Examples caught from the Desk benchmark:
-      - "while you were rushing out"
-      - "before you've even sat down"
-
-    We intentionally limit this to concrete observable actions. Abstract
-    reactions such as "you're blaming yourself" remain semantic/personality
-    territory so Mairon does not become sterile.
-    """
-
-    value = _normalise_apostrophes_for_physical_checks(
-        draft
+    sources = user_sources if user_sources is not None else {
+        "current_user": str(grounding_text or ""),
+    }
+    return find_user_physical_state_violations(
+        draft, sources, USER_PHYSICAL_ACTION_FAMILIES,
     )
-
-    violations = []
-
-    for family, variants in USER_PHYSICAL_ACTION_FAMILIES.items():
-        variant_pattern = "|".join(
-            re.escape(item)
-            for item in variants
-        )
-
-        pattern = (
-            r"\byou(?:\s+(?:are|were|have|had|did|will|would|could|might|"
-            r"still|already|just|even|never|not))*\s+(?:"
-            + variant_pattern
-            + r")\b"
-        )
-
-        direct_match = re.search(
-            pattern,
-            value,
-            flags=re.IGNORECASE,
-        )
-
-        # Participial scene descriptions can put the invented action before
-        # the explicit second-person subject: "Sitting there staring at
-        # nothing, you're ...". Treat those as the same observable-state
-        # claim without broadening to generic imperative "look" phrasing.
-        reversed_scene_match = False
-        cross_sentence_scene_match = False
-        ing_variants = [
-            item
-            for item in variants
-            if item.endswith("ing")
-        ]
-        if ing_variants:
-            reversed_scene_match = bool(re.search(
-                r"\b(?:"
-                + "|".join(re.escape(item) for item in ing_variants)
-                + r")\b[^.!?]{0,80}\byou(?:\b|'re|'ve|'ll|'d)",
-                value,
-                flags=re.IGNORECASE,
-            ))
-            cross_sentence_scene_match = bool(re.search(
-                r"\b(?:"
-                + "|".join(re.escape(item) for item in ing_variants)
-                + r")\b[^.!?]{0,80}[?!]\s*you(?:\b|'re|'ve|'ll|'d)",
-                value,
-                flags=re.IGNORECASE,
-            ))
-
-        indirect_scene_match = False
-        sentence_initial_scene_match = False
-        if ing_variants:
-            indirect_scene_match = bool(re.search(
-                r"\byou\b[^.!?]{0,65}\b(?:stop|stopped|keep|kept|start|started|continue|continued)\s+(?:"
-                + "|".join(re.escape(item) for item in ing_variants)
-                + r")\b",
-                value,
-                flags=re.IGNORECASE,
-            ))
-
-            # Conversational fragments can omit the explicit second-person
-            # subject while still asserting an observed physical state:
-            # "Sitting there staring at nothing? ..." is still a claim about
-            # Oliver. Keep this narrow so abstract phrases such as
-            # "looking at it another way" are not swept in.
-            if family in {"stare", "look", "watch"}:
-                sentence_initial_scene_match = bool(re.search(
-                    r"(?:^|[.!?]\s+)(?:sitting\s+there\s+|standing\s+there\s+)?(?:"
-                    + "|".join(re.escape(item) for item in ing_variants)
-                    + r")\s+(?:at|out|around)\b",
-                    value,
-                    flags=re.IGNORECASE,
-                ))
-
-        if not (
-            direct_match
-            or reversed_scene_match
-            or cross_sentence_scene_match
-            or indirect_scene_match
-            or sentence_initial_scene_match
-        ):
-            continue
-
-        if _grounding_mentions_action_family(
-            grounding_text=grounding_text,
-            variants=variants,
-        ):
-            continue
-
-        violations.append(
-            "unsupported Oliver physical-action/state claim involving "
-            + family
-        )
-
-    return violations
 
 
 def _normalise_apostrophes_for_physical_checks(
@@ -1805,8 +1811,12 @@ def find_unknown_media_opinion_overreach_violations(
     user_input: str,
     draft: str,
     conversation=None,
+    *,
+    research_evidence=None,
+    opinion_entry=None,
+    opinion_subject=None,
 ) -> List[str]:
-    """Reject invented work-specific takes after Mairon admits it lacks familiarity.
+    """Reject work-specific familiarity without an authoritative knowledge basis.
 
     An explicit first-hand-knowledge disclaimer is good epistemic behaviour, but
     it cannot be followed by concrete claims about pacing, world-building,
@@ -1816,6 +1826,12 @@ def find_unknown_media_opinion_overreach_violations(
     """
     user = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
     response = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
+    violations = find_opinion_knowledge_violations(
+        user_input, draft, conversation,
+        research_evidence=research_evidence,
+        opinion_entry=opinion_entry,
+        opinion_subject=opinion_subject,
+    )
 
     if not re.search(
         r"\bwhat\s+do\s+you\s+(?:actually\s+|really\s+)?think\s+(?:of|about)\b|"
@@ -1823,7 +1839,7 @@ def find_unknown_media_opinion_overreach_violations(
         user,
         flags=re.IGNORECASE,
     ):
-        return []
+        return violations
 
     recent_user_context = str(
         build_recent_user_grounding_context(
@@ -1833,6 +1849,27 @@ def find_unknown_media_opinion_overreach_violations(
         or ""
     ).lower()
     allowed_user_grounding = user + "\n" + recent_user_context
+
+    if re.search(
+        r"\byou(?:'re| are)\s+(?:clearly\s+)?(?:obsessed|a\s+fan|into\s+it|hooked)\b|"
+        r"\byou\s+(?:obviously|clearly)\s+(?:love|like|adore)\b",
+        response,
+        flags=re.IGNORECASE,
+    ) and not re.search(
+        r"\bi\s+(?:love|like|adore|am\s+obsessed|am\s+into)\b",
+        user,
+        flags=re.IGNORECASE,
+    ):
+        violations.append(
+            "unknown-media opinion invented Oliver's preference/attachment to the work"
+        )
+
+    # Actual admitted readable research has its own source/sentence verifier.
+    # Its availability is never inferred from candidate qualifiers or a ledger
+    # confidence label. Personal-consumption and USER-attachment checks above
+    # still apply; only the older default-unknown familiarity thresholds defer.
+    if has_admitted_work_research_basis(user_input, research_evidence, opinion_subject):
+        return list(dict.fromkeys(violations))
 
     knowledge_qualifier = bool(re.search(
         r"\b(?:from|based\s+on)\s+what\s+i\s+know\b|"
@@ -1848,6 +1885,12 @@ def find_unknown_media_opinion_overreach_violations(
         response,
         flags=re.IGNORECASE,
     ))
+
+    # A truthful limitation can name the property it cannot assess. Retain the
+    # raw admission separately, and apply the older overreach checks only to
+    # asserted clauses; a disclaimer must not shield an independent factual tail.
+    raw_response = response
+    response = " ".join(asserted_opinion_clauses(draft)).lower()
 
     media_dimension_patterns = {
         "pacing": r"\bpacing\b",
@@ -1885,9 +1928,9 @@ def find_unknown_media_opinion_overreach_violations(
             or concrete_familiarity_shape
         )
     ):
-        return [
+        return list(dict.fromkeys(violations + [
             "unknown-media opinion presented detailed work-specific familiarity without a knowledge qualifier or user-supplied grounding"
-        ]
+        ]))
 
     admits_limited_familiarity = bool(re.search(
         r"\bi\s+(?:haven['’]?t|have\s+not|didn['’]?t|did\s+not)\s+"
@@ -1895,13 +1938,11 @@ def find_unknown_media_opinion_overreach_violations(
         r"(?:read|watch|see|play|finish|consume|experience)\b|"
         r"\bi\s+don['’]?t\s+know\s+enough\b|"
         r"\bi\s+can['’]?t\s+give\s+(?:you\s+)?(?:a\s+)?real\s+take\b",
-        response,
+        raw_response,
         flags=re.IGNORECASE,
     ))
     if not admits_limited_familiarity:
-        return []
-
-    violations: List[str] = []
+        return list(dict.fromkeys(violations))
 
     work_specific_guess = re.search(
         r"\b(?:pacing|world[- ]?building|characters?|character\s+work|plot|prose|"
@@ -1961,20 +2002,6 @@ def find_unknown_media_opinion_overreach_violations(
     if admitted_but_specific:
         violations.append(
             "unknown-media opinion admitted insufficient familiarity but still asserted ungrounded work-specific properties"
-        )
-
-    if re.search(
-        r"\byou(?:'re| are)\s+(?:clearly\s+)?(?:obsessed|a\s+fan|into\s+it|hooked)\b|"
-        r"\byou\s+(?:obviously|clearly)\s+(?:love|like|adore)\b",
-        response,
-        flags=re.IGNORECASE,
-    ) and not re.search(
-        r"\bi\s+(?:love|like|adore|am\s+obsessed|am\s+into)\b",
-        user,
-        flags=re.IGNORECASE,
-    ):
-        violations.append(
-            "unknown-media opinion invented Oliver's preference/attachment to the work"
         )
 
     return list(dict.fromkeys(violations))
@@ -2178,6 +2205,7 @@ def find_deterministic_grounding_violations(
         _unsupported_user_physical_action_claims(
             draft=draft,
             grounding_text=grounding_text,
+            user_sources=_social_relation_sources(user_input, conversation),
         )
     ):
         violations.append(
@@ -4356,14 +4384,28 @@ def find_ai_job_market_answer_violations(
 def find_explicit_user_constraint_violations(
     user_input: str,
     draft: str,
+    conversation=None,
 ) -> List[str]:
-    """Preserve explicit negative constraints from Oliver's current turn.
+    """Preserve explicit negative constraints from the live user task.
 
     This is intentionally conservative: it only blocks personal assumptions
     Oliver explicitly told Mairon not to make. General trade-off discussion is
     still allowed when it does not assign those preferences/facts to Oliver.
     """
-    user = re.sub(r"\s+", " ", str(user_input or "").strip()).lower()
+    from core.reasoning_trust import live_task_user_texts
+    live_user_texts = live_task_user_texts(user_input, conversation)
+    # A lexical guard cannot adjudicate a new value or revised requirement.
+    # Keep the current-turn check, and let the existing semantic verifier
+    # resolve chronological prior constraints when the user explicitly revises
+    # them. The trust packet still retains those prior USER turns as data.
+    if re.search(
+        r"\b(?:actually|correction|revise|revised|instead|no\s+longer|"
+        r"ignore\s+(?:the\s+)?(?:earlier|previous|prior)|"
+        r"change\s+(?:the\s+)?(?:constraint|requirement|criteria))\b",
+        str(user_input or ""), re.I,
+    ):
+        live_user_texts = (str(user_input or ""),)
+    user = re.sub(r"\s+", " ", "\n".join(live_user_texts)).strip().lower()
     text = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
     violations: List[str] = []
 
@@ -4802,6 +4844,364 @@ def _core_verifier_think_setting(
     return None
 
 
+def _bounded_acknowledgement(draft: str) -> bool:
+    """Recognise only short acknowledgements that add no literal premise.
+
+    This is a latency optimisation, not factual authority. Everything outside
+    this complete grammar goes through the existing conversational verifier.
+    """
+    text = re.sub(r"\s+", " ", str(draft or "").replace("’", "'")).strip()
+    return bool(re.fullmatch(
+        r"(?:(?:yeah|well|fine|alright|okay|ok)[,!]?\s+)?"
+        r"(?:anytime|you're welcome|you are welcome|don't mention it|do not mention it|"
+        r"no worries|no problem|all good|glad (?:that|it) helped|you got it|"
+        r"that's what i'm here for|that is what i am here for|got it|noted|understood|"
+        r"fair(?: enough)?|alright|okay|ok)"
+        r"[.!]*",
+        text, flags=re.IGNORECASE,
+    ))
+
+
+def find_acknowledgement_direction_violations(
+    *, user_input: str, draft: str, core_answer_contract: Any,
+) -> List[str]:
+    """A user thanking the assistant does not reverse the gratitude direction."""
+    if contract_intent(core_answer_contract) != "acknowledge":
+        return []
+    runtime = coerce_answer_contract_runtime(core_answer_contract)
+    user = str(user_input or "").replace("’", "'").strip()
+    is_thanks = bool(
+        (runtime and runtime.speech_act == "thanks")
+        or re.match(r"^(?:thanks\b|thank\s+you\b|cheers\b|ta\b)", user, re.I)
+    )
+    if not is_thanks:
+        return []
+    response = str(draft or "").replace("’", "'").strip()
+    if re.match(
+        r"^(?:(?:well|yeah|okay|ok|alright)[,!]?\s+)?"
+        r"(?:thanks\b|thank\s+you\b|i\s+(?:thank\s+you|appreciate\s+(?:your|you))\b|"
+        r"i(?:'m|\s+am)\s+grateful\b)", response, re.I,
+    ):
+        return ["acknowledgement reversed the user-to-assistant gratitude direction"]
+    return []
+
+
+def should_verify_acknowledgement_grounding(
+    core_answer_contract: Any, draft: str,
+) -> bool:
+    """Rich acknowledgements need grounding; a pure welcome remains cheap."""
+    return bool(
+        contract_intent(core_answer_contract) == "acknowledge"
+        and contract_forbids_new_factual_claims(core_answer_contract)
+        and not _bounded_acknowledgement(draft)
+    )
+
+
+def _verifier_field_errors(
+    parsed: Dict[str, Any], *, verdict: str, claims: str,
+    optional_flags=(),
+) -> List[str]:
+    """Validate verdict types and all supplied negative evidence together.
+
+    Older successful verifiers omitted optional relation/relevance flags. Those
+    omissions remain compatible, but a supplied malformed flag is not a verdict.
+    """
+    errors = []
+    if type(parsed.get(verdict)) is not bool:
+        errors.append("invalid verdict")
+    for name in optional_flags:
+        if name in parsed and type(parsed[name]) is not bool:
+            errors.append("invalid " + name)
+    if claims in parsed and not isinstance(parsed[claims], list):
+        errors.append("invalid claim assessments")
+    if isinstance(parsed.get(claims), list) and any(
+        not isinstance(item, str) or not item.strip() for item in parsed[claims]
+    ):
+        errors.append("invalid claim assessment")
+    return errors
+
+
+def _social_literal_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").replace("’", "'").replace("‘", "'")).strip()
+
+
+def _social_relation_sources(user_input: str, conversation=None) -> Dict[str, str]:
+    """Witness identities are assigned by Core, never by candidate prose."""
+    prior = []
+    for item in reversed(list(conversation or [])):
+        role, content = _message_role_and_content(item)
+        value = _social_literal_text(content)
+        if str(role or "").lower() == "user" and value:
+            prior.append(value)
+        if len(prior) >= 4:
+            break
+    sources = {"current_user": _social_literal_text(user_input)}
+    for index, value in enumerate(reversed(prior), 1):
+        sources["prior_user_" + str(index)] = value
+    return sources
+
+
+def _social_relation_key(value: str) -> str:
+    """Only regular grammatical morphology; no synonym/semantic aliases."""
+    value = _social_literal_text(value).lower()
+    words = re.findall(r"[a-z]+", value)
+    normalised = []
+    for word in words:
+        if len(word) > 5 and word.endswith("ation"):
+            word = word[:-3]
+        elif len(word) > 5 and word.endswith("ing"):
+            word = word[:-3]
+        elif len(word) > 4 and word.endswith("ed"):
+            word = word[:-2]
+        elif len(word) > 4 and word.endswith("s"):
+            word = word[:-1]
+        if len(word) > 4 and word.endswith("e"):
+            word = word[:-1]
+        normalised.append(word)
+    return " ".join(normalised)
+
+
+def _social_relation_is_unasserted(candidate: str, start: int) -> bool:
+    prefix = re.split(r"[.!?;]|\b(?:but|however|yet)\b", candidate[:start], flags=re.I)[-1]
+    return bool(re.search(
+        r"\bi\s+(?:do\s+not|don't|cannot|can't|could\s+not|couldn't|won't|will\s+not)"
+        r"\s+(?:know|confirm|verify|claim|say|assert|establish)\b[^.!?;]{0,80}"
+        r"(?:whether|that|if)?\s*$", prefix, re.I,
+    ))
+
+
+def _social_relation_is_reaction_mirror(predicate: str) -> bool:
+    """Only a complete affect-to-user clause; a factual tail is not a mirror."""
+    return bool(re.fullmatch(
+        r"(?:(?:clearly|already|really|still|just)\s+)*"
+        r"(?:annoy(?:s|ed|ing)?|irritat(?:es?|ed|ing)|bother(?:s|ed|ing)?|"
+        r"frustrat(?:es?|ed|ing)|upset(?:s|ting)?|anger(?:s|ed|ing)?|"
+        r"disappoint(?:s|ed|ing)?|pleas(?:es?|ed|ing)|delight(?:s|ed|ing)?|"
+        r"excit(?:es?|ed|ing)|worr(?:y|ies|ied|ying))"
+        r"\s+(?:you|to\s+you)(?:\s+(?:already|clearly|again))?",
+        _social_literal_text(predicate), re.I,
+    ))
+
+
+def _social_user_witness_is_asserted(source: str, quote: str) -> bool:
+    """Keep omitted conditional/quoted context from becoming a literal witness."""
+    start = source.find(quote)
+    if start < 0:
+        return False
+    left = max(source.rfind(marker, 0, start) for marker in (".", "!", "?", ";")) + 1
+    right_positions = [source.find(marker, start + len(quote)) for marker in (".", "!", "?", ";")]
+    right = min((value + 1 for value in right_positions if value >= 0), default=len(source))
+    clause = source[left:right]
+    if re.search(r"(?:\bif\b|\bunless\b|\bnot\b|\bnever\b|n't\b|\?|\bwould\b|\bwill\b)", clause, re.I):
+        return False
+    prefix = source[left:start]
+    # Apostrophes inside ordinary contractions are not quotation delimiters.
+    for opening, closing in (("\"", "\""), ("`", "`"), ("“", "”"), ("‘", "’")):
+        if opening == closing:
+            if prefix.count(opening) % 2:
+                return False
+        elif prefix.count(opening) > prefix.count(closing):
+            return False
+    if re.search(r"(?:^|\s)'[^']*$", prefix):
+        return False
+    return True
+
+
+def build_conversational_relation_obligations(
+    *, user_input: str, draft: str, core_answer_contract: Any, conversation=None,
+) -> Dict[str, Any]:
+    """Bounded literal refinements that cannot be authorised by topic overlap.
+
+    This is a source-lock adapter, not a general proposition parser. A named
+    actor's handling/response is a reference, not a supplied event predicate.
+    A complaint about the assistant is not a supplied relationship role. Core
+    marks bounded event refinements and perspective-normalised participant
+    relations for the existing verifier to assess with USER witnesses.
+    """
+    sources = _social_relation_sources(user_input, conversation)
+    user = sources["current_user"]
+    candidate = _social_literal_text(draft)
+    obligations = []
+
+    # The lexical family describes a *reference act*, not particular events.
+    # Actor identities are captured from the actual user text, never a fixture.
+    references = list(re.finditer(
+        r"\b(?P<actor>[A-Z][\w-]*(?:\s+[A-Z][\w-]*){0,2}|[a-z][\w-]*)'s\s+"
+        r"(?P<head>(?i:handling|response|reaction|approach|attitude|treatment|decision|"
+        r"behaviour|behavior|opinion|judgement|judgment))\b",
+        user,
+    ))
+    def add(kind, span, predicate, actor="", role_direction=""):
+        record = {"kind": kind, "candidate_span": span, "predicate": predicate,
+                  "actor": actor, "role_direction": role_direction}
+        if record not in obligations:
+            obligations.append(record)
+
+    for reference in references:
+        actor = reference.group("actor")
+        source_head = reference.group("head")
+        subject = r"\b" + re.escape(actor)
+        if len(references) == 1:
+            subject = r"\b(?:" + re.escape(actor) + r"|he|she|they|his|her|their)"
+        # Noun phrases can assert events too: nominalisation must not evade a
+        # verb-only check. A hedge/evaluation doesn't supply the nominal premise.
+        possessive = re.compile(
+            subject + r"(?:'s|(?<=her)|(?<=his)|(?<=their))\s+"
+            r"(?P<predicate>[a-z]+(?:[- ][a-z]+){0,3}?)"
+            r"(?=\s+(?:of|on|in|at|to|for|with|was|were|is|are|feels?|seems?|looks?|"
+            r"sounds?|has|had|will|would|can|could|might|may|[a-z]+ly|[a-z]+ed)\b|[.,;!?]|$)", re.I,
+        )
+        for match in possessive.finditer(candidate):
+            if _social_relation_is_unasserted(candidate, match.start()):
+                continue
+            predicate = match.group("predicate").strip()
+            if _social_relation_key(predicate) != _social_relation_key(source_head):
+                add("event_predicate", match.group(0), predicate, actor)
+            tail = candidate[match.end():]
+            evaluation = re.match(
+                r"(?:\s+(?:of|on|in|at|to|for|with)\s+[^.!?;]{1,100}?)?"
+                r"\s+(?:is|was|feels?|seems?|looks?|sounds?)\s+(?:like\s+)?"
+                r"(?P<predicate>[^.!?;]{1,100})", tail, re.I,
+            )
+            if evaluation and not _social_relation_is_reaction_mirror(evaluation.group("predicate")):
+                add("event_evaluation", match.group(0) + evaluation.group(0),
+                    evaluation.group("predicate").strip(), actor)
+        # A finite action is likewise narrower than a topic reference. Regular
+        # restatements of handling/response keep their supplied reference head.
+        finite = re.compile(
+            subject + r"\s+(?:(?:probably|apparently|clearly|really|already|just|still|"
+            r"might|may|could|would|will|has|had|have)\s+)*"
+            r"(?P<predicate>[a-z]+)\b", re.I,
+        )
+        for match in finite.finditer(candidate):
+            if _social_relation_is_unasserted(candidate, match.start()):
+                continue
+            predicate = match.group("predicate")
+            if predicate.lower() in {"is", "was", "are", "were", "seems", "looks", "feels"}:
+                tail = candidate[match.end():]
+                evaluation = re.match(r"\s+(?P<predicate>[^.!?;]{1,100})", tail, re.I)
+                if evaluation and not _social_relation_is_reaction_mirror(evaluation.group("predicate")):
+                    add("event_evaluation", match.group(0) + evaluation.group(0),
+                        predicate + evaluation.group(0), actor)
+                continue
+            if _social_relation_key(predicate) != _social_relation_key(source_head):
+                add("event_predicate", match.group(0), predicate, actor)
+            else:
+                # "Handled it" can be a trivial reference; "handled it badly"
+                # adds a verdict about the event. A reaction mirror whose user
+                # is the affected party does not acquire that event verdict.
+                tail = candidate[match.end():]
+                manner = re.match(
+                    r"(?P<tail>\s+(?:it|that|this|them)\s+[a-z]+(?:\s+[a-z]+){0,2})"
+                    r"(?=[.,;!?]|$)", tail, re.I,
+                )
+                if not manner:
+                    manner = re.match(r"(?P<tail>[^.!?;]{0,80}?\b[a-z]+ly)\b", tail, re.I)
+                if manner:
+                    claim = predicate + manner.group("tail")
+                    add("event_evaluation", match.group(0) + manner.group("tail"), claim.strip(), actor)
+
+    runtime = coerce_answer_contract_runtime(core_answer_contract)
+    complaint = bool(
+        (runtime and (runtime.speech_act in {"correction", "complaint"}
+                      or runtime.intent == "correct_mairon"))
+        or (re.search(r"\byou\b", user, re.I)
+            and re.search(r"\b(?:should(?:n't|nt)?|supposed\s+to|ought\s+to)\b", user, re.I))
+    )
+    if complaint:
+        # Core detects participant roles and agency independently of grammar.
+        # The shared parser reverses first/second person for USER witnesses;
+        # candidate prose never contributes an authoritative participant fact.
+        from core.participant_relations import detect_participant_relations
+        for relation in detect_participant_relations(candidate, speaker="assistant"):
+            if relation["mode"] == "unasserted":
+                # Core identified a bounded refusal to assert this relation;
+                # an independently asserted tail remains a separate obligation.
+                continue
+            record = {
+                "kind": "relationship_role" if relation["relation_kind"] in {"relationship_role", "role_acting"} else "participant_agency",
+                "candidate_span": relation["candidate_span"],
+                "predicate": relation["predicate"],
+                "actor": "",
+                "role_direction": relation["subject"] + "_for_" + (relation["target"] or "unspecified"),
+                "participant_relation": relation,
+            }
+            if record not in obligations:
+                obligations.append(record)
+
+    for index, record in enumerate(obligations, 1):
+        record["index"] = index
+    return {"sources": sources, "obligations": tuple(obligations)}
+
+
+def validate_conversational_relation_assessments(
+    parsed: Dict[str, Any], packet: Dict[str, Any],
+) -> List[str]:
+    """A global yes cannot stand in for the scoped literal relation witnesses."""
+    required = packet["obligations"]
+    if not required:
+        return []
+    assessments = parsed.get("relation_assessments")
+    if not isinstance(assessments, list) or len(assessments) != len(required):
+        return ["Core conversational relation assessment is missing or incomplete"]
+    by_index = {}
+    for assessment in assessments:
+        if (not isinstance(assessment, dict) or type(assessment.get("index")) is not int
+                or assessment["index"] in by_index
+                or type(assessment.get("supported")) is not bool):
+            return ["Core conversational relation assessment is malformed"]
+        by_index[assessment["index"]] = assessment
+    if set(by_index) != {item["index"] for item in required}:
+        return ["Core conversational relation assessment is missing or incomplete"]
+    violations = []
+    for obligation in required:
+        check = by_index[obligation["index"]]
+        label = "unsupported Core conversational " + obligation["kind"]
+        if check["supported"] is False:
+            violations.append(label)
+            continue
+        if any(not isinstance(check.get(name), str) for name in ("source_id", "source_quote", "source_predicate")):
+            violations.append(label + " has malformed witness fields")
+            continue
+        quote = _social_literal_text(check.get("source_quote"))
+        source_predicate = _social_literal_text(check.get("source_predicate"))
+        source = packet["sources"].get(check.get("source_id"))
+        # Model labels, invented witnesses, assistant history and the draft
+        # cannot manufacture a source. Event refinements retain their strict
+        # literal predicate audit. Participant propositions use Core's shared
+        # perspective-normalized relation parser across grammatical forms.
+        if (not isinstance(source, str) or not quote or not source_predicate
+                or len(quote) > 500 or len(source_predicate) > 100
+                or quote not in source or source_predicate not in quote):
+            violations.append(label + " lacks a literal USER relation witness")
+            continue
+        if "participant_relation" in obligation:
+            from core.participant_relations import participant_relation_witnessed
+            if not participant_relation_witnessed(
+                obligation["participant_relation"], quote, source_text=source,
+            ):
+                violations.append(label + " changed the USER-supplied participant direction or premise")
+            continue
+        if _social_relation_key(source_predicate) != _social_relation_key(obligation["predicate"]):
+            violations.append(label + " lacks a literal USER relation witness")
+            continue
+        if not _social_user_witness_is_asserted(source, quote):
+            violations.append(label + " uses a conditional, questioned or negated witness")
+            continue
+        if obligation["kind"] == "relationship_role":
+            role = re.escape(source_predicate)
+            pattern = (
+                r"\bi(?:'m|\s+am|\s+was)\s+(?:still\s+|just\s+)?your\s+" + role + r"\b"
+                if obligation["role_direction"] == "user_for_assistant"
+                else r"\byou(?:'re|\s+are|\s+were)\s+(?:still\s+|just\s+)?my\s+" + role + r"\b"
+            )
+            if not re.search(pattern, quote, re.I):
+                violations.append(label + " changed the USER-supplied role direction")
+        elif not re.search(r"\b" + re.escape(obligation["actor"]) + r"\b", quote, re.I):
+            violations.append(label + " lacks its USER-supplied actor")
+    return violations
+
+
 def verify_core_grounded_draft(
     client,
     model: str,
@@ -4809,6 +5209,7 @@ def verify_core_grounded_draft(
     draft: str,
     core_answer_contract: Optional[str],
     conversation=None,
+    trust_context: Optional[str] = None,
 ) -> List[str]:
     """
     Isolated semantic verifier for Core-restricted conversational turns.
@@ -4829,10 +5230,17 @@ def verify_core_grounded_draft(
     smuggle in a factual premise.
     """
 
-    if not should_verify_core_grounding(
-        core_answer_contract
+    if not (
+        should_verify_core_grounding(core_answer_contract)
+        or should_verify_acknowledgement_grounding(core_answer_contract, draft)
     ):
         return []
+
+    direction_violations = find_acknowledgement_direction_violations(
+        user_input=user_input, draft=draft, core_answer_contract=core_answer_contract,
+    )
+    if direction_violations:
+        return direction_violations
 
     deterministic_violations = (
         find_deterministic_grounding_violations(
@@ -4866,6 +5274,25 @@ def verify_core_grounded_draft(
             conversation,
             max_user_messages=grounding_user_window,
         )
+    )
+
+    relation_packet = build_conversational_relation_obligations(
+        user_input=user_input, draft=draft, core_answer_contract=core_answer_contract,
+        conversation=conversation,
+    )
+
+    from core.user_history_obligations import (
+        build_user_history_packet, validate_user_history_assessments,
+    )
+    # The new USER-history ceiling belongs to the existing social authority
+    # lane. Verified private/tool evidence and explicit recall keep their
+    # existing evidence transports and wider recall window.
+    history_packet = build_user_history_packet(
+        draft if intent in {
+            "share_context", "casual_conversation", "acknowledge",
+            "self_correction", "correct_mairon", "share_opinion",
+        } else "",
+        relation_packet["sources"],
     )
 
     system_text = (
@@ -4902,7 +5329,20 @@ def verify_core_grounded_draft(
         "- Grounding applies to statements a reasonable reader could interpret as "
         "literal claims about reality.\n"
         "- Clearly absurd, impossible, anthropomorphic, sarcastic, teasing, or "
-        "hyperbolic jokes are NOT factual claims and do NOT require evidence.\n"
+        "hyperbolic jokes may use non-literal predicates. This permission never "
+        "supplies the plausible concrete premises of the joke.\n"
+        "- Only an obviously impossible or non-literal predicate is exempt from factual "
+        "grounding. Sarcasm, teasing, an evaluative adjective, or a hedge does not by "
+        "itself exempt a plausible underlying event, relationship, habit, observation, "
+        "or future-world premise.\n"
+        "- A user expressing anger, admiration, disappointment, or a preference establishes "
+        "that user stance only. It does not establish another person's actions, motives, "
+        "intentions, success, cruelty, blame, future consequences, or repeated behaviour. "
+        "Acknowledge the user's reaction without endorsing unseen event facts.\n"
+        "- Distinguish a correction/complaint directed at Mairon from a new factual premise "
+        "about the user's motives or relationship history. Respond to the actual correction.\n"
+        "- In an acknowledgement, the user thanks Mairon and Mairon receives that thanks; "
+        "do not reverse speaker and recipient or invent why the user finally spoke.\n"
         "- For a share_opinion turn, generic evaluative reasoning about an abstract "
         "idea, trade-off, or distinction is also not an external-world factual claim. "
         "Mairon may reason about a user-supplied comparison without needing citation-style "
@@ -4982,13 +5422,15 @@ def verify_core_grounded_draft(
         "talk about merely processing input, or unrelated banter is not relevant. "
         "Do not use older assistant prose to rescue relevance.\n\n"
         "Return compact JSON ONLY, with no explanation and no extra fields:\n"
-        '{"supported":true,"relevant":true,"source_faithful":true,"unsupported_claims":[]}\n\n'
+        '{"supported":true,"relevant":true,"source_faithful":true,"speech_act_faithful":true,"unsupported_claims":[]}\n\n'
         "Set source_faithful=false if the draft substitutes a supplied entity, reverses "
         "actor/target/ownership/direction/time relations, or invents a concrete relation "
         "that is not entailed by the packet. "
         "If any factual assertion is unsupported, set supported=false and "
         "list only short descriptions of those claims. If the draft does not "
-        "actually respond to the current message, set relevant=false."
+        "actually respond to the current message, set relevant=false. Set speech_act_faithful=false "
+        "if the draft reverses gratitude direction, ignores the actual correction/complaint, or "
+        "pretends an explicitly withheld prior stance was already established."
     )
 
     messages = [
@@ -5006,6 +5448,9 @@ def verify_core_grounded_draft(
             ),
         },
     ]
+
+    if trust_context:
+        messages.append({"role": "system", "content": str(trust_context)})
 
     source_lock_text = build_source_lock_instruction(
         user_input=user_input,
@@ -5038,6 +5483,58 @@ def verify_core_grounded_draft(
             "content": recent_user_context,
         })
 
+    if relation_packet["obligations"]:
+        messages.append({
+            "role": "system",
+            "content": (
+                "CORE LITERAL RELATION OBLIGATIONS:\n"
+                + json.dumps(relation_packet, ensure_ascii=False)
+                + "\nThese candidate spans refine a referenced event or add a relationship role. "
+                "The spans are claims to validate, NOT evidence. Participant subject/target, "
+                "agency, polarity, actual/conditional scope and role identity are assigned by Core. "
+                "A role or recurring agency claim cannot disappear because its wording is "
+                "non-possessive, sarcastic or labelled non-literal. A conditional complaint "
+                "transformation may use the actual USER complaint only if it preserves "
+                "responsibility/direction and asserts no new literal role or history. "
+                "The source_predicate must be an exact substring of that USER quote. "
+                "A referenced handling/response, "
+                "topic name, emotional reaction or criticism cannot supply a more specific "
+                "action, moral verdict, motive or relationship role. Decompose nominalised "
+                "events and the concrete premises of sarcasm just as literal verbs. "
+                "Add relation_assessments to the JSON verdict, exactly once for each listed index: "
+                '{"index":1,"supported":false,"source_id":"","source_quote":"","source_predicate":""}. '
+                "A supported entry requires an exact literal quote from one of the identified "
+                "USER sources, plus the exact source predicate/role substring establishing this "
+                "claim and its actor/direction. A topic/reaction-only quote is not an event witness. "
+                "Do not quote the draft, assistant prose, model knowledge or contract instructions. "
+                "Regular grammatical inflection is allowed; semantic synonyms cannot replace the "
+                "inspectable literal predicate in this bounded audit. Without that witness use "
+                "supported=false. Do not invent quotes to make the global verdict pass."
+            ),
+        })
+
+    if history_packet["obligations"]:
+        messages.append({
+            "role": "system",
+            "content": (
+                "CORE USER-HISTORY OBLIGATIONS:\n"
+                + json.dumps(history_packet, ensure_ascii=False)
+                + "\nThese candidate propositions are NOT evidence. Core has identified "
+                "plausible personal duration, prior activity, recurrence or habitual-state "
+                "premises. A weak temporal cue does not supply a duration, intervening "
+                "activity, abandonment or habitual location. Sarcasm cannot supply a "
+                "plausible literal premise. Preserve participant, activity/object, polarity, "
+                "elapsed-time and recurrence scope. Add history_assessments exactly once "
+                "for each listed index: "
+                '{"index":1,"supported":false,"source_id":"","source_quote":""}. '
+                "A positive entry needs an exact quote from an identified USER source "
+                "establishing the matching history proposition. Do not quote candidate "
+                "prose, assistant history, contract instructions or model memory. A global "
+                "positive verdict cannot erase these obligations."
+            ),
+        })
+
+    scoped_obligation_count = len(relation_packet["obligations"]) + len(history_packet["obligations"])
     messages.extend([
         {
             "role": "user",
@@ -5064,7 +5561,7 @@ def verify_core_grounded_draft(
         "messages": messages,
         "options": {
             "temperature": 0,
-            "num_predict": 160,
+            "num_predict": min(2048, max(480, scoped_obligation_count * 140)) if scoped_obligation_count else 160,
             "num_ctx": 8192,
         },
     }
@@ -5123,7 +5620,17 @@ def verify_core_grounded_draft(
             "Core claim-grounding verifier could not validate the draft"
         ]
 
-    violations = []
+    if _verifier_field_errors(
+        parsed, verdict="supported", claims="unsupported_claims",
+        optional_flags=("relevant", "source_faithful", "speech_act_faithful"),
+    ):
+        return ["Core claim-grounding verifier returned malformed assessment state"]
+
+    violations = validate_conversational_relation_assessments(parsed, relation_packet)
+    violations.extend(validate_user_history_assessments(parsed, history_packet))
+
+    if parsed.get("speech_act_faithful") is False:
+        violations.append("Core conversational draft changed the supplied speech-act direction or stance state")
 
     if parsed.get(
         "source_faithful"
@@ -5145,9 +5652,7 @@ def verify_core_grounded_draft(
             )
         )
 
-    if parsed.get(
-        "supported"
-    ) is True:
+    if parsed.get("supported") is True and not parsed.get("unsupported_claims"):
         return violations
 
     claims = parsed.get(
@@ -5216,6 +5721,89 @@ def should_verify_factual_focus_fidelity(
     )
 
 
+def _requires_live_mechanism_assessments(core_answer_contract) -> bool:
+    """The bounded USER-premise authority needs inspectable inference coverage.
+
+    Ordinary stable/public-world factual callers retain their existing fidelity
+    interface. Neither candidate origin nor a provider path supplies authority.
+    """
+    runtime = coerce_answer_contract_runtime(core_answer_contract)
+    return bool(
+        runtime
+        and runtime.intent == "factual_question"
+        and runtime.authority == "live_user_task"
+        and runtime.epistemic_mode == "user_context_reasoning"
+    )
+
+
+def _mechanism_fidelity_units(draft: str) -> List[str]:
+    # Index the supplied draft, rather than accepting model-selected coverage.
+    # The semantic verifier must assess every unit; Core does not infer a device
+    # mechanism from this lightweight punctuation boundary.
+    value = re.sub(r"[ \t]+", " ", str(draft or "").strip())
+    return [piece.strip() for piece in re.split(r"(?<=[.!?])\s+|\n+", value) if piece.strip()]
+
+
+def _live_mechanism_assessment_violations(
+    parsed: Dict[str, Any], units: List[str], user_turns, obligations=None,
+) -> List[str]:
+    """Validate bounded semantic units against actual USER witness membership.
+
+    The model assesses entailment and applicability. Core independently detects
+    causal/property obligations and owns completeness, witness scope and role,
+    and aggregation. Neither global success nor a none/conditional label can
+    erase an asserted obligation or promote a symptom to a mechanism witness.
+    """
+    malformed = "Core factual-focus mechanism assessments were incomplete or malformed"
+    raw = parsed.get("mechanism_assessments")
+    if not units or not isinstance(raw, list) or len(raw) != len(units):
+        return [malformed]
+    seen = set()
+    violations = []
+    kinds = {"none", "conditional_hypothesis", "supplied_mechanism", "unsupported_application"}
+    for assessment in raw:
+        if not isinstance(assessment, dict):
+            return [malformed]
+        index = assessment.get("sentence_index")
+        kind = assessment.get("kind")
+        supported = assessment.get("supported")
+        applicable = assessment.get("applicability_established")
+        witness = assessment.get("user_witness")
+        if (
+            type(index) is not int or not 1 <= index <= len(units) or index in seen
+            or not isinstance(kind, str) or kind not in kinds
+            or type(supported) is not bool or type(applicable) is not bool
+            or "user_witness" not in assessment
+        ):
+            return [malformed]
+        seen.add(index)
+        if kind == "supplied_mechanism":
+            if not isinstance(witness, dict):
+                return [malformed]
+            turn_index, quote = witness.get("turn_index"), witness.get("quote")
+            if (
+                type(turn_index) is not int or not 1 <= turn_index <= len(user_turns)
+                or not isinstance(quote, str) or not quote.strip()
+                or quote not in user_turns[turn_index - 1]
+                or not applicable
+            ):
+                return [malformed]
+        elif witness is not None:
+            return [malformed]
+        elif kind in {"none", "conditional_hypothesis"} and applicable:
+            return [malformed]
+        if not supported or kind == "unsupported_application":
+            violations.append(
+                "factual-focus source-fidelity violation: a mechanism or causal application lacked supplied support"
+            )
+    if seen != set(range(1, len(units) + 1)):
+        return [malformed]
+    from core.diagnostic_obligations import build_diagnostic_obligations, diagnostic_obligation_violations
+    required = build_diagnostic_obligations(units) if obligations is None else obligations
+    violations.extend(diagnostic_obligation_violations(required, raw, user_turns))
+    return list(dict.fromkeys(violations))
+
+
 def verify_factual_focus_fidelity(
     client,
     model: str,
@@ -5223,14 +5811,16 @@ def verify_factual_focus_fidelity(
     draft: str,
     core_answer_contract: Optional[str],
     conversation=None,
+    trust_context: Optional[str] = None,
 ) -> List[str]:
     """
-    Verify only PERSONAL / CONVERSATIONAL source fidelity on a factual answer.
+    Verify PERSONAL / CONVERSATIONAL and user-specific inference fidelity.
 
     Public-world facts that answer the current question are explicitly outside
     this verifier's scope. This lets Mairon say "Ottawa" from model knowledge
-    while preventing invented tails such as "I got lost reading a book about it
-    last time."
+    while preventing invented tails or unsupported application of a general
+    mechanism to a user's actual system. Typed live USER-task authority requires
+    complete, inspectable mechanism assessments from this same semantic call.
     """
 
     if not should_verify_factual_focus_fidelity(
@@ -5245,13 +5835,38 @@ def verify_factual_focus_fidelity(
         )
     )
 
+    live_mechanism_assessments = _requires_live_mechanism_assessments(core_answer_contract)
+    runtime_contract = coerce_answer_contract_runtime(core_answer_contract)
+    contract_state = {}
+    if runtime_contract:
+        contract_state = {
+            "intent": runtime_contract.intent,
+            "authority": runtime_contract.authority,
+            "epistemic_mode": runtime_contract.epistemic_mode,
+            "allow_new_factual_claims": runtime_contract.allow_new_factual_claims,
+            "required_claims": runtime_contract.required_claims,
+            "forbidden_behaviours": runtime_contract.forbidden_behaviours,
+        }
+    mechanism_units = _mechanism_fidelity_units(draft) if live_mechanism_assessments else []
+    mechanism_obligations = ()
+    if live_mechanism_assessments:
+        from core.diagnostic_obligations import build_diagnostic_obligations
+        mechanism_obligations = build_diagnostic_obligations(mechanism_units)
+    live_user_turns = ()
+    if live_mechanism_assessments:
+        from core.reasoning_trust import live_task_user_texts
+        live_user_turns = live_task_user_texts(user_input, conversation)
+
     system_text = (
         "You are Mairon Core's INTERNAL factual-answer source-fidelity verifier. "
         "You are not speaking to Oliver.\n\n"
         "IMPORTANT SCOPE:\n"
-        "- Do NOT fact-check the public-world answer to Oliver's current factual question.\n"
-        "- The answer may legitimately come from the local model's general knowledge.\n"
-        "- Check ONLY claims about Oliver, Mairon, their conversation/history, prior actions, "
+        "- Do NOT fact-check the public-world answer when it asserts an independent general fact. "
+        "That exemption never covers applying a mechanism to this user's actual system.\n"
+        "- Stable general knowledge can explain supplied premises, but does not establish "
+        "a mechanism's presence, applicability or causal role in this user's actual system. "
+        "User-specific diagnostic inferences ARE inside this verifier's scope.\n"
+        "- Check claims about Oliver, Mairon, their conversation/history, prior actions, "
         "personal habits, remembered events, observations, research supposedly performed, "
         "or user-specific entities/relations.\n\n"
         "SOURCE-FIDELITY RULES:\n"
@@ -5268,6 +5883,20 @@ def verify_factual_focus_fidelity(
         "possibilities may be framed as possibilities, but they are not observations about his setup.\n"
         "- A reading beside one node/device does not prove the state of an unmeasured path/component. "
         "Distinguish what the measurement rules out from what remains only a hypothesis.\n"
+        "- Assess diagnostic inferences in five separate categories: observed fact, eliminated "
+        "hypothesis, weakened hypothesis, plausible remaining hypothesis, and established cause. "
+        "A correlation, symptom, improved result, or measurement contrast may weaken some "
+        "hypotheses or localise a problem; it does not alone establish a cause or eliminate "
+        "all competing explanations. Candidate wording must retain live alternatives.\n"
+        "- A plausible mechanism may be proposed as a conditional hypothesis, but do not assert "
+        "its presence, necessity, causal role, or measured behaviour in the user's setup without "
+        "support. A symptom does not establish its unseen mechanism merely because that "
+        "mechanism sounds technically plausible.\n"
+        "- Preserve explicit live user constraints, including exclusions and negative "
+        "requirements. Do not introduce unstated budget, device, platform, preference, or "
+        "configuration assumptions, and do not restore a premise the user corrected or excluded. "
+        "A useful optional approach is not a necessary requirement unless the supplied premises "
+        "actually establish that necessity.\n"
         "- If Oliver explicitly says an endpoint is wired, reject a draft that assigns that endpoint "
         "a Wi-Fi channel/band as though it were observed.\n"
         "- Obvious impossible self-personification that does not imply a real prior event can be "
@@ -5279,8 +5908,46 @@ def verify_factual_focus_fidelity(
         "- Same question, draft 'Ottawa. I didn't get lost reading a book about it this time.' "
         "=> NOT faithful unless supplied context proves Mairon previously read/got lost in such a book.\n\n"
         "Return compact JSON ONLY:\n"
-        '{"faithful":true,"violations":[]}'
+        '{"faithful":true,"inference_faithful":true,"constraints_faithful":true,"violations":[]}'
+        "\nSet inference_faithful=false when a user-specific inference exceeds the observations "
+        "or premises. Set constraints_faithful=false when explicit live constraints are ignored "
+        "or reversed. Any negative finding also makes faithful=false."
     )
+
+    if live_mechanism_assessments:
+        system_text += (
+            "\n\nTYPED LIVE USER-TASK AUTHORITY — REQUIRED MECHANISM COVERAGE:\n"
+            "The current contract permits reasoning from USER premises, not acquisition of "
+            "new facts about the user's actual equipment. Assess EVERY numbered draft unit, "
+            "including units with no mechanism. Add mechanism_assessments to the JSON: "
+            '[{"sentence_index":1,"kind":"none","supported":true,'
+            '"applicability_established":false,"user_witness":null}].\n'
+            "kind must be none, conditional_hypothesis, supplied_mechanism or unsupported_application. "
+            "A conditional_hypothesis is explicitly only a generic possibility, hypothetical "
+            "explanation or proposed test; it does not establish that the mechanism applies to "
+            "this user's system. Set applicability_established=false and user_witness=null. "
+            "An 'if' or 'could' prefix alone does not make the entire sentence safe: inspect "
+            "the consequent, explanation and following claims for asserted causal applicability, "
+            "properties of the user's actual component or a purported known quirk matching "
+            "this user's symptom. Those require their own support.\n"
+            "Use supplied_mechanism only when the USER actually supplied a premise that "
+            "entails the mechanism/property or its application, with applicability_established=true "
+            'and user_witness={"turn_index":1,"quote":"exact USER words"}. '
+            "A symptom, model plausibility, topic overlap or earlier assistant explanation "
+            "is NOT that witness. Conditional USER premises support conditional conclusions "
+            "only, not an assertion that the premise is physically true. If a mechanism is "
+            "presented as applicable without that support, use unsupported_application and "
+            "supported=false. Preserve valid hypotheses and live alternative explanations; "
+            "do not reject a generic conditional merely because it names a mechanism.\n"
+            "Core also supplies bounded causal/application obligations detected from the "
+            "numbered candidate units BEFORE your classification. A none label cannot erase "
+            "an obligation. A conditional label cannot erase an asserted actual-system "
+            "property, cause or causal exclusion. For an asserted obligation, identify a "
+            "USER witness that actually supplies the corresponding proposition and scope; "
+            "a symptom or merely related topic is not a mechanism/property witness. "
+            "Every sentence_index must occur exactly once. Any unsupported unit makes "
+            "faithful=false and inference_faithful=false. Return no explanatory prose."
+        )
 
     user_packet = (
         "CURRENT USER MESSAGE:\n"
@@ -5300,6 +5967,20 @@ def verify_factual_focus_fidelity(
         ).strip()
     )
 
+    if live_mechanism_assessments:
+        user_packet += (
+            "\n\nAUTHORITATIVE LIVE USER TURNS (one-based indexes):\n"
+            + json.dumps(list(live_user_turns), ensure_ascii=False)
+            + "\n\nNUMBERED DRAFT UNITS (classification targets, NEVER evidence):\n"
+            + "\n\nCORE CAUSAL/APPLICATION OBLIGATIONS (checks, NEVER evidence):\n"
+            + json.dumps(mechanism_obligations, ensure_ascii=False)
+            + "\n\nNUMBERED CLASSIFICATION TARGETS:\n"
+            + json.dumps([
+                {"sentence_index": index, "text": text}
+                for index, text in enumerate(mechanism_units, 1)
+            ], ensure_ascii=False)
+        )
+
     source_lock_text = build_source_lock_instruction(
         user_input=user_input,
         conversation=conversation,
@@ -5317,7 +5998,13 @@ def verify_factual_focus_fidelity(
             "role": "system",
             "content": system_text,
         },
+        {"role": "system", "content": "CORE ANSWER CONTRACT STATE:\n"
+         + json.dumps(contract_state, ensure_ascii=False)
+         + "\nCORE ANSWER CONTRACT INSTRUCTION:\n" + render_answer_contract(core_answer_contract)},
     ]
+
+    if trust_context:
+        verifier_messages.append({"role": "system", "content": str(trust_context)})
 
     if source_lock_text:
         verifier_messages.append({
@@ -5342,7 +6029,7 @@ def verify_factual_focus_fidelity(
         "messages": verifier_messages,
         "options": {
             "temperature": 0,
-            "num_predict": 96,
+            "num_predict": min(1536, max(384, len(mechanism_units) * 96)) if live_mechanism_assessments else 96,
             "num_ctx": 8192,
         },
     }
@@ -5384,10 +6071,28 @@ def verify_factual_focus_fidelity(
             "Core factual-focus fidelity verifier could not validate the draft"
         ]
 
-    if parsed.get(
-        "faithful"
-    ) is True:
-        return []
+    if _verifier_field_errors(
+        parsed, verdict="faithful", claims="violations",
+        optional_flags=("inference_faithful", "constraints_faithful"),
+    ):
+        return ["Core factual-focus fidelity verifier returned malformed assessment state"]
+
+    independent_violations = []
+    if live_mechanism_assessments:
+        independent_violations.extend(_live_mechanism_assessment_violations(
+            parsed, mechanism_units, live_user_turns, mechanism_obligations,
+        ))
+    if parsed.get("inference_faithful") is False:
+        independent_violations.append(
+            "factual-focus source-fidelity violation: diagnostic inference exceeded supplied observations/premises"
+        )
+    if parsed.get("constraints_faithful") is False:
+        independent_violations.append(
+            "factual-focus source-fidelity violation: explicit live user constraint was ignored or reversed"
+        )
+
+    if parsed.get("faithful") is True and not parsed.get("violations"):
+        return independent_violations
 
     raw_violations = parsed.get(
         "violations"
@@ -5418,7 +6123,7 @@ def verify_factual_focus_fidelity(
             )
 
     if cleaned:
-        return [
+        return independent_violations + [
             (
                 "factual-focus source-fidelity violation: "
                 + violation
@@ -5426,7 +6131,7 @@ def verify_factual_focus_fidelity(
             for violation in cleaned
         ]
 
-    return [
+    return independent_violations or [
         (
             "factual answer added unsupported Oliver/Mairon "
             "history or source-fidelity claims"

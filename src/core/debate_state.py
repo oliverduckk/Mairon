@@ -542,6 +542,8 @@ def build_pairwise_semantic_instruction(
     *,
     debate_continuation: bool = False,
     position: Optional[str] = None,
+    established_stance_state: Optional[str] = None,
+    stance_basis_added: bool = False,
 ) -> Optional[str]:
     """
     Render compact semantic state for the language model.
@@ -645,7 +647,25 @@ def build_pairwise_semantic_instruction(
             "may state which side it prefers without inventing canon facts to justify it.",
         ])
 
-    if position == "left":
+    if established_stance_state in {"none", "withheld"}:
+        lines.append(
+            "- Core continuity: Mairon has no established side to defend. "
+            "The previous limitation/absence of a take remains in force. Do not "
+            "present a new side as an existing take or invent knowledge to justify it."
+        )
+        if stance_basis_added:
+            lines.append(
+                "- Oliver supplied a new reasoning basis this turn. A fresh, "
+                "explicitly conditional judgement may use those premises; label "
+                "it as new rather than claiming it was the previous position."
+            )
+        else:
+            lines.append(
+                "- Asking to defend a take supplies no new basis. Explain that "
+                "there was no take, and preserve the previous knowledge limitation."
+            )
+
+    elif position == "left":
         lines.append(
             "- Structured persona state: Mairon previously sided with "
             + left
@@ -1037,6 +1057,8 @@ def find_pairwise_opinion_integrity_violations(
     response_text: Any,
     debate_continuation: bool = False,
     established_position: Optional[str] = None,
+    established_stance_state: Optional[str] = None,
+    stance_basis_added: bool = False,
 ) -> list[str]:
     """
     Enforce only the conversational/persona side of a pairwise opinion.
@@ -1099,6 +1121,20 @@ def find_pairwise_opinion_integrity_violations(
         established_position
     ).lower()
 
+    if established_stance_state in {"none", "withheld"}:
+        if current_position in {"left", "right"}:
+            explicitly_fresh = bool(re.search(
+                r"\b(?:now|given\s+(?:that|these|those|your)|"
+                r"with\s+(?:these|those|your)\s+(?:premises|facts|details)|"
+                r"on\s+(?:that|this)\s+basis|a\s+new\s+(?:take|position|judgement))\b",
+                response, flags=re.IGNORECASE,
+            ))
+            if not stance_basis_added or not explicitly_fresh:
+                violations.append(
+                    "debate continuation manufactured a side despite an established absence of a take"
+                )
+        return violations
+
     if previous_position not in {
         "left",
         "right",
@@ -1124,6 +1160,7 @@ def build_pairwise_opinion_fallback(
     *,
     position: Optional[str] = None,
     debate_continuation: bool = False,
+    established_stance_state: Optional[str] = None,
 ) -> str:
     """
     Persona-safe fallback after repeated pairwise-opinion grounding failures.
@@ -1156,6 +1193,13 @@ def build_pairwise_opinion_fallback(
     ).lower()
 
     if debate_continuation:
+        if established_stance_state in {"none", "withheld"}:
+            if established_stance_state == "withheld":
+                return (
+                    "I didn't have an informed side to defend. I still don't "
+                    "know enough to turn that into a judgement without inventing details."
+                )
+            return "I hadn't picked a side. Asking me to defend one doesn't mean I already had a take."
         if position_value == "left":
             return (
                 "I had "

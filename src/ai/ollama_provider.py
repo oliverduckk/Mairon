@@ -94,7 +94,9 @@ from research.media_grounding import (
 )
 
 from research.public_factual_research import (
+    actual_read_url,
     build_internal_public_factual_packet,
+    build_public_factual_authority_context,
     gather_public_factual_research,
 )
 
@@ -116,7 +118,10 @@ from research.public_factual_grounding import (
     build_supported_current_lookup_fallback,
     find_grounded_opinion_response_violations,
     build_public_factual_retry_instruction,
+    build_public_factual_generation_instruction,
+    requires_public_factual_salvage_completion as should_verify_public_factual_salvage_completion,
     verify_public_factual_draft,
+    verify_public_factual_salvage_completion,
 )
 
 from core.intent_router import (
@@ -138,6 +143,18 @@ from core.debate_state import (
     build_pairwise_semantic_instruction,
     find_pairwise_opinion_integrity_violations,
     looks_like_debate_continuation,
+)
+from core.social_acknowledgement import build_empty_social_acknowledgement
+from core.stance_ownership import (
+    is_user_stance_acknowledgement, build_stance_ownership_frame,
+    render_stance_ownership_instruction, find_stance_ownership_violations,
+)
+from research.public_source_completion import (
+    complete_public_source_request, public_source_output_required,
+)
+from core.reasoning_trust import (
+    build_reasoning_trust_frame,
+    render_reasoning_trust_instruction,
 )
 from core.seriousness import (
     assess_consequential_advice,
@@ -186,6 +203,8 @@ from core.claim_grounding import (
     find_factual_personal_observation_violations,
     find_question_echo_violations,
     find_unknown_media_opinion_overreach_violations,
+    find_acknowledgement_direction_violations,
+    should_verify_acknowledgement_grounding,
     should_verify_core_grounding,
     should_verify_factual_focus_fidelity,
     verify_core_grounded_draft,
@@ -8795,6 +8814,11 @@ def handle_direct_conversation(
     )
 
     contract_runtime = coerce_answer_contract_runtime(core_answer_contract)
+    # A USER stance acknowledgement does not establish Mairon's own opinion.
+    stance_ownership_frame = build_stance_ownership_frame(
+        user_input, core_answer_contract, accepted_opinion_entry=opinion_entry,
+    )
+    stance_ownership_instruction = render_stance_ownership_instruction(stance_ownership_frame)
     contract_debate_continuation = bool(
         contract_runtime
         and str((contract_runtime.metadata or {}).get("debate_continuation") or "").strip().lower()
@@ -8826,6 +8850,7 @@ def handle_direct_conversation(
             user_input=user_input,
             intent=core_intent,
         )
+        if stance_ownership_frame is None else None
     )
 
     if background_research_opportunity:
@@ -8875,6 +8900,17 @@ def handle_direct_conversation(
                 marker_payload=proposal,
             )
 
+    # Dialogue state describes a prior stance only. It does not promote the
+    # factual content of a prior assistant answer into evidence.
+    reasoning_trust_frame = build_reasoning_trust_frame(
+        user_input=user_input,
+        conversation=conversation,
+        core_answer_contract=core_answer_contract,
+        opinion_subject=opinion_subject,
+        opinion_entry=opinion_entry,
+    )
+    reasoning_trust_instruction = render_reasoning_trust_instruction(reasoning_trust_frame)
+
     pairwise_opinion_instruction = (
         build_pairwise_semantic_instruction(
             opinion_subject,
@@ -8882,8 +8918,10 @@ def handle_direct_conversation(
                 core_is_debate_continuation
             ),
             position=pairwise_position,
+            established_stance_state=getattr(reasoning_trust_frame, "stance_state", None),
+            stance_basis_added=bool(getattr(reasoning_trust_frame, "stance_basis_added", False)),
         )
-        if opinion_subject
+        if opinion_subject and stance_ownership_frame is None
         else None
     )
 
@@ -9127,7 +9165,16 @@ def handle_direct_conversation(
 
         public_factual_evidence = (
             build_internal_public_factual_packet(
-                public_research_result
+                public_research_result,
+                include_read_provenance=(
+                    core_intent == "factual_question"
+                    and factual_epistemic_mode == "public_source_verified"
+                    and _core_contract_value(core_answer_contract, "Factual authority") == "public_web"
+                    and not research_evidence
+                    and not media_domain_active
+                    and not core_is_grounded_opinion
+                    and not core_is_consequential_advice
+                ),
             )
         )
 
@@ -9252,6 +9299,23 @@ def handle_direct_conversation(
     grounded_research_evidence = (
         research_evidence
         or public_factual_evidence
+    )
+
+    # This producer context is built from retained Core research, independently
+    # of the common shadow evaluator and its semantic annotation capability.
+    public_authority_context = (
+        build_public_factual_authority_context(public_research_result, user_input)
+        if (
+            public_factual_research_success
+            and core_intent == "factual_question"
+            and factual_epistemic_mode == "public_source_verified"
+            and _core_contract_value(core_answer_contract, "Factual authority") == "public_web"
+            and not research_evidence
+            and not media_domain_active
+            and not core_is_grounded_opinion
+            and not core_is_consequential_advice
+        )
+        else None
     )
 
     # Spoiler-progress turns already have the current conversation plus
@@ -9470,6 +9534,9 @@ def handle_direct_conversation(
             "content": self_correction_context
         })
 
+    if stance_ownership_instruction:
+        base_messages.append({"role": "system", "content": stance_ownership_instruction})
+
     if opinion_context:
         base_messages.append({
             "role": "system",
@@ -9480,6 +9547,12 @@ def handle_direct_conversation(
         base_messages.append({
             "role": "system",
             "content": pairwise_opinion_instruction,
+        })
+
+    if reasoning_trust_instruction and not core_is_consequential_advice:
+        base_messages.append({
+            "role": "system",
+            "content": reasoning_trust_instruction,
         })
 
     if research_evidence:
@@ -9493,6 +9566,13 @@ def handle_direct_conversation(
             "role": "system",
             "content": public_factual_evidence
         })
+
+        public_authority_instruction = build_public_factual_generation_instruction(public_authority_context)
+        if public_authority_instruction:
+            base_messages.append({
+                "role": "system",
+                "content": public_authority_instruction,
+            })
 
         if core_is_grounded_opinion:
             base_messages.append({
@@ -9575,7 +9655,7 @@ def handle_direct_conversation(
                 "content": core_micro_act_instruction
             })
 
-    if core_intent == "share_opinion":
+    if core_intent == "share_opinion" and stance_ownership_frame is None:
         opinion_lane_lines = [
             "OPINION-LANE RESPONSE MODE:",
             "- Give the subjective opinion Oliver actually asked for.",
@@ -9591,13 +9671,24 @@ def handle_direct_conversation(
         ]
 
         if core_is_debate_continuation:
-            opinion_lane_lines.extend([
-                "- Oliver explicitly asked Mairon to defend/explain its own active take.",
-                "- Give actual reasons for the position. Do not answer only with 'Fair', "
-                "'yeah', a generic concession, or an argument about Oliver's tone.",
-                "- If the prior stance cannot be defended honestly, revise or withdraw it "
-                "explicitly instead of inventing evidence.",
-            ])
+            if (
+                getattr(reasoning_trust_frame, "stance_state", None) in {"none", "withheld"}
+                and not getattr(reasoning_trust_frame, "stance_basis_added", False)
+            ):
+                opinion_lane_lines.extend([
+                    "- The defence request presupposes a take, but Core records that no "
+                    "informed side was established. Preserve that conversational fact.",
+                    "- Briefly explain the existing limitation. Do not recast Oliver's "
+                    "preference as your own take or invent a position to defend.",
+                ])
+            else:
+                opinion_lane_lines.extend([
+                    "- Oliver explicitly asked Mairon to defend/explain its own active take.",
+                    "- Give actual reasons for the position. Do not answer only with 'Fair', "
+                    "'yeah', a generic concession, or an argument about Oliver's tone.",
+                    "- If the prior stance cannot be defended honestly, revise or withdraw it "
+                    "explicitly instead of inventing evidence.",
+                ])
 
         base_messages.append({
             "role": "system",
@@ -9891,7 +9982,9 @@ def handle_direct_conversation(
     ):
         """
         Re-run deterministic acceptance guards after sentence-level media
-        salvage without paying for another semantic verifier call.
+        salvage without paying for another semantic verifier call. Public
+        factual subsets with a retained current-state or explicit required-
+        claim obligation also receive the separate completion check below.
 
         The public-source verifier already approved each retained sentence as
         both supported and within scope. These checks make sure mechanical
@@ -10044,6 +10137,8 @@ def handle_direct_conversation(
             )
         )
 
+    ordinary_core_grounding_required = core_grounding_required
+    all_direct_attempts_no_visible = True
     for attempt in range(
         1,
         personality_draft_limit + 1
@@ -10452,6 +10547,7 @@ def handle_direct_conversation(
         # No external action tools exist in this mode. If Qwen somehow
         # produces an unusable tool-only response, retry as plain chat.
         if tool_calls:
+            all_direct_attempts_no_visible = False
             violations = [
                 "attempted a tool call during direct conversation"
             ]
@@ -10516,6 +10612,8 @@ def handle_direct_conversation(
         sanitized_draft_text = _strip_internal_reasoning_markup(
             original_draft_text
         )
+        if sanitized_draft_text.strip():
+            all_direct_attempts_no_visible = False
 
         if sanitized_draft_text != original_draft_text.strip():
             print(
@@ -10641,6 +10739,14 @@ def handle_direct_conversation(
                 "lexical denial with calibrated uncertainty."
             )
 
+        # Complete an explicit provenance output request from the actual Core
+        # page-read snapshot, before the existing draft verifier and digests.
+        if public_authority_context and public_source_output_required(user_input):
+            draft_text = complete_public_source_request(
+                draft_text, user_input=user_input,
+                authority_context=public_authority_context, contract=core_answer_contract,
+            )
+
         if generation_debug_enabled():
             print(
                 f"[Debug] Draft attempt {attempt}: "
@@ -10650,6 +10756,9 @@ def handle_direct_conversation(
             )
 
         violations = []
+        violations.extend(find_stance_ownership_violations(
+            draft_text, frame=stance_ownership_frame,
+        ))
 
         if not draft_text:
             if original_draft_text.strip():
@@ -10739,10 +10848,13 @@ def handle_direct_conversation(
                     user_input=user_input,
                     draft=draft_text,
                     conversation=conversation,
+                    research_evidence=(research_evidence, public_factual_evidence),
+                    opinion_entry=opinion_entry,
+                    opinion_subject=opinion_subject,
                 )
             )
 
-        if opinion_subject:
+        if opinion_subject and stance_ownership_frame is None:
             violations.extend(
                 find_pairwise_opinion_integrity_violations(
                     opinion_subject,
@@ -10754,6 +10866,8 @@ def handle_direct_conversation(
                     established_position=(
                         pairwise_position
                     ),
+                    established_stance_state=getattr(reasoning_trust_frame, "stance_state", None),
+                    stance_basis_added=bool(getattr(reasoning_trust_frame, "stance_basis_added", False)),
                 )
             )
 
@@ -10903,6 +11017,7 @@ def handle_direct_conversation(
             find_explicit_user_constraint_violations(
                 user_input=user_input,
                 draft=draft_text,
+                conversation=conversation,
             )
         )
 
@@ -10963,6 +11078,14 @@ def handle_direct_conversation(
             )
         )
 
+        violations.extend(
+            find_acknowledgement_direction_violations(
+                user_input=user_input,
+                draft=draft_text,
+                core_answer_contract=core_answer_contract,
+            )
+        )
+
         # Acceptance-stage invariant: subjective/opinion lanes may introduce
         # their own picks, but concrete real-world creator/credit attributions
         # are not free personality detail. Unless Oliver explicitly asked for
@@ -10977,6 +11100,10 @@ def handle_direct_conversation(
             )
         )
 
+        core_grounding_required = (
+            ordinary_core_grounding_required
+            or should_verify_acknowledgement_grounding(core_answer_contract, draft_text)
+        )
         if core_grounding_required:
             violations.extend(
                 verify_core_grounded_draft(
@@ -10986,6 +11113,7 @@ def handle_direct_conversation(
                     draft=draft_text,
                     core_answer_contract=core_answer_contract,
                     conversation=conversation,
+                    trust_context=reasoning_trust_instruction,
                 )
             )
 
@@ -11029,6 +11157,7 @@ def handle_direct_conversation(
                         draft=draft_text,
                         core_answer_contract=core_answer_contract,
                         conversation=conversation,
+                        trust_context=reasoning_trust_instruction,
                     )
                 )
 
@@ -11063,6 +11192,7 @@ def handle_direct_conversation(
                     user_input=user_input,
                     draft=draft_text,
                     research_evidence=public_factual_evidence,
+                    authority_context=public_authority_context,
                 )
             )
 
@@ -11152,6 +11282,14 @@ def handle_direct_conversation(
                     salvaged_draft
                     and salvaged_draft != draft_text.strip()
                 ):
+                    # Sentence deletion cannot erase an explicit requested
+                    # source identity. The attachment is a Core read result,
+                    # not text recovered from the rejected draft.
+                    if public_authority_context and public_source_output_required(user_input):
+                        salvaged_draft = complete_public_source_request(
+                            salvaged_draft, user_input=user_input,
+                            authority_context=public_authority_context, contract=core_answer_contract,
+                        )
                     salvage_violations = list(
                         _validate_salvaged_research_draft(
                             salvaged_draft
@@ -11175,6 +11313,7 @@ def handle_direct_conversation(
                         find_explicit_user_constraint_violations(
                             user_input=user_input,
                             draft=salvaged_draft,
+                            conversation=conversation,
                         )
                     )
                     salvage_violations.extend(
@@ -11203,6 +11342,64 @@ def handle_direct_conversation(
                             core_answer_contract=core_answer_contract,
                         )
                     )
+                    # Supported individual sentences do not imply that deleting
+                    # the unsupported ones preserved the requested answer.
+                    # This is a legacy producer check, never a common shadow
+                    # decision. Eligibility comes from Core contract/research
+                    # state; candidate origin supplies no authority.
+                    if (
+                        not salvage_violations
+                        and public_factual_verification is not None
+                        and public_factual_evidence
+                        and public_factual_research_success
+                        and core_intent == "factual_question"
+                        and factual_epistemic_mode == "public_source_verified"
+                        and _core_contract_value(core_answer_contract, "Factual authority") == "public_web"
+                        and not research_evidence
+                        and not media_domain_active
+                        and not core_is_grounded_opinion
+                        and not core_is_consequential_advice
+                    ):
+                        completion_violations = []
+                        try:
+                            completion_required = should_verify_public_factual_salvage_completion(
+                                core_answer_contract=core_answer_contract,
+                                research_evidence=public_factual_evidence,
+                                authority_context=public_authority_context,
+                                identity_date_obligations=(getattr(public_factual_verification, "verification_state", {}) or {}).get("identity_date_obligations", ()),
+                                user_input=user_input,
+                            )
+                            if type(completion_required) is not bool:
+                                completion_violations = [
+                                    "public factual sentence salvage completion could not be established"
+                                ]
+                            elif completion_required:
+                                completion_violations = verify_public_factual_salvage_completion(
+                                    client=client,
+                                    model=active_local_model,
+                                    user_input=user_input,
+                                    draft=salvaged_draft,
+                                    core_answer_contract=core_answer_contract,
+                                    research_evidence=public_factual_evidence,
+                                    authority_context=public_authority_context,
+                                    identity_date_obligations=(getattr(public_factual_verification, "verification_state", {}) or {}).get("identity_date_obligations", ()),
+                                )
+                                if (
+                                    not isinstance(completion_violations, list)
+                                    or any(not isinstance(value, str) or not value.strip()
+                                           for value in completion_violations)
+                                ):
+                                    completion_violations = [
+                                        "public factual sentence salvage completion could not be established"
+                                    ]
+                        except Exception:
+                            completion_violations = [
+                                "public factual sentence salvage completion could not be established"
+                            ]
+                        if completion_violations:
+                            salvage_violations.extend(completion_violations)
+                            violations.extend(completion_violations)
+                            print("[Grounding] Supported public sentence subset did not fulfill the required answer.")
                     salvage_violations = list(dict.fromkeys(salvage_violations))
 
                     if not salvage_violations:
@@ -11265,7 +11462,23 @@ def handle_direct_conversation(
             for violation in violations
         )
 
-        if diagnostic_fallback is not None:
+        # Empty generation cannot turn a known non-action micro-act into an
+        # implementation-error response. This adds neither authority nor action.
+        empty_social_ack = (
+            build_empty_social_acknowledgement(
+                user_input=user_input, contract=core_answer_contract,
+            )
+            if all_direct_attempts_no_visible else None
+        )
+        if stance_ownership_frame is not None:
+            final_response_text = "Got it."
+            print("[Core] USER stance acknowledgement: ownership preserved.")
+
+        elif empty_social_ack is not None:
+            final_response_text = empty_social_ack
+            print("[Core] Empty social generation: bounded acknowledgement.")
+
+        elif diagnostic_fallback is not None:
             final_response_text = diagnostic_fallback
             print(
                 "[Grounding] Diagnostic drafts remained invalid; Core used a calibrated bounded diagnostic fallback."
@@ -11286,7 +11499,7 @@ def handle_direct_conversation(
         elif public_factual_evidence:
             if core_is_source_provenance_followup and public_readable_sources:
                 used_source = public_readable_sources[0]
-                used_url = str(used_source.get("url") or "").strip()
+                used_url = actual_read_url(used_source)
                 if used_url:
                     final_response_text = (
                         "I did retrieve and read a public source for this turn. "
@@ -11361,6 +11574,7 @@ def handle_direct_conversation(
                         debate_continuation=(
                             core_is_debate_continuation
                         ),
+                        established_stance_state=getattr(reasoning_trust_frame, "stance_state", None),
                     )
                 )
 
@@ -11560,7 +11774,7 @@ def handle_direct_conversation(
             relationship_context=relationship_context,
         )
 
-    if opinion_subject:
+    if opinion_subject and stance_ownership_frame is None:
         record_opinion_if_needed(
             subject=opinion_subject,
             response_text=final_response_text,
@@ -11916,6 +12130,7 @@ def _get_response_impl(
 
     if (
         core_intent == "reason_from_supplied_premises"
+        or is_user_stance_acknowledgement(user_input, core_answer_contract)
         or (
             core_intent != "calendar_event_creation_request"
             and should_use_direct_conversation(user_input)
@@ -12029,6 +12244,7 @@ def _get_response_impl(
     )
 
     tools_used = []
+    any_tool_call_seen = False
 
     last_web_search_result = None
     last_email_search_result = None
@@ -12072,6 +12288,7 @@ def _get_response_impl(
             response.message.tool_calls
             or []
         )
+        any_tool_call_seen = any_tool_call_seen or bool(tool_calls)
 
         # --------------------------------------------------
         # Calendar write permission request
@@ -12230,6 +12447,16 @@ def _get_response_impl(
                 or ""
             ).strip()
 
+            # Reasoning-only output is also empty for a known non-action
+            # micro-act. Other tool/result lanes retain their existing handling.
+            if (
+                not any_tool_call_seen and not tools_used
+                and build_empty_social_acknowledgement(
+                    user_input=user_input, contract=core_answer_contract,
+                ) is not None
+            ):
+                response_content = _strip_internal_reasoning_markup(response_content)
+
             if not response_content:
                 empty_final_retries += 1
 
@@ -12259,10 +12486,17 @@ def _get_response_impl(
                     continue
 
                 fallback = (
-                    "I couldn't produce a usable answer for that request. "
-                    "I rejected repeated empty model responses rather than "
-                    "pretending the request was completed."
+                    build_empty_social_acknowledgement(
+                        user_input=user_input, contract=core_answer_contract,
+                    )
+                    if not any_tool_call_seen and not tools_used else None
                 )
+                if fallback is None:
+                    fallback = (
+                        "I couldn't produce a usable answer for that request. "
+                        "I rejected repeated empty model responses rather than "
+                        "pretending the request was completed."
+                    )
 
                 working_conversation.append({
                     "role": "assistant",
