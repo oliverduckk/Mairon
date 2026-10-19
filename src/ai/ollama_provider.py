@@ -148,6 +148,7 @@ from core.social_acknowledgement import build_empty_social_acknowledgement
 from core.stance_ownership import (
     is_user_stance_acknowledgement, build_stance_ownership_frame,
     render_stance_ownership_instruction, find_stance_ownership_violations,
+    find_user_stance_echo_violations,
 )
 from research.public_source_completion import (
     complete_public_source_request, public_source_output_required,
@@ -184,6 +185,7 @@ from core.claim_grounding import (
     build_mairon_agency_modality_instruction,
     build_recent_user_grounding_context,
     find_mairon_agency_modality_violations,
+    find_mairon_self_authority_violations,
     find_incidental_public_attribution_violations,
     find_user_diagnostic_overclaim_violations,
     find_pairwise_comparison_drift_violations,
@@ -6850,6 +6852,12 @@ def build_core_micro_act_instruction(
         "do not invent it. Use personality instead.",
     ]
 
+    if intent == "casual_conversation" and re.fullmatch(r"[^\W\d_]{1,32}[.!]*", str(user_input or "").strip()):
+        lines.append(
+            "- This is a single-token social address, not a new task. Give a brief companion "
+            "acknowledgement within 24 words; do not invent an activity, observation, history or monologue."
+        )
+
     if intent == "self_correction":
         lines.extend([
             "- Oliver is correcting his OWN earlier wording, not accusing Mairon of an error.",
@@ -7954,6 +7962,10 @@ def find_core_answer_contract_violations(
         violations.append(
             "current Core contract forbids generic follow-up/service language"
         )
+
+    if intent == "casual_conversation" and re.fullmatch(r"[^\W\d_]{1,32}[.!]*", str(user_input or "").strip()):
+        if len(text.split()) > 24:
+            violations.append("single-token social address became an unrequested monologue")
 
     if intent == "acknowledge":
         word_count = len(
@@ -10044,6 +10056,17 @@ def handle_direct_conversation(
             )
         )
 
+        candidate_violations.extend(find_mairon_self_authority_violations(
+            user_input=user_input, draft=candidate_text,
+            core_answer_contract=core_answer_contract, conversation=conversation,
+        ))
+        candidate_violations.extend(find_user_stance_echo_violations(
+            candidate_text, user_input, core_answer_contract, accepted_opinion_entry=opinion_entry,
+        ))
+        candidate_violations.extend(find_explicit_user_constraint_violations(
+            user_input=user_input, draft=candidate_text, conversation=conversation,
+        ))
+
         candidate_violations.extend(
             find_relative_date_weekday_violations(
                 user_input=user_input,
@@ -10759,6 +10782,9 @@ def handle_direct_conversation(
         violations.extend(find_stance_ownership_violations(
             draft_text, frame=stance_ownership_frame,
         ))
+        violations.extend(find_user_stance_echo_violations(
+            draft_text, user_input, core_answer_contract, accepted_opinion_entry=opinion_entry,
+        ))
 
         if not draft_text:
             if original_draft_text.strip():
@@ -10887,6 +10913,10 @@ def handle_direct_conversation(
 
         # Core owns what Mairon can/do/will do. This validator is deliberately
         # domain-independent and runs on every direct-conversation draft.
+        violations.extend(find_mairon_self_authority_violations(
+            user_input=user_input, draft=draft_text,
+            core_answer_contract=core_answer_contract, conversation=conversation,
+        ))
         violations.extend(
             find_mairon_agency_modality_violations(
                 user_input=user_input,
@@ -11193,6 +11223,9 @@ def handle_direct_conversation(
                     draft=draft_text,
                     research_evidence=public_factual_evidence,
                     authority_context=public_authority_context,
+                    consequential_domain=(consequential_domain if core_is_consequential_advice else None),
+                    user_conversation=(conversation if core_is_consequential_advice else None),
+                    core_answer_contract=core_answer_contract,
                 )
             )
 

@@ -29,7 +29,7 @@ _STANCE = re.compile(
     r"\b(?P<marker>"
     r"i\s+(?:(?:still|now|already|also|really|personally|honestly|actually)\s+)?"
     r"(?:(?:do\s+not|don't)\s+)?(?:(?:really|actually)\s+)?"
-    r"(?:think|reckon|believe|feel|consider|prefer|like|love|hate|agree|disagree)"
+        r"(?:think|reckon|believe|feel|consider|prefer|like|dislike|love|hate|enjoy|rate|agree|disagree)"
     r"|i(?:'d|\s+would)\s+(?:say|pick|choose|prefer)"
     r"|(?:my\s+(?:take|opinion|view|position|preference)\s+(?:is|remains))"
     r"|in\s+my\s+opinion|for\s+me\s*[,—:])\s*",
@@ -100,7 +100,7 @@ def _stance_kind(marker: str) -> str:
     negative = bool(re.search(r"\b(?:not|don't)\b", marker))
     verb = next((word for word in reversed(marker.split()) if word in {
         "think", "reckon", "believe", "feel", "consider", "prefer", "like",
-        "love", "hate", "agree", "disagree",
+        "love", "hate", "dislike", "enjoy", "rate", "agree", "disagree",
         "say", "pick", "choose",
     }), "judgement")
     kind = "judgement" if verb in {"think", "reckon", "believe", "feel", "consider"} else verb
@@ -130,7 +130,80 @@ def _stances(value: Any) -> Tuple[StanceProposition, ...]:
         item = StanceProposition(_stance_kind(match.group("marker")), key)
         if item not in result:
             result.append(item)
+    # A possessive preference is an owned stance even without an 'I think'
+    # marker. Keep its subject whole; words inside a quoted USER attribution
+    # remain masked and cannot become an assistant opinion.
+    favourite = re.compile(
+        r"(?P<subject>[^.!?;]{1,180}?)\s+(?P<copula>isn't|aren't|is|are|remains?)\s+"
+        r"(?P<prefix>(?:(?:still|also|really|definitely|not|never)\s+)*)"
+        r"(?:(?:one\s+of|among)\s+)?my\s+(?P<negative>least\s+)?"
+        r"favou?rites?\b(?P<category>[^.!?;]{0,80})", re.I,
+    )
+    for match in favourite.finditer(masked):
+        subject = re.sub(r"^(?:yeah|yes|no|well|noted|honestly|personally)\s*[,;:]\s*", "", match.group("subject"), flags=re.I)
+        if (re.search(r"\b(?:if|unless|assuming|whether|suppose)\b", subject, re.I)
+                or re.search(r"\b(?:you\s+(?:said|think|reckon)|your\s+(?:view|opinion))\b", subject, re.I)
+                or masked[match.end():].lstrip().startswith("?")):
+            continue
+        key = _key(subject)
+        if not key or len(key.split()) > 30:
+            continue
+        negative = bool(match.group("negative") or "n't" in match.group("copula")
+                        or re.search(r"\b(?:not|never)\b", match.group("prefix"), re.I))
+        item = StanceProposition(("negative:" if negative else "positive:") + "favourite", key)
+        if item not in result:
+            result.append(item)
+    inverted = re.compile(r"\bmy\s+(?P<negative>least\s+)?favou?rite(?:\s+[a-z][a-z-]*){0,3}?\s+"
+                          r"(?:is|remains)\s+(?P<subject>[^.!?;]{1,160})", re.I)
+    for match in inverted.finditer(masked):
+        prefix = re.split(r"[.!?;](?=\s|$)", masked[:match.start()])[-1]
+        if re.search(r"\b(?:if|unless|whether)\b", prefix, re.I):
+            continue
+        subject = re.split(r",?\s+\b(?:but|however)\b", match.group("subject"), maxsplit=1, flags=re.I)[0]
+        item = StanceProposition(("negative:" if match.group("negative") else "positive:") + "favourite", _key(subject))
+        if item.content and item not in result:
+            result.append(item)
     return tuple(result)
+
+
+def find_user_stance_echo_violations(
+    draft: Any, user_input: Any, core_answer_contract: Any = None,
+    accepted_opinion_entry: Any = None,
+) -> list[str]:
+    """Prevent USER stance transport during a non-debate social response.
+
+    The explicit acknowledgement adapter above remains separate from ordinary
+    opinion formation/ledger ingress. This narrower guard recognises only a
+    stance about the same bounded USER proposition, never a new assistant
+    stance on an unrelated subject. A matching independently accepted ledger
+    stance can still be expressed. USER words and assistant dialogue are not
+    substitutes for that independent authority.
+    """
+    runtime = coerce_answer_contract_runtime(core_answer_contract)
+    if runtime is None or runtime.intent not in {
+        "share_opinion", "acknowledge", "share_context", "self_correction", "casual_conversation",
+    } or runtime.authority not in {
+        "user_turn", "conversation", "live_conversation", "user_turn_and_live_conversation",
+    } or _OWN_OPINION_REQUEST.search(_unquoted(_text(user_input))):
+        return []
+    if str((runtime.metadata or {}).get("debate_continuation") or "").lower() in {"1", "true", "yes"}:
+        return []
+    user = _stances(user_input)
+    if not user:
+        return []
+    accepted = _stances(accepted_opinion_entry.get("stance_text")) if isinstance(accepted_opinion_entry, Mapping) else ()
+    if isinstance(accepted_opinion_entry, Mapping) and accepted_opinion_entry.get("kind") == "pairwise_comparison":
+        position = str(accepted_opinion_entry.get("position") or "").lower()
+        left, right = _key(accepted_opinion_entry.get("left")), _key(accepted_opinion_entry.get("right"))
+        if position in {"left", "right"} and left and right:
+            preferred, other = (left, right) if position == "left" else (right, left)
+            accepted += (StanceProposition("positive:prefer", preferred + " over " + other),)
+    def content(item):
+        return re.sub(r"\s+(?:too|either|as\s+well)$", "", item.content)
+    if any(candidate not in accepted and any(content(candidate) == content(owned) for owned in user)
+           for candidate in _stances(draft)):
+        return ["USER-owned stance was echoed as an unestablished assistant stance"]
+    return []
 
 
 def is_user_stance_acknowledgement(user_input: Any, core_answer_contract: Any = None) -> bool:

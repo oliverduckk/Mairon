@@ -50,6 +50,16 @@ _KNOWN_PROPERTY = re.compile(
     r"(?:behaviour|behavior|property|feature|quirk))\s+of\s+"
     r"(?P<subject>(?:your|my|our)\s+[a-z][\w'-]*(?:\s+[a-z][\w'-]*){0,3})", re.I,
 )
+_CONCLUSION_CERTAINTY = re.compile(
+    r"\b(?:is|are|was|were|'s|'re)\s+"
+    r"(?:(?:still|then|now)\s+)?(?:definitely|certainly|necessarily|undoubtedly)\s+|"
+    r"\b(?:must\s+(?:therefore\s+)?be|has\s+to\s+be|have\s+to\s+be|"
+    r"can\s+only\s+be|can\s+be\s+only)\s+", re.I,
+)
+_PROOF_CONCLUSION = re.compile(
+    r"\b(?:proves?|proven|confirms?|confirmed|establishes?|established|"
+    r"demonstrates?|demonstrated|rules?\s+out|eliminates?|eliminated)\s+", re.I,
+)
 
 
 def _literal(value: Any) -> str:
@@ -140,6 +150,88 @@ def _obligation(index: int, kind: str, clause: str, before: str, predicate: str,
     }
 
 
+def _diagnostic_conclusions(index: int, unit: str) -> list[dict[str, Any]]:
+    """Project decisive inferences separately from their proposed measurements.
+
+    A conditional antecedent need not be physically true for its inference to
+    overclaim: ``if reading X, then only cause Y`` still asserts the diagnostic
+    rule X -> only Y.  That rule requires support, rather than a model label of
+    ``conditional_hypothesis``.  This is deliberately bounded to overt proof,
+    certainty and exclusivity; ordinary possible explanations stay unchanged.
+    """
+    found = []
+    for pattern in (_CONCLUSION_CERTAINTY, _PROOF_CONCLUSION):
+        for match in pattern.finditer(unit):
+            raw_left = unit[:match.start()]
+            # A separate contrast cannot supply either an epistemic hedge for
+            # this conclusion or a factual tail inside a bounded possibility.
+            # Keep the original unit only for the literal conditional rule.
+            left_parts, right_parts = _clauses(raw_left), _clauses(unit[match.end():])
+            left = left_parts[-1] if left_parts else raw_left
+            right = (right_parts[0] if right_parts else unit[match.end():]).strip(" .!?")
+            if not _WORDS.search(left) or not _WORDS.search(right):
+                continue
+            if _nonasserted_scope(unit, left) or re.search(
+                r"\b(?:does\s+not|doesn't|do\s+not|don't|cannot|can't|"
+                r"could\s+not|couldn't|would\s+not|wouldn't|not|never)\s*$", left, re.I,
+            ):
+                continue
+            if re.match(r"\s*(?:no|neither|nothing|none)\b", left.rsplit(",", 1)[-1], re.I):
+                # 'No mechanism is established' is a bounded refusal to infer,
+                # rather than an affirmative diagnostic establishment.
+                continue
+            # Asking whether an inference holds or quoting an example does
+            # not itself assert it. A proposed if-test is not such a question.
+            if unit.rstrip().endswith("?") or any(
+                raw_left.count(opening) % 2 for opening in ('"', '`')
+            ) or raw_left.count("“") > raw_left.count("”") or re.search(r"(?:^|\s)'[^']*$", raw_left):
+                continue
+            if _bounded_limitation_value(right) or re.fullmatch(
+                r"(?:(?:still|only|just)\s+)?(?:possible|a\s+possibility|"
+                r"inconclusive|insufficient|uncertain|useful|helpful|"
+                r"worth\s+(?:trying|checking|testing))", right, re.I,
+            ):
+                continue
+            if re.match(
+                r"(?:(?:still|just|only)\s+)?(?:possible|plausible|conceivable)\s+that\b|"
+                r"(?:(?:still|currently)\s+)?(?:a\s+)?(?:possibility|hypothesis)(?:\s+that\b|$)",
+                right, re.I,
+            ):
+                # Strong confidence that a hypothesis remains possible does
+                # not assert that its mechanism applies to the actual system.
+                continue
+            if pattern is _CONCLUSION_CERTAINTY and re.match(
+                r"(?:compatible|consistent)\s+with\b", right, re.I,
+            ):
+                # Compatibility with a possible explanation is not proof of
+                # that explanation. Concrete USER-system properties still
+                # enter the existing actual_property projector independently.
+                continue
+            # An epistemically modal proof claim is not a conclusive rule.
+            # In contrast, 'can only be' is exclusive despite the word can.
+            if pattern is _PROOF_CONCLUSION and re.search(
+                r"\b(?:could|may|might|can)\s*$", left, re.I,
+            ):
+                continue
+            item = _obligation(index, "diagnostic_conclusion", unit, left,
+                               "conclusion", left, right)
+            # For this obligation, modality of the measurement cannot erase
+            # certainty of its consequent. Retain the whole rule for witness
+            # direction/antecedent comparison, not only the conclusion noun.
+            item["mode"] = "asserted"
+            item["conditional_rule"] = bool(re.match(
+                r"\s*(?:if|unless|assuming|supposing|suppose)\b", unit, re.I,
+            ))
+            item["condition_tokens"] = _tokens(raw_left.split(",", 1)[0]) if item["conditional_rule"] else ()
+            item["condition_polarity"] = _polarity(raw_left.split(",", 1)[0]) if item["conditional_rule"] else None
+            item["exclusive"] = bool(re.search(
+                r"\b(?:only|sole|exclusively|rules?\s+out|eliminates?|eliminated)\b", match.group(), re.I,
+            ))
+            item["polarity"] = "negative" if re.match(r"\s*(?:not|never|no)\b", right, re.I) else "positive"
+            found.append(item)
+    return found
+
+
 def _clause_obligations(index: int, clause: str) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
     passive = re.search(r"\bcaused\s+by\s+", clause, re.I)
@@ -227,6 +319,7 @@ def build_diagnostic_obligations(units: Sequence[str]) -> tuple[dict[str, Any], 
     found: list[dict[str, Any]] = []
     for index, raw_unit in enumerate(units, 1):
         unit = _literal(raw_unit)
+        found.extend(_diagnostic_conclusions(index, unit))
         contrast = re.search(
             r"\b(?:it|this|that)(?:\s+is\s+not|\s+isn't|\s+is\s+never)\s+"
             r"(?P<excluded>[^;.!?]{1,120});\s*(?:it|this|that)(?:'s|\s+is)\s+"
@@ -248,7 +341,7 @@ def build_diagnostic_obligations(units: Sequence[str]) -> tuple[dict[str, Any], 
     return tuple(unique)
 
 
-def _quote_is_asserted(source: str, quote: str) -> bool:
+def _quote_is_asserted(source: str, quote: str, *, conditional_rule: bool = False) -> bool:
     start = source.find(quote)
     if start < 0:
         return False
@@ -256,7 +349,15 @@ def _quote_is_asserted(source: str, quote: str) -> bool:
     ends = [source.find(marker, start + len(quote)) for marker in (".", "!", "?", ";")]
     right = min((position + 1 for position in ends if position >= 0), default=len(source))
     context, prefix = source[left:right], source[left:start]
-    if re.search(r"\b(?:if|unless|assuming|supposing|suppose|would|will)\b|\?", context, re.I):
+    if conditional_rule:
+        # A USER can explicitly supply a diagnostic implication, without
+        # claiming its hypothetical antecedent happened. Preserve that whole
+        # rule, while still rejecting questions, quotations and nested examples.
+        if not re.match(r"\s*(?:if|unless|assuming|supposing|suppose)\b", quote, re.I):
+            return False
+        if context.strip() != quote.strip() or "?" in context:
+            return False
+    elif re.search(r"\b(?:if|unless|assuming|supposing|suppose|would|will)\b|\?", context, re.I):
         return False
     for opening, closing in (("\"", "\""), ("`", "`"), ("“", "”"), ("‘", "’")):
         if (opening == closing and prefix.count(opening) % 2) or (
@@ -286,6 +387,13 @@ def _witness_matches(obligation: Mapping[str, Any], quote: str) -> bool:
             continue
         if obligation["exclusive"] and not witness["exclusive"]:
             continue
+        if obligation.get("predicate") == "conclusion":
+            if bool(obligation.get("conditional_rule")) != bool(witness.get("conditional_rule")):
+                continue
+            if obligation.get("condition_polarity") != witness.get("condition_polarity"):
+                continue
+            if tuple(obligation.get("condition_tokens", ())) != tuple(witness.get("condition_tokens", ())):
+                continue
         if _matching_tokens(obligation["subject_tokens"], witness["subject_tokens"]) and (
                 not obligation["value_tokens"] or _matching_tokens(obligation["value_tokens"], witness["value_tokens"])):
             return True
@@ -355,7 +463,8 @@ def diagnostic_obligation_violations(
             violations.append(malformed)
             continue
         if obligation["mode"] == "asserted" and (
-                not _quote_is_asserted(user_turns[turn_index - 1], quote)
+                not _quote_is_asserted(user_turns[turn_index - 1], quote,
+                                       conditional_rule=bool(obligation.get("conditional_rule")))
                 or not _witness_matches(obligation, quote)):
             violations.append(unsupported)
     return list(dict.fromkeys(violations))

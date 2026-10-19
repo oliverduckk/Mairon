@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import os
@@ -7,6 +8,18 @@ from types import SimpleNamespace
 from types import MappingProxyType
 
 from core.evidence import freeze_metadata
+from core.seriousness import assess_consequential_advice
+from research.consequential_obligations import (
+    consequential_user_scope, consequential_claim_obligations,
+    consequential_assessment_schema, consequential_claim_failures,
+)
+from research.public_explanation_targets import (
+    explanation_target_obligations, explanation_target_schema,
+    explanation_target_instruction, explanation_target_failures,
+    explanation_limitation_complete, explanation_literal_target_complete,
+    public_witness_catalog, public_witness_schema, public_witness_instruction,
+    resolve_public_witness_refs,
+)
 from research.public_claim_obligations import (
     admitted_body_sources, build_public_claim_obligations, public_claim_assessment_schema,
     public_claim_failures, public_request_requires_relational_completion,
@@ -106,6 +119,12 @@ class PublicFactualVerificationResult(list):
 
 def _verification_debug_enabled():
     value = str(os.getenv("MAIRON_DEBUG_GENERATION", "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _public_binding_debug_enabled():
+    """Opt in to safe structural records without raw-generation debugging."""
+    value = str(os.getenv("MAIRON_DEBUG_PUBLIC_BINDING", "") or "").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 
@@ -600,6 +619,95 @@ def _live_lookup_capability_contradiction_indexes(packet, user_input, draft_sent
     return flagged
 
 
+def _current_existence_target(user_input):
+    """Project a bounded USER existential/current request, never its answer."""
+    value = re.sub(r"\s+", " ", str(user_input or "").strip())
+    match = re.search(r"\b(?:is|are)\s+there\s+(?:(?:a|an|any)\s+)?"
+                      r"(?:new|latest|current|recent|updated)\s+([^?!;]+)", value, re.I)
+    if not match:
+        return None
+    nominal = re.split(r"\s+(?:out|available|right\s+now|now|today|yet|this\s+(?:week|month))\b",
+                       match.group(1).strip().rstrip('.'), maxsplit=1, flags=re.I)[0].strip()
+    # Compound questions keep their existing scoped semantic completion; do
+    # not pretend one nominal/reference covers several requested subjects.
+    if (not nominal or len(nominal) > 120 or re.search(r"\b(?:and|or|but|when|why|which)\b|,", nominal, re.I)):
+        return None
+    return nominal
+
+
+def _current_existence_answer_complete(packet, user_input, sentences):
+    if (not isinstance(packet, Mapping) or packet.get("freshness_required") is not True) and not re.search(
+            r"\b(?:right\s+now|now|today|currently|latest|current|this\s+(?:week|month))\b", str(user_input or ''), re.I):
+        return True
+    target = _current_existence_target(user_input)
+    if target is None:
+        return True
+    if " ".join(sentences).strip() == build_failed_public_factual_fallback():
+        return True
+    from research.public_explanation_targets import public_role_bridge
+    sources = admitted_body_sources(packet)
+    bodies = tuple(source['content_excerpt'] for source in sources.values()) or ('',)
+    if sentences and all(_producer_limitation(sentence) for sentence in sentences):
+        for sentence in sentences:
+            if re.fullmatch(r"I\s+(?:cannot|can['’]t|could\s+not|couldn['’]t)\s+"
+                            r"(?:verify|confirm|establish|determine)\s+(?:this|that|it)"
+                            r"(?:\s+(?:cleanly|reliably|from\s+(?:the\s+)?available\s+evidence))?[.!]?", sentence, re.I):
+                return True
+            if (any(public_role_bridge(target, sentence, body) for body in bodies)
+                    and re.search(r"\b(?:whether|if)\b[^.!?]*\b(?:new|latest|current|available|released|exists?)\b|"
+                                  r"\b(?:current|latest|newest|recent)\s+(?:release|version|availability|state)\b", sentence, re.I)):
+                return True
+        return False
+    clauses = [clause.strip() for sentence in sentences
+               for clause in re.split(r";|\b(?:but|whereas)\b", str(sentence), flags=re.I) if clause.strip()]
+    for position, sentence in enumerate(clauses):
+        text = str(sentence).strip()
+        if (text.endswith('?') or re.match(r'^["“]|^(?:if|unless|suppose|imagine|try|consider|check)\b', text, re.I)
+                or re.search(r"\b(?:will|would|might|may|could)\b", text, re.I)):
+            continue
+        # A direct yes/no can answer a single binary request without repeating
+        # its nouns. A longer answer still has to carry the current predicate.
+        if re.fullmatch(r"(?:yes|no)[.!]?", text, re.I):
+            return True
+        predicate = re.search(r"\b(?:available|released|published|launched|exists?)\b|"
+                                   r"\bthere\s+(?:is|are|isn['’]t|aren['’]t)\b|"
+                                   r"\b(?:is|are)\s+(?:not\s+)?(?:out|new)\b", text, re.I)
+        if not predicate:
+            continue
+        requested_new = bool(re.search(r"\b(?:new|latest|recent|updated)\b", str(user_input), re.I))
+        if requested_new:
+            # Availability of an old/existing item is not evidence of a new
+            # one. Newness must attach to this proposition, not to advice or
+            # an unrelated side sentence. Fixed historical release alone is
+            # likewise insufficient, even with a current packet envelope.
+            before = text[:predicate.start()]
+            new_nominal = bool(re.search(r"\b(?:new|latest|current|recent|updated)\b", before, re.I))
+            if re.match(r"there\b", predicate.group(), re.I):
+                new_nominal = bool(re.match(r"\s*(?:(?:not|no)\s+)?(?:(?:a|an|any)\s+)?"
+                                           r"(?:new|latest|current|recent|updated)\b", text[predicate.end():], re.I))
+            recent_event = (predicate.group().casefold() in {'released', 'published', 'launched'}
+                            and bool(re.search(r"\b(?:just|recently|today|yesterday|this\s+(?:week|month))\b", text, re.I)))
+            direct_reference = bool(re.match(r"^(?:yes|no)[,!]\s*it\b", text, re.I))
+            if not (new_nominal or recent_event or direct_reference):
+                continue
+        # Bind the subject of THIS availability/existence predicate. A target
+        # named in another clause cannot rescue availability of another item.
+        if re.match(r"there\b", predicate.group(), re.I):
+            subject = re.split(r"\b(?:and|or|because|while)\b|,", text[predicate.end():], maxsplit=1, flags=re.I)[0]
+        else:
+            subject = re.split(r"\b(?:and|or|because|while|says|states|reports)\b|,", text[:predicate.start()], flags=re.I)[-1]
+        bound = any(public_role_bridge(target, subject, body) for body in bodies)
+        reference = re.match(r"^(?:(?:yes|no)[,!]\s*)?(?:it\b|(?:a|the|this|that)\s+(?:new\s+)?one\b)", text, re.I)
+        if reference and position > 0:
+            previous_head = re.split(r"\b(?:is|are|was|were|has|have|supports?|offers?|provides?)\b",
+                                     str(clauses[position - 1]), maxsplit=1, flags=re.I)[0]
+            reference = (not re.search(r"\b(?:and|or)\b|,", previous_head, re.I)
+                         and any(public_role_bridge(target, previous_head, body) for body in bodies))
+        if bound or reference:
+            return True
+    return False
+
+
 def _current_lookup_answer_integrity_indexes(packet, user_input, draft_sentences):
     """Require a live identification lookup to actually identify the requested thing."""
     if not isinstance(packet, dict) or not packet.get("sources"):
@@ -617,6 +725,8 @@ def _current_lookup_answer_integrity_indexes(packet, user_input, draft_sentences
     metadata = re.sub(r"\s+", " ", " ".join(metadata_parts))
 
     flagged = set()
+    if not _current_existence_answer_complete(packet, user_input, draft_sentences):
+        flagged.update(range(1, len(draft_sentences) + 1))
 
     # "What is the latest/current version of X?" must contain a concrete
     # source-supported version identifier rather than model-cutoff prose or a
@@ -834,6 +944,70 @@ def _public_explanation_requested(user_input):
     ))
 
 
+def _public_explanation_obligations(user_input, core_answer_contract, packet,
+                                   consequential_active=False):
+    """Bind only the immediate public-factual Core contract, never draft origin.
+
+    Other callers of the legacy source verifier include approved background
+    research. They retain their separate contracts and are not migrated here.
+    """
+    from core.answer_contract_runtime import coerce_answer_contract_runtime
+
+    contract = coerce_answer_contract_runtime(core_answer_contract)
+    if (contract is None or consequential_active
+            or contract.intent != "factual_question"
+            or contract.authority != "public_web"
+            or contract.epistemic_mode != "public_source_verified"
+            or not isinstance(packet, Mapping)
+            or packet.get("research_kind") != "public_factual"):
+        return ()
+    return explanation_target_obligations(user_input)
+
+
+def _public_explanation_limitation_complete(obligations, sentences):
+    # A transparent first-person limitation can be checked without inventing a
+    # new semantic call. The helper permits only bounded identity/citation
+    # scaffolding alongside that limitation, never arbitrary factual tails.
+    return bool(obligations and sentences
+                and any(_producer_limitation(sentence) for sentence in sentences)
+                and explanation_limitation_complete(obligations, sentences))
+
+
+def _composed_public_verifier_protocol(schema, sentence_count, claim_count, target_count):
+    """One bounded response contract for independently numbered protocols.
+
+    Core supplies counts. These constraints never supply a verdict or allow a
+    missing array to be inferred from the global answer's status.
+    """
+    composed = copy.deepcopy(schema)
+    counts = {"sentence_assessments": sentence_count,
+              "claim_assessments": claim_count,
+              "explanation_target_assessments": target_count}
+    for name, count in counts.items():
+        array = composed["properties"][name]
+        array["minItems"] = array["maxItems"] = count
+        array["items"]["properties"]["index"]["maximum"] = count
+    instruction = (
+        "\nCOMPOSED VERIFIER RESPONSE CONTRACT:\n"
+        "Return one JSON object with ALL required root keys: "
+        + ", ".join(composed["required"])
+        + ". Do not merge or substitute the independently numbered arrays. "
+        "sentence_assessments indices refer to draft sentences; claim_assessments "
+        "indices refer to Core content obligations; explanation_target_assessments "
+        "indices refer to Core request targets. Each index occurs exactly once in "
+        "its own array. A negative verdict still requires complete arrays.\n"
+        "claim_assessments entries have exactly index, supported, source_id, source_quote. "
+        "Do not place target-binding flags or candidate quotes inside them. "
+        "explanation_target_assessments entries have exactly index, outcome, "
+        "mechanism_bound, effect_bound, relationship_answered, mechanism_quote, "
+        "effect_quote, answer_quote, source_id, source_quote. Do not replace target "
+        "flags with a claim supported field. Each literal body witness must support "
+        "its own obligation; a global positive cannot fill either missing assessment.\n"
+        "EXACT ARRAY COUNTS: " + json.dumps(counts) + "\n"
+    )
+    return composed, instruction
+
+
 def _public_advice_only_completion(user_input, sentences):
     """Reject an unmistakable advice-only answer to an explanation request.
 
@@ -993,6 +1167,9 @@ def verify_public_factual_draft(
     draft,
     research_evidence,
     authority_context=None,
+    consequential_domain=None,
+    user_conversation=None,
+    core_answer_contract=None,
 ):
     """Verify a public factual answer only against Core's retrieved evidence."""
 
@@ -1001,8 +1178,26 @@ def verify_public_factual_draft(
 
     packet = _extract_json_object(research_evidence) or {}
     draft_sentences = _split_draft_sentences(draft)
-    claim_obligations = build_public_claim_obligations(draft_sentences)
     identity_date_obligations = public_identity_date_obligations(draft_sentences)
+    # Eligibility belongs to Core's serious-answer contract/current task, not
+    # candidate origin, source nationality, or a list of known payment rails.
+    consequential_active = bool(consequential_domain) or assess_consequential_advice(user_input).is_consequential
+    explanation_obligations = _public_explanation_obligations(
+        user_input, core_answer_contract, packet, consequential_active,
+    )
+    claim_obligations = build_public_claim_obligations(
+        draft_sentences, explanation_obligations=explanation_obligations, evidence_packet=packet,
+    )
+    target_assessment_required = bool(explanation_obligations) and not _public_explanation_limitation_complete(
+        explanation_obligations, draft_sentences,
+    ) and not explanation_literal_target_complete(explanation_obligations, draft_sentences, packet)
+    witness_catalog = (public_witness_catalog(explanation_obligations, draft_sentences, packet)
+                       if target_assessment_required and any(item.get("relation_type") == "purpose_or_necessity"
+                                                           for item in explanation_obligations) else None)
+    consequential_obligations = (consequential_claim_obligations(draft_sentences)
+                                 if consequential_active else ())
+    user_applicability = (consequential_user_scope(user_input, user_conversation)
+                          if consequential_active else {})
     source_property_indexes = _public_source_property_indexes(authority_context, draft_sentences)
     source_property_exclusions = set().union(*source_property_indexes.values()) if source_property_indexes else set()
 
@@ -1166,6 +1361,31 @@ def verify_public_factual_draft(
             + json.dumps(tuple(admitted_body_sources(packet)), ensure_ascii=False)
         )
 
+    if consequential_obligations:
+        system_text += (
+            "\nCORE CONSEQUENTIAL APPLICABILITY OBLIGATIONS:\n"
+            "Core independently detected concrete procedure/time/exclusivity propositions. "
+            "Return exactly one consequential_assessment per obligation. Positive global or "
+            "sentence verdicts cannot erase these obligations. For supported=true provide one "
+            "source_id and a literal source_quote (at most 800 characters) from that same admitted "
+            "source's content_excerpt entailing the complete procedure, actor direction, numeric "
+            "time relation or absolute outcome. Titles, snippets, URLs and another source cannot "
+            "supply a missing witness. Judge the action and its USER applicability separately: "
+            "retrieval from a provider/country does not establish that it is Oliver's provider/country. "
+            "No known USER scope means concrete local/provider-specific procedure is unestablished; "
+            "use supported=false, null source_id and null source_quote. Do not fill scope from model "
+            "memory or candidate prose. Generic promptly contacting the relevant sending provider "
+            "through official support is not a guarantee, deadline or specific recovery power.\n"
+            + json.dumps(consequential_obligations, ensure_ascii=False)
+            + "\nCORE USER-AUTHORED APPLICABILITY (unknown dimensions omitted): "
+            + json.dumps(user_applicability, ensure_ascii=False)
+            + "\nADMITTED BODY SOURCE IDENTIFIERS: "
+            + json.dumps(tuple(admitted_body_sources(packet)), ensure_ascii=False)
+        )
+
+    if target_assessment_required:
+        system_text += explanation_target_instruction(explanation_obligations, packet)
+
     messages = [
         {"role": "system", "content": system_text},
         {"role": "user", "content": "OLIVER'S CURRENT MESSAGE:\n" + str(user_input)},
@@ -1192,15 +1412,46 @@ def verify_public_factual_draft(
                 len(draft_sentences)
                 * 24
                 + len(claim_obligations) * 220
+                + len(consequential_obligations) * 220
+                + (len(explanation_obligations) * 440 if target_assessment_required else 0)
             ),
         ),
     )
 
+    verifier_schema = (public_claim_assessment_schema(PUBLIC_FACTUAL_VERIFIER_RESPONSE_SCHEMA)
+                       if claim_obligations else PUBLIC_FACTUAL_VERIFIER_RESPONSE_SCHEMA)
+    if consequential_obligations:
+        verifier_schema = consequential_assessment_schema(verifier_schema)
+    if target_assessment_required:
+        verifier_schema = explanation_target_schema(verifier_schema)
+    if target_assessment_required and claim_obligations:
+        verifier_schema, response_instruction = _composed_public_verifier_protocol(
+            verifier_schema, len(draft_sentences), len(claim_obligations), len(explanation_obligations),
+        )
+        # The base-only example omitted both scoped arrays. The actual composed
+        # schema is the single response contract whenever both apply.
+        before, marker, remainder = system_text.partition("Return JSON ONLY in this shape:\n")
+        if marker:
+            closing = remainder.find("\n}\n")
+            if closing >= 0:
+                system_text = before + "Return JSON ONLY using the composed schema.\n" + remainder[closing + 3:]
+        system_text += response_instruction
+        messages[0]["content"] = system_text
+        # Account explicitly for two body-witness protocols within the existing
+        # bounded verifier call and unchanged 2400-token ceiling.
+        verifier_num_predict = min(2400, max(verifier_num_predict,
+            256 + len(draft_sentences) * 32 + len(claim_obligations) * 280
+            + len(explanation_obligations) * 640))
+
+    if witness_catalog:
+        verifier_schema = public_witness_schema(verifier_schema, witness_catalog)
+        system_text += public_witness_instruction(witness_catalog)
+        messages[0]["content"] = system_text
+
     verifier_kwargs = {
         "model": model,
         "messages": messages,
-        "format": (public_claim_assessment_schema(PUBLIC_FACTUAL_VERIFIER_RESPONSE_SCHEMA)
-                   if claim_obligations else PUBLIC_FACTUAL_VERIFIER_RESPONSE_SCHEMA),
+        "format": verifier_schema,
         "options": {
             "temperature": 0,
             "num_predict": verifier_num_predict,
@@ -1215,6 +1466,8 @@ def verify_public_factual_draft(
     result = client.chat(**verifier_kwargs)
     verifier_content = str(result.message.content or "")
     parsed = _extract_json_object(verifier_content)
+    if witness_catalog and parsed:
+        parsed = resolve_public_witness_refs(parsed, witness_catalog)
 
     if not parsed:
         if _verification_debug_enabled():
@@ -1285,6 +1538,10 @@ def verify_public_factual_draft(
     )
     for index, reasons in public_identity_date_failures(identity_date_obligations, packet).items():
         content_claim_failures.setdefault(index, set()).update(reasons)
+    for index, reasons in consequential_claim_failures(
+            consequential_obligations, parsed.get("consequential_assessments"),
+            packet, user_applicability).items():
+        content_claim_failures.setdefault(index, set()).update(reasons)
 
     cleaned_claims = []
     for claim in claims[:6]:
@@ -1299,6 +1556,25 @@ def verify_public_factual_draft(
 
     if _public_advice_only_completion(user_input, draft_sentences):
         violations.append("public factual explanation request received advice without an explanation")
+    if target_assessment_required:
+        target_failures = explanation_target_failures(
+            explanation_obligations, parsed.get("explanation_target_assessments"),
+            draft_sentences, packet,
+        )
+        violations.extend(
+            "public factual explanation target incomplete: " + code
+            for code in target_failures
+        )
+        if target_failures and _public_binding_debug_enabled():
+            try:
+                from research.public_explanation_targets import explanation_target_diagnostics
+                for record in explanation_target_diagnostics(
+                        explanation_obligations, parsed.get("explanation_target_assessments"),
+                        draft_sentences, packet):
+                    print("[Grounding] Explanation target diagnostic: " + json.dumps(record, sort_keys=True))
+            except Exception:
+                # Observability cannot change sentence support or publication.
+                pass
 
     for index, reasons in sorted(content_claim_failures.items()):
         violations.append("public factual content obligation unsupported: " + ",".join(sorted(reasons))
@@ -1384,6 +1660,7 @@ def verify_public_factual_draft(
             and index not in live_lookup_capability_indexes
             and index not in current_lookup_answer_indexes
             and index not in consequential_specific_procedure_indexes
+            and index not in consequential_unresolved_scope_indexes
             and index not in source_property_exclusions
             and index not in content_claim_failures
         )
@@ -1420,6 +1697,10 @@ def verify_public_factual_draft(
                 "claim_obligations": claim_obligations,
                 "claim_assessments": parsed.get("claim_assessments", []),
                 "identity_date_obligations": identity_date_obligations,
+                "consequential_obligations": consequential_obligations,
+                "consequential_assessments": parsed.get("consequential_assessments", []),
+                "explanation_target_obligations": explanation_obligations,
+                "explanation_target_assessments": parsed.get("explanation_target_assessments", []),
             }
         except Exception:
             # A failed metadata snapshot leaves support unproven in shadow only.
@@ -1494,6 +1775,66 @@ def requires_public_factual_salvage_completion(
         return True
 
 
+def _public_subset_authority_failures(sentences, authority_context, freshness_required, outcome,
+                                     *, user_input=None, packet=None):
+    """Deletion cannot discard Core's retained source/current-state authority.
+
+    The existing completion call still judges the requested proposition. These
+    independent checks cannot establish entailment, but a positive completion
+    verdict cannot turn conditional advice or an unverified current state into
+    a factual answer. Older partial envelopes are not invented as full source
+    snapshots; real versioned envelopes retain the exact full-draft rules.
+    """
+    failures = []
+    canonical_limitation = (outcome == "bounded_limitation"
+                            and " ".join(sentences).strip() == build_failed_public_factual_fallback())
+    actual_snapshot = (isinstance(authority_context, Mapping)
+                       and authority_context.get("version") == 1)
+    if actual_snapshot and not canonical_limitation:
+        properties = _public_source_property_indexes(authority_context, sentences)
+        if properties:
+            failures.append("public factual sentence salvage retained an unsupported source property")
+    if not freshness_required:
+        return failures
+    if outcome == "bounded_limitation":
+        from core.acceptance_public import _citation_identity
+        limited = [_producer_limitation(sentence) for sentence in sentences]
+        if (canonical_limitation or any(limited) and all(
+                bounded or _citation_identity(sentence)
+                for sentence, bounded in zip(sentences, limited))
+                and _current_existence_answer_complete(packet, user_input,
+                                                      [sentence for sentence, bounded in zip(sentences, limited) if bounded])):
+            return failures
+        return failures + ["public factual sentence salvage did not retain a bounded current-state limitation"]
+    if actual_snapshot:
+        required_date = authority_context.get("required_current_as_of")
+        current = any(isinstance(source, Mapping)
+                      and source.get("read_success") is True
+                      and source.get("accepted_as_evidence") is True
+                      and source.get("currentness_established") is True
+                      and (not required_date or source.get("current_as_of") == required_date)
+                      for source in authority_context.get("sources", ()))
+        if not current:
+            failures.append("public factual sentence salvage lacks verified current-state authority")
+    # A conditional consequence or suggested action does not answer a current
+    # factual predicate, even when the source supports that advice perfectly.
+    # This is assertion scope, not a topic-keyword or domain-specific test.
+    factual = []
+    for sentence in sentences:
+        text = str(sentence).strip()
+        if (not text or text.endswith("?")
+                or re.match(r'^["“]|^(?:if|unless|suppose|imagine|try|consider|check|contact|ask|'
+                            r'you\s+(?:can|could|should|might|may)\b)', text, re.I)
+                or re.search(r"\b(?:might|may|could)\s+(?:want|wish)\s+to\b", text, re.I)):
+            continue
+        factual.append(text)
+    if not factual:
+        failures.append("public factual sentence salvage did not retain the requested current predicate")
+    if not _current_existence_answer_complete(packet, user_input, sentences):
+        failures.append("public factual sentence salvage did not bind the requested current target")
+    return list(dict.fromkeys(failures))
+
+
 def verify_public_factual_salvage_completion(
     client,
     model,
@@ -1526,6 +1867,20 @@ def verify_public_factual_salvage_completion(
         )
         if not str(user_input or "").strip() or not str(draft or "").strip():
             return failure
+        explanation_obligations = _public_explanation_obligations(
+            user_input, contract, packet,
+        )
+        subset_sentences = _split_draft_sentences(draft)
+        target_assessment_required = bool(explanation_obligations) and not _public_explanation_limitation_complete(
+            explanation_obligations, subset_sentences,
+        ) and not explanation_literal_target_complete(explanation_obligations, subset_sentences, packet)
+        completion_schema = (explanation_target_schema(PUBLIC_FACTUAL_COMPLETION_RESPONSE_SCHEMA)
+                             if target_assessment_required else PUBLIC_FACTUAL_COMPLETION_RESPONSE_SCHEMA)
+        witness_catalog = (public_witness_catalog(explanation_obligations, subset_sentences, packet)
+                           if target_assessment_required and any(item.get("relation_type") == "purpose_or_necessity"
+                                                               for item in explanation_obligations) else None)
+        if witness_catalog:
+            completion_schema = public_witness_schema(completion_schema, witness_catalog)
         contract_state = {
             "task": contract.task,
             "intent": contract.intent,
@@ -1586,16 +1941,23 @@ def verify_public_factual_salvage_completion(
             {"role": "system", "content": json.dumps(packet) if isinstance(research_evidence, Mapping) else str(research_evidence)},
             {"role": "user", "content": "RETAINED VERIFIER-SUPPORTED SUBSET:\n" + str(draft)},
         ]
+        if target_assessment_required:
+            messages.insert(1, {"role": "system", "content": explanation_target_instruction(
+                explanation_obligations, packet,
+            )})
+        if witness_catalog:
+            messages.insert(1, {"role": "system", "content": public_witness_instruction(witness_catalog)})
         authority_instruction = build_public_factual_generation_instruction(authority_context)
         if authority_instruction:
             messages.insert(2, {"role": "system", "content": authority_instruction})
         kwargs = {
             "model": model,
             "messages": messages,
-            "format": PUBLIC_FACTUAL_COMPLETION_RESPONSE_SCHEMA,
+            "format": completion_schema,
             "options": {
                 "temperature": 0,
-                "num_predict": min(2400, max(320, 180 + len(claims) * 24)),
+                "num_predict": min(2400, max(320, 180 + len(claims) * 24
+                                             + (len(explanation_obligations) * 440 if target_assessment_required else 0))),
                 "num_ctx": 12288,
             },
         }
@@ -1604,7 +1966,9 @@ def verify_public_factual_salvage_completion(
             kwargs["think"] = think_setting
         result = client.chat(**kwargs)
         parsed = _extract_json_object(result.message.content)
-        expected_keys = set(PUBLIC_FACTUAL_COMPLETION_RESPONSE_SCHEMA["required"])
+        if witness_catalog and parsed:
+            parsed = resolve_public_witness_refs(parsed, witness_catalog)
+        expected_keys = set(completion_schema["required"])
         if not isinstance(parsed, dict) or set(parsed) != expected_keys:
             return failure
         completed, outcome = parsed["completed"], parsed["outcome"]
@@ -1635,10 +1999,17 @@ def verify_public_factual_salvage_completion(
                              and outcome != "incomplete" and not violations)
         if completed != expected_complete:
             return failure
+        if target_assessment_required and explanation_target_failures(
+                explanation_obligations, parsed.get("explanation_target_assessments"),
+                subset_sentences, packet):
+            return ["public factual sentence salvage did not bind the requested explanation target"]
         if (not completed or _public_advice_only_completion(
                 user_input, _split_draft_sentences(draft))):
             return ["public factual sentence salvage did not complete the requested answer"]
-        return []
+        return _public_subset_authority_failures(
+            subset_sentences, authority_context, freshness_required, outcome,
+            user_input=user_input, packet=packet,
+        )
     except Exception:
         # Completion infrastructure failure must not publish a side sentence.
         # The provider retains its existing bounded retry/fallback policy.

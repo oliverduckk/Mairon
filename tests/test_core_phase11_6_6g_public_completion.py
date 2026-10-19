@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -19,15 +20,59 @@ from research.public_factual_grounding import (
     verify_public_factual_draft, verify_public_factual_salvage_completion,
 )
 from test_core_phase11_6_6c_public_content_authority import (
-    Client, packet, verdict, witnesses,
+    Client as _LegacyClient, packet, verdict, witnesses,
 )
 
 USER = "Why does the relay buzz when the supply changes?"
 ADVICE = "Try changing the setting or updating the controller if it persists."
-EXPLANATION = "Intermittent contact interrupts power because the connection briefly opens."
+EXPLANATION = "Stepped input can produce acoustic oscillation because the contact briefly opens."
+SOURCE_BODY = ("The supply change is also called stepped input. "
+               "The relay buzz is also called acoustic oscillation. " + EXPLANATION)
 LIMITATION = "I cannot verify why the relay buzzes from the available evidence."
 CONTRACT = AnswerContractRuntime(intent="factual_question", authority="public_web",
                                 epistemic_mode="public_source_verified")
+
+
+def _fixture_target_assessments(kwargs):
+    """Follow the requested structured schema without another model call."""
+    content = kwargs["messages"][-1]["content"]
+    if content.startswith("PROPOSED MAIRON DRAFT TO VERIFY, NUMBERED BY CORE:\n"):
+        numbered = content.split("\n", 1)[1]
+        candidate = " ".join(re.sub(r"^S\d+:\s*", "", line)
+                             for line in numbered.splitlines())
+    else:
+        candidate = content.split("\n", 1)[1]
+    if EXPLANATION in candidate:
+        return [{"index": 1, "outcome": "factual_explanation", "mechanism_bound": True,
+                 "effect_bound": True, "relationship_answered": True,
+                 "mechanism_quote": "Stepped input", "effect_quote": "acoustic oscillation",
+                 "answer_quote": EXPLANATION, "source_id": "S1", "source_quote": SOURCE_BODY}]
+    return [{"index": 1, "outcome": "incomplete", "mechanism_bound": False,
+             "effect_bound": False, "relationship_answered": False,
+             "mechanism_quote": None, "effect_quote": None, "answer_quote": None,
+             "source_id": None, "source_quote": None}]
+
+
+def _align_fixture_payload(value, kwargs):
+    if "explanation_target_assessments" not in kwargs.get("format", {}).get("required", ()):
+        return value
+    # Deliberately malformed verifier fixtures remain malformed.
+    if not isinstance(value, dict) or not (
+        {"supported", "sentence_assessments"} <= value.keys()
+        or {"completed", "outcome", "request_fulfilled", "required_claim_assessments", "violations"} <= value.keys()
+    ):
+        return value
+    result = dict(value)
+    result["explanation_target_assessments"] = _fixture_target_assessments(kwargs)
+    return result
+
+
+class Client(_LegacyClient):
+    def chat(self, **kwargs):
+        result = super().chat(**kwargs)
+        value = json.loads(result.message.content)
+        result.message.content = json.dumps(_align_fixture_payload(value, kwargs))
+        return result
 
 
 def completion(*, fulfilled=True, outcome="factual_answer"):
@@ -36,7 +81,7 @@ def completion(*, fulfilled=True, outcome="factual_answer"):
             "violations": [] if fulfilled else ["incomplete_request"]}
 
 
-def verify(text, current=USER, body=EXPLANATION, response=None):
+def verify(text, current=USER, body=SOURCE_BODY, response=None):
     sentences = _split_draft_sentences(text)
     claims = []
     for sentence in sentences:
@@ -46,7 +91,7 @@ def verify(text, current=USER, body=EXPLANATION, response=None):
             claims.append(item)
     client = Client(response or verdict(len(sentences), claims=claims if claims else None))
     result = verify_public_factual_draft(client, "replaceable-model", current, text,
-                                        json.dumps(packet(body)))
+                                        json.dumps(packet(body)), core_answer_contract=CONTRACT)
     return result, client
 
 
@@ -143,33 +188,33 @@ class PublicExplanationCompletionTests(unittest.TestCase):
     def test_completion_positive_cannot_authorize_advice_only_subset(self):
         client = Client(completion())
         result = verify_public_factual_salvage_completion(client, "replaceable-model", USER,
-                    ADVICE, CONTRACT, json.dumps(packet(EXPLANATION)))
+                    ADVICE, CONTRACT, json.dumps(packet(SOURCE_BODY)))
         self.assertTrue(result)
         self.assertEqual(len(client.calls), 1, "existing bounded completion call schedule is retained")
 
     def test_completion_positive_can_accept_supported_explanation_subset(self):
         client = Client(completion())
         result = verify_public_factual_salvage_completion(client, "replaceable-model", USER,
-                    EXPLANATION + " " + ADVICE, CONTRACT, json.dumps(packet(EXPLANATION)))
+                    EXPLANATION + " " + ADVICE, CONTRACT, json.dumps(packet(SOURCE_BODY)))
         self.assertFalse(result)
         self.assertEqual(len(client.calls), 1)
 
     def test_completion_positive_can_accept_truthful_limitation_subset(self):
         client = Client(completion(outcome="bounded_limitation"))
         result = verify_public_factual_salvage_completion(client, "replaceable-model", USER,
-                    LIMITATION, CONTRACT, json.dumps(packet(EXPLANATION)))
+                    LIMITATION, CONTRACT, json.dumps(packet(SOURCE_BODY)))
         self.assertFalse(result)
 
     def test_negative_completion_remains_rejected(self):
         client = Client(completion(fulfilled=False, outcome="incomplete"))
         result = verify_public_factual_salvage_completion(client, "replaceable-model", USER,
-                    EXPLANATION, CONTRACT, json.dumps(packet(EXPLANATION)))
+                    EXPLANATION, CONTRACT, json.dumps(packet(SOURCE_BODY)))
         self.assertTrue(result)
 
     def test_malformed_completion_remains_fail_closed(self):
         client = Client({"completed": True})
         result = verify_public_factual_salvage_completion(client, "replaceable-model", USER,
-                    ADVICE, CONTRACT, json.dumps(packet(EXPLANATION)))
+                    ADVICE, CONTRACT, json.dumps(packet(SOURCE_BODY)))
         self.assertTrue(result)
 
     def test_unsupported_explanation_is_not_rescued_by_structural_completeness(self):

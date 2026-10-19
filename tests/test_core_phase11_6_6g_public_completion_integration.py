@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 import copy
 import io
 import json
+import re
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -25,7 +26,9 @@ from research.public_factual_research import actual_read_url, build_public_factu
 
 USER = "Why does the relay buzz when the supply changes?"
 ADVICE = "Try inspecting the connector or changing the current limit."
-EXPLANATION = "Intermittent contact interrupts power because the connection briefly opens."
+EXPLANATION = "Stepped input can produce acoustic oscillation because the contact briefly opens."
+SOURCE_BODY = ("The supply change is also called stepped input. "
+               "The relay buzz is also called acoustic oscillation. " + EXPLANATION)
 LIMITATION = "I cannot verify why the relay buzzes from the available evidence."
 BAD = "The relay buzzes because the latch is permanently damaged."
 
@@ -52,6 +55,40 @@ def claim_results(*items):
     return result
 
 
+def _fixture_target_assessments(kwargs):
+    """Follow the requested structured schema without another model call."""
+    content = kwargs["messages"][-1]["content"]
+    if content.startswith("PROPOSED MAIRON DRAFT TO VERIFY, NUMBERED BY CORE:\n"):
+        numbered = content.split("\n", 1)[1]
+        candidate = " ".join(re.sub(r"^S\d+:\s*", "", line)
+                             for line in numbered.splitlines())
+    else:
+        candidate = content.split("\n", 1)[1]
+    if EXPLANATION in candidate:
+        return [{"index": 1, "outcome": "factual_explanation", "mechanism_bound": True,
+                 "effect_bound": True, "relationship_answered": True,
+                 "mechanism_quote": "Stepped input", "effect_quote": "acoustic oscillation",
+                 "answer_quote": EXPLANATION, "source_id": "S1", "source_quote": SOURCE_BODY}]
+    return [{"index": 1, "outcome": "incomplete", "mechanism_bound": False,
+             "effect_bound": False, "relationship_answered": False,
+             "mechanism_quote": None, "effect_quote": None, "answer_quote": None,
+             "source_id": None, "source_quote": None}]
+
+
+def _align_fixture_payload(value, kwargs):
+    if "explanation_target_assessments" not in kwargs.get("format", {}).get("required", ()):
+        return value
+    # Deliberately malformed verifier fixtures remain malformed.
+    if not isinstance(value, dict) or not (
+        {"supported", "sentence_assessments"} <= value.keys()
+        or {"completed", "outcome", "request_fulfilled", "required_claim_assessments", "violations"} <= value.keys()
+    ):
+        return value
+    result = dict(value)
+    result["explanation_target_assessments"] = _fixture_target_assessments(kwargs)
+    return result
+
+
 class PublicClient:
     def __init__(self, drafts, verifications, completions=()):
         self.drafts=iter(drafts)
@@ -68,17 +105,17 @@ class PublicClient:
             value=next(self.completions)
             if isinstance(value,Exception):
                 raise value
-            content=json.dumps(value)
+            content=json.dumps(_align_fixture_payload(value, kwargs))
         elif "INTERNAL public-factual evidence verifier" in system:
             self.verifier_calls+=1
-            content=json.dumps(next(self.verifications))
+            content=json.dumps(_align_fixture_payload(next(self.verifications), kwargs))
         else:
             self.generations+=1
             content=next(self.drafts)
         return SimpleNamespace(message=SimpleNamespace(content=content,tool_calls=[]),done_reason="stop")
 
 
-def run(client, current=USER, body=EXPLANATION+" "+ADVICE):
+def run(client, current=USER, body=SOURCE_BODY+" "+ADVICE):
     retained=copy.deepcopy(research())
     retained["query"]=retained["original_query"]="relay supply behaviour"
     retained["sources"][0]["title"]="Relay maintenance guide"

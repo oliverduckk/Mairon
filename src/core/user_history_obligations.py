@@ -117,7 +117,7 @@ def _durations(value: str) -> tuple[tuple[str, str, str, str], ...]:
     return tuple(result)
 
 
-def _scope(clause: str, start: int, quote_prefix: str = "") -> str:
+def _scope(clause: str, start: int, quote_prefix: str = "", *, conversational_hedge=False) -> str:
     prefix = clause[:start]
     quoted_prefix = quote_prefix + prefix
     for quote in ('"', "`"):
@@ -127,7 +127,10 @@ def _scope(clause: str, start: int, quote_prefix: str = "") -> str:
         return "quoted"
     if clause.rstrip().endswith("?") and not re.search(r",?\s+(?:then|huh|right|eh)\?$", clause, re.I):
         return "questioned"
-    if re.search(r"\b(?:if|unless|suppose|supposing|hypothetically)\b", clause, re.I):
+    # An assistant's discourse hedge does not make an embedded USER premise
+    # hypothetical. An actual 'suppose you ...' or 'I suppose if ...' still does.
+    scoped = re.sub(r"\bi\s+suppose(?:\s+that)?\b", "I think", clause, flags=re.I) if conversational_hedge else clause
+    if re.search(r"\b(?:if|unless|suppose|supposing|hypothetically)\b", scoped, re.I):
         return "conditional"
     if re.search(r"\b(?:might|could|would|may)\b", clause, re.I):
         return "hedged"
@@ -160,6 +163,131 @@ def _owned_items(value: str, speaker: str) -> tuple[str, ...]:
         if key not in keys:
             keys.append(key)
     return tuple(keys)
+
+
+def _object_event_projections(clause: str, speaker: str, quote_prefix: str = "", *, owned_items=()) -> tuple[dict[str, Any], ...]:
+    """Project a concrete item's repeated-event premise, not a future event.
+
+    'Less likely to be misplaced again' still claims a previous misplacement.
+    The object, event and bounded location must come from USER history; its
+    present existence/location is not that history. No event is inferred from
+    the candidate's object description, and unresolved pronouns stay unresolved.
+    """
+    subject = "i" if speaker == "user" else "you"
+    possessive = "my" if speaker == "user" else "your"
+    event = r"(?:left|lost|forgot|forgotten|leave|lose|forget|[a-z]+ed)"
+    passive = re.compile(r"\b(?:be|been|being|is|was|were)\s+(?:not\s+|never\s+)?"
+                         r"(?P<event>" + event + r")\b(?P<tail>[^.;!?]{0,120})", re.I)
+    active = re.compile(r"\b" + subject + r"(?:'ve|'d|'ll)?\s+"
+                        r"(?P<prefix>(?:(?:have|had|did|didn't|will|have\s+not|had\s+not|not|never|once|previously|already|just)\s+)*)"
+                        r"(?P<event>" + event + r")\s+(?P<tail>[^.;!?]{1,140})", re.I)
+    result = []
+
+    def object_fields(value):
+        value = value.strip(" ,")
+        if re.fullmatch(r"(?:it|this|that)", value, re.I):
+            return owned_items[0] if len(owned_items) == 1 else "unresolved_item"
+        value = re.sub(r"^(?:my|your|the|this|that|a|an)\s+", "", value, flags=re.I)
+        keys = _key(value, speaker)
+        return "@user:" + " ".join(keys) if keys and len(keys) <= 4 else "unresolved_item"
+
+    def emit(match, object_text, arguments, *, negative=False):
+        recurring = bool(re.search(r"\bagain\b", match.group(0), re.I))
+        # A candidate 'again' introduces an earlier occurrence. A literal USER
+        # past event can supply that occurrence without saying it happened twice.
+        if speaker == "assistant" and not recurring:
+            return
+        scoped = clause[:match.end()] + ("?" if clause.rstrip().endswith("?") else "")
+        mode = _scope(scoped, match.start(), quote_prefix,
+                      conversational_hedge=speaker == "assistant")
+        if mode == "future" and recurring:
+            mode = "presupposed"
+        if speaker == "user" and re.search(r"\bwill\b|'ll\b", match.group(0), re.I):
+            return
+        arguments = re.sub(r"\b(?:again|before|once|previously|already|just)\b", "", arguments, flags=re.I)
+        arguments = re.split(r",|\b(?:and|but|which|so|because|while)\b", arguments, maxsplit=1, flags=re.I)[0]
+        arguments = re.sub(r"\s+(?:now|anymore)$", "", arguments.strip(), flags=re.I)
+        predicate = _lemma(match.group("event"))
+        # Passive 'left behind' and active 'left X behind' retain the same
+        # predicate complement. No location or action synonym is invented.
+        event_key = (predicate,) + _key(arguments, speaker)
+        result.append({"kind": "object_prior_event", "span": match.group(0),
+                       "body": match.group(0), "mode": mode, "start": match.start(), "end": match.end(),
+                       "subject": object_fields(object_text),
+                       "extra": {"event_key": event_key, "content_tokens": event_key,
+                                 "activity_anchor": predicate, "polarity": "negative" if negative else "positive"}})
+
+    for match in passive.finditer(clause):
+        if speaker == "assistant" and not re.search(r"\bagain\b", match.group("tail"), re.I):
+            continue
+        before = clause[:match.start()]
+        antecedents = list(re.finditer(
+            r"\b(?P<object>(?:the|this|that|" + possessive + r")\s+[a-z][a-z-]*(?:\s+[a-z][a-z-]*){0,3}?)"
+            r"(?:\s+(?:is|was|were|has|had|will|now|still|sits?|holds?|rests?|lies?)\b|\s*$)", before, re.I))
+        # A generic plural/indefinite example ('items can be repaired again')
+        # is not a personal-world event. Only a concrete definite/owned item
+        # or a bounded referential pronoun enters this small projection.
+        if not antecedents and not re.search(r"\b(?:it|this|that)\s+(?:is|was|were|will|can|could|might|may)\b", before, re.I):
+            continue
+        object_text = antecedents[-1].group("object") if antecedents else "it"
+        emit(match, object_text, match.group("tail"),
+             negative=bool(re.search(r"\b(?:not|never)\b", match.group(0)[:match.start("event") - match.start()], re.I)))
+    for match in active.finditer(clause):
+        tail = match.group("tail")
+        if match.group("event").lower() in {"leave", "lose", "forget"} and not re.search(
+                r"\b(?:did|didn't|never|will)\b|'ll\b", match.group(0), re.I):
+            continue
+        nominal = re.match(r"(?P<object>(?:(?:my|your|the|this|that|a|an)\s+)?[a-z][a-z-]*(?:\s+[a-z][a-z-]*){0,3}?)(?=\s+(?:in|on|at|behind|under|beside|again|before|once|previously)\b|$)", tail, re.I)
+        if nominal is not None:
+            emit(match, nominal.group("object"), tail[nominal.end():],
+                 negative=bool(re.search(r"\b(?:not|never|didn't)\b", match.group("prefix"), re.I)))
+    return tuple(result)
+
+
+def _object_condition_projections(clause: str, speaker: str, quote_prefix: str = "") -> tuple[dict[str, Any], ...]:
+    """A possessive participial modifier still predicates an item's state.
+
+    'Your mislabelled cables' is not merely an object reference: it presents
+    mislabelling as real. Project the same bounded state from USER adjectival
+    or copular forms, retaining object identity and polarity. This supplies
+    neither the event's cause nor an invented previous event or duration.
+    """
+    possessive = "my" if speaker == "user" else "your"
+    condition = r"(?:[a-z]{3,}ed|lost|broken|torn|stolen|forgotten|bent)"
+    adjective = re.compile(
+        r"\b" + possessive + r"\s+(?P<condition>" + condition + r")\s+"
+        r"(?P<object>[a-z][a-z-]*(?:\s+[a-z][a-z-]*){0,2}?)"
+        r"(?=\s+(?:is|are|was|were|has|have|had|will|would|can|could|might|may|"
+        r"in|on|at|inside|outside|under|beside|before|after|because|and|but)\b|[,.;!?]|$)", re.I,
+    )
+    copular = re.compile(
+        r"\b" + possessive + r"\s+(?P<object>[a-z][a-z-]*(?:\s+[a-z][a-z-]*){0,2}?)\s+"
+        r"(?P<copula>is|are|was|were|isn't|aren't|wasn't|weren't)\s+"
+        r"(?P<negation>(?:(?:not|never|no\s+longer)\s+)?)"
+        r"(?P<condition>" + condition + r")\b", re.I,
+    )
+    result = []
+    for pattern in (adjective, copular):
+        for match in pattern.finditer(clause):
+            # Abstract evaluative/personifying descriptions do not supply a
+            # concrete user's item history. Ordinary content grounding still
+            # owns any independent substantive proposition about these topics.
+            if re.search(r"\b(?:argument|reasoning|idea|logic|explanation|opinion|"
+                         r"preference|code|compiler|story|plot|chapter|gods?)\b",
+                         match.group("object"), re.I):
+                continue
+            mode = _scope(clause[:match.end()] + ("?" if clause.rstrip().endswith("?") else ""),
+                          match.start(), quote_prefix, conversational_hedge=speaker == "assistant")
+            negative = bool(re.search(r"n't\b|\b(?:not|never|no\s+longer)\b", match.group(0), re.I))
+            state = _lemma(match.group("condition"))
+            temporal = "past" if pattern is copular and re.match(r"(?:was|were)", match.group("copula"), re.I) else "current"
+            result.append({"kind": "object_condition", "span": match.group(0),
+                           "body": match.group(0), "mode": mode,
+                           "subject": "@user:" + " ".join(_key(match.group("object"), speaker)),
+                           "extra": {"condition_key": state, "condition_temporal": temporal, "activity_anchor": state,
+                                     "content_tokens": (state,),
+                                     "polarity": "negative" if negative else "positive"}})
+    return tuple(result)
 
 
 def _behaviour_transitions(clause: str, speaker: str, quote_prefix: str = "") -> tuple[dict[str, Any], ...]:
@@ -213,7 +341,7 @@ def _behaviour_transitions(clause: str, speaker: str, quote_prefix: str = "") ->
             # epistemic or future scope remains authoritative.  A consequence
             # elsewhere in the sentence must not hide its actual premise.
             mode = _scope(clause[:match.start("activity")] + activity,
-                          match.start(), quote_prefix)
+                          match.start(), quote_prefix, conversational_hedge=speaker == "assistant")
             if re.search(r"\b(?:figuratively|metaphorically|rhetorically|as\s+a\s+metaphor)\b",
                          activity, re.I) and not (
                     _DURATION.search(activity) or _FREQUENCY.search(activity)
@@ -259,7 +387,7 @@ def _premise_scope(clause: str, start: int, predicate_end: int, quote_prefix: st
                         r"(?:explain|tell|clarify|remind|say)\b", "explain", local[:start], flags=re.I)
         local = before + local[start:]
         start = len(before)
-    mode = _scope(local, start, quote_prefix)
+    mode = _scope(local, start, quote_prefix, conversational_hedge=conversational_hedge)
     if mode in {"future", "hedged", "conditional", "quoted", "unasserted"}:
         return "unasserted" if mode == "hedged" else mode
     return "presupposed" if question else "asserted"
@@ -525,6 +653,252 @@ def _personal_record_projections(clause: str, speaker: str, quote_prefix: str = 
     return tuple(records)
 
 
+def _relationship_history_projections(clause: str, speaker: str, quote_prefix: str = "") -> tuple[dict[str, Any], ...]:
+    """Keep mental premises, completed changes and transactions distinct.
+
+    These are bounded actual USER-history candidates, not product knowledge or
+    evidence inferred from model prose. The same projection normalises literal
+    USER witnesses; a prior expectation does not prove that it later ceased.
+    """
+    records = []
+    person = r"\b(?P<person>i|you)(?:'ve|'d|'m|'re)?\b"
+    prefix = r"(?P<prefix>(?:(?:have|had|am|are|was|were|do|did|don't|didn't|haven't|hadn't|not|never|no\s+longer|already|finally|just|actually|still|used\s+to|will|would|could|might|may|should|can)\s+)*)"
+
+    def subject(match):
+        return "@" + (speaker if match.group("person").lower() == "i"
+                      else "assistant" if speaker == "user" else "user")
+
+    def topic(value):
+        return re.split(r",|\b(?:but|however|and\s+(?:you|i|it|that|this)\b)", value,
+                        maxsplit=1, flags=re.I)[0].strip(" ,.!?;")
+
+    def mode(match, *, embedded=False):
+        end = match.start("target") if "target" in match.groupdict() else match.end()
+        local = clause[:end]
+        if embedded:
+            # A future consequence does not erase an explicitly completed
+            # since/after antecedent. True conditional/quote scopes remain.
+            before = local[:match.start()]
+            before = re.sub(r"\bwill\b|'ll\b|\bwould\b|\bcould\b|\bmight\b", "", before, flags=re.I)
+            local = before + local[match.start():]
+            result = _scope(local, len(before), quote_prefix)
+        else:
+            result = _scope(local, match.start(), quote_prefix)
+        return "questioned" if result == "asserted" and clause.rstrip().endswith("?") else result
+
+    def emit(match, kind, target, temporal, *, polarity="positive", owner=None, predicate="expect", extra=None):
+        target_key = _key(target, speaker)
+        if not target_key:
+            return
+        opaque = _mental_topic(target, speaker)
+        fields = {"relation_key": target_key, "relation_temporal": temporal,
+                  "target_polarity": opaque["target_polarity"], "target_modals": opaque["target_modals"],
+                  "relation_predicate": predicate, "polarity": polarity,
+                  "content_tokens": (predicate,) + target_key, "activity_anchor": predicate,
+                  "subject": owner or subject(match)}
+        fields.update(extra or {})
+        embedded = (bool(re.search(r"\b(?:since|after|now\s+that)\s*$", clause[:match.start()], re.I))
+                    or kind == "transaction_relation" and temporal == "completed" and "object" in match.groupdict())
+        records.append({"kind": kind, "span": match.group(0), "body": predicate + " " + target,
+                        "mode": mode(match, embedded=embedded), "start": match.start(), "end": match.end(),
+                        "extra": fields})
+
+    covered = []
+    cessation = re.compile(person + r"\s+" + prefix
+                          + r"(?P<change>stopped|ceased|quit)\s+expecting\s+(?P<target>[^.;!?]{1,160})", re.I)
+    for match in cessation.finditer(clause):
+        if subject(match) != "@user":
+            continue
+        target = topic(match.group("target"))
+        negative = bool(re.search(r"\b(?:not|never)\b|n't\b", match.group("prefix"), re.I))
+        # Negated cessation does not manufacture the positive prior premise.
+        if not negative:
+            emit(match, "expectation_state", target, "prior")
+        emit(match, "expectation_cessation", target, "completed",
+             polarity="negative" if negative else "positive")
+        covered.append((match.start(), match.end()))
+
+    expectation = re.compile(person + r"\s+" + prefix
+                             + r"(?P<verb>expect|expected|expecting)\s+(?P<target>[^.;!?]{1,160})", re.I)
+    for match in expectation.finditer(clause):
+        if subject(match) != "@user" or any(left <= match.start() < right for left, right in covered):
+            continue
+        prior = (match.group("verb").lower() == "expected"
+                 or bool(re.search(r"\b(?:was|were|had|used\s+to)\b|'d\b", match.group(0), re.I)))
+        target = topic(match.group("target"))
+        emit(match, "expectation_state", target, "prior" if prior else "current",
+             polarity="negative" if re.search(r"\b(?:not|never|no\s+longer)\b|n't\b", match.group("prefix"), re.I) else "positive")
+
+    verbs = {"pay": "pay", "paid": "pay", "paying": "pay", "buy": "buy", "bought": "buy", "buying": "buy",
+             "purchase": "purchase", "purchased": "purchase", "purchasing": "purchase",
+             "hire": "hire", "hired": "hire", "hiring": "hire",
+             "subscribe": "subscribe", "subscribed": "subscribe", "subscribing": "subscribe"}
+    transaction = re.compile(person + r"\s+" + prefix + r"(?P<verb>" + "|".join(verbs)
+                             + r")\s+(?P<target>[^.;!?]{1,160})", re.I)
+    nominal = re.compile(r"\b(?P<object>(?:the|that|this|my|your)\s+(?:[a-z][a-z-]*\s+){0,3}?[a-z][a-z-]*)\s+(?:that\s+)?"
+                         + person + r"\s+" + prefix + r"(?P<verb>" + "|".join(verbs) + r")\b"
+                         + r"(?P<link>\s+(?:for|to))?", re.I)
+    relative_ranges = []
+
+    def transaction_record(match, target, *, relative=False):
+        actor = subject(match)
+        key = _key(target, speaker)
+        # Assistant self-history is outside this USER family unless an actual
+        # transaction with the USER is asserted. Direction stays explicit.
+        if actor != "@user" and "@user" not in key:
+            return
+        verb = match.group("verb").lower()
+        negative = bool(re.search(r"\b(?:not|never)\b|n't\b", match.group("prefix"), re.I))
+        past = verb in {"paid", "bought", "purchased", "hired", "subscribed"} or bool(re.search(
+            r"\b(?:did|didn't|have|haven't|had|hadn't)\b|'(?:ve|d)\b", match.group(0), re.I))
+        emit(match, "transaction_relation", target, "completed" if past else "current",
+             polarity="negative" if negative else "positive", owner=actor, predicate=verbs[verb])
+
+    for match in nominal.finditer(clause):
+        target = re.sub(r"^(?:my|your|the|this|that)\s+", "", match.group("object"), flags=re.I)
+        # A bounded first-person self-relative identifies the assistant, not an
+        # arbitrary role alias. This resolves perspective, never authority.
+        before = clause[:match.start()]
+        if speaker == "assistant" and re.search(
+                r"\b(?:i'm|i\s+am)\s+(?:(?:more|less)\s+)?(?:like\s+)?$|"
+                r"\b(?:i'll|i\s+(?:will|might|could|would))\s+(?:(?:start|keep)\s+)?"
+                r"(?:acting|behaving|being|becoming|be)\s+(?:more|less)\s+like\s+"
+                r"[^.;!?]{0,100}?(?:and\s+(?:more|less)\s+like\s+)?$", before, re.I):
+            target = "me"
+        target = (match.group("link") or "").strip() + " " + target
+        transaction_record(match, target, relative=True)
+        relative_ranges.append((match.start(), match.end()))
+    for match in transaction.finditer(clause):
+        if any(left <= match.start() < right for left, right in relative_ranges):
+            continue
+        transaction_record(match, topic(match.group("target")))
+    return tuple(records)
+
+
+def _personal_recurrence_and_intention_projections(clause: str, speaker: str, quote_prefix: str = "") -> tuple[dict[str, Any], ...]:
+    """Project prior acts and present intentions without inventing their topic.
+
+    A declarative question with ``again`` still carries a prior-act premise.
+    A speaker's ``I think`` does not turn an attributed USER motive into USER
+    evidence. Both projections retain opaque arguments and participant direction;
+    ordinary questions, actual conditionals and quoted examples stay unasserted.
+    """
+    subject = "i" if speaker == "user" else "you"
+    person = r"\b" + subject + r"(?:'m|'re|'ve|'d)?\b"
+    prefix = r"(?P<prefix>(?:(?:am|are|was|were|have|had|do|did|don't|didn't|haven't|hadn't|not|never|no\s+longer|just|actually|already|still|previously|once|currently|might|may|could|would|will|can)\s+)*)"
+    records = []
+
+    def emit(match, kind, predicate, target, temporal, *, premise=False):
+        before_target = match.start("target")
+        mode = _premise_scope(clause, match.start(), before_target, quote_prefix,
+                              conversational_hedge=speaker == "assistant")
+        if mode not in {"quoted", "conditional", "future", "unasserted"}:
+            mode = "presupposed" if premise else "questioned" if clause.rstrip().endswith("?") else "asserted"
+        target = re.split(r",|\b(?:but|however|and\s+(?:you|i|it|that|this)\b)", target,
+                          maxsplit=1, flags=re.I)[0].strip(" ,.!?;")
+        target = re.sub(r"\b(?:again|before|earlier|previously|once|already)\b", "", target, flags=re.I).strip()
+        key = _key(target, speaker)
+        if not key and re.fullmatch(r"(?:it|this|that|these|those)", target, re.I):
+            # Retain a literal deictic argument; dropping the whole argument
+            # would make 'checking that again' disappear before validation.
+            key = ("deictic:" + target.lower(),)
+        if not key:
+            return
+        negative = bool(re.search(r"\b(?:not|never|no\s+longer)\b|n't\b", match.group("prefix"), re.I))
+        opaque = _mental_topic(target, speaker)
+        records.append({"kind": kind, "span": match.group(0), "body": predicate + " " + target,
+                        "mode": mode, "start": match.start(), "end": match.end(),
+                        "extra": {"relation_key": key, "relation_temporal": temporal,
+                                  "relation_predicate": predicate, "target_polarity": opaque["target_polarity"],
+                                  "target_modals": opaque["target_modals"],
+                                  "content_tokens": (predicate,) + key, "activity_anchor": predicate,
+                                  "polarity": "negative" if negative else "positive"}})
+
+    # An opaque purpose belongs to a claimed present intention, not to actual
+    # activity evidence. Future/conditional language INSIDE the purpose does
+    # not change the scope of 'you are trying'.
+    intention = re.compile(person + r"\s+" + prefix
+                           + r"(?P<verb>trying|aiming|planning|hoping|intending)\s+to\s+"
+                           + r"(?P<target>[^.;!?]{1,180})", re.I)
+    for match in intention.finditer(clause):
+        emit(match, "user_intention_state", _lemma(match.group("verb")), match.group("target"), "current")
+
+    # Candidate recurrence is intentionally bounded to an explicit USER actor
+    # and progressive/past act. A literal USER past occurrence is enough to
+    # establish the prior occurrence; it need not itself claim repetition.
+    action = r"(?P<verb>[a-z]+ing|[a-z]+ed|" + "|".join(_IRREGULAR) + r")"
+    recurring = re.compile(person + r"\s+" + prefix + action + r"\s+(?P<target>[^.;!?]{1,150})", re.I)
+    for match in recurring.finditer(clause):
+        if match.group("verb").lower() in {"trying", "aiming", "planning", "hoping", "intending"}:
+            continue
+        # This projection is a prior ACTION obligation. Ordinary affective or
+        # preference acknowledgements retain their existing social semantics;
+        # 'enjoying it again' need not invent a concrete earlier agentive act.
+        if _lemma(match.group("verb")) in {_lemma(word) for word in (
+                "be", "like", "love", "enjoy", "hate", "prefer", "believe", "feel", "want", "need", "know", "understand")}:
+            continue
+        repeated = bool(re.search(r"\bagain\b", match.group("target"), re.I))
+        past = not match.group("verb").lower().endswith("ing") or bool(re.search(
+            r"\b(?:was|were|had|did|didn't|have|haven't|hadn't)\b|'(?:ve|d)\b", match.group(0)[:match.start("verb") - match.start()], re.I))
+        if speaker == "assistant" and not repeated or speaker == "user" and not (past or repeated):
+            continue
+        emit(match, "personal_prior_act", _lemma(match.group("verb")), match.group("target"), "prior", premise=repeated)
+    if speaker == "user":
+        correction = re.compile(person + r"\s+"
+                                r"(?P<prefix>(?:did\s+not|didn't|never)\s+)"
+                                r"(?P<verb>[a-z]+)\s+(?P<target>[^.;!?]{1,150})", re.I)
+        for match in correction.finditer(clause):
+            emit(match, "personal_prior_act", _lemma(match.group("verb")), match.group("target"), "prior")
+
+    # Inclusive agency and contrastive present clauses carry the same prior-
+    # act premise as direct USER recurrence. Keep shared agency distinct from
+    # a USER-only act. A current negative ('did not X this time') presupposes
+    # earlier X; it does not establish a prior negative event. Conversely a
+    # positive contrast requires a matching earlier negative state. These are
+    # premise candidates only; literal USER history still supplies authority.
+    actor = r"(?P<actor>we|" + subject + r")"
+    contrasted = re.compile(
+        r"\b" + actor + r"(?:'ve|'d|'ll)?\s+"
+        r"(?P<prefix>(?:(?:did\s+not|do\s+not|have\s+not|had\s+not|didn't|don't|haven't|hadn't|"
+        r"won't|will\s+not|will|can|could|would|might|may|did|do|have|had|not|never|just|"
+        r"accidentally|actually|already|previously|once)\s+)*)"
+        r"(?:(?P<wrapper>decide|decided|remember|remembered|manage|managed)\s+to\s+)?"
+        r"(?P<verb>[a-z]+)\s+(?P<target>[^.;!?]{1,150})", re.I,
+    )
+    for match in contrasted.finditer(clause):
+        shared = match.group("actor").lower() == "we"
+        contrast = bool(re.search(r"\bthis\s+time\b", match.group("target"), re.I))
+        repeat = bool(re.search(r"\bagain\b", match.group("target"), re.I))
+        if not shared and not contrast:
+            continue  # Existing direct recurrence retains its call schedule.
+        if _lemma(match.group("verb")) in {_lemma(word) for word in (
+            "be", "like", "love", "enjoy", "hate", "prefer", "believe", "feel", "want", "need", "know", "understand",
+        )}:
+            continue
+        past = bool(re.search(r"\b(?:did|didn't|have|had|haven't|hadn't)\b|'(?:ve|d)\b", match.group(0), re.I)) \
+            or match.group("verb").lower().endswith("ed") or match.group("verb").lower() in _IRREGULAR
+        if speaker == "assistant" and not (contrast or repeat) or speaker == "user" and not (past or repeat or contrast):
+            continue
+        start = len(records)
+        target = re.sub(r"\bthis\s+time\b", "", match.group("target"), flags=re.I).strip()
+        predicate = _lemma(match.group("verb"))
+        if match.group("wrapper"):
+            # Deciding/remembering/managing to do something is not the same
+            # proposition as doing it. Retain that actor/predicate distinction.
+            predicate = _lemma(match.group("wrapper"))
+            target = "to " + match.group("verb") + " " + target
+        emit(match, "personal_prior_act", predicate, target, "prior", premise=contrast or repeat)
+        for record in records[start:]:
+            if shared:
+                record["extra"]["subject"] = "@shared:user_assistant"
+            if speaker == "assistant" and (contrast or repeat):
+                if record["mode"] not in {"quoted", "conditional", "unasserted"}:
+                    record["mode"] = "presupposed"
+                negative_current = bool(re.search(r"\b(?:not|never)\b|n't\b", match.group("prefix"), re.I))
+                record["extra"]["polarity"] = "positive" if repeat or negative_current else "negative"
+    return tuple(records)
+
+
 def _state_projections(clause: str, speaker: str, quote_prefix: str = "") -> tuple[dict[str, Any], ...]:
     """Bounded hidden USER-state premises; ordinary questions stay questions.
 
@@ -538,6 +912,10 @@ def _state_projections(clause: str, speaker: str, quote_prefix: str = "") -> tup
     specs = list(_current_activity_projections(clause, speaker, quote_prefix))
     specs.extend(_personal_record_projections(clause, speaker, quote_prefix))
     specs.extend(_immediate_activity_projections(clause, speaker, quote_prefix))
+    relationships = _relationship_history_projections(clause, speaker, quote_prefix)
+    specs = [item for item in specs if not any(new["start"] <= item["start"] < new["end"] for new in relationships)]
+    specs.extend(relationships)
+    specs.extend(_personal_recurrence_and_intention_projections(clause, speaker, quote_prefix))
 
     def record(kind, match, body, mode, **extra):
         specs.append({"kind": kind, "span": match.group(0), "body": body, "mode": mode,
@@ -730,7 +1108,10 @@ def detect_user_history(text: str, *, speaker: str = "assistant", preserve_occur
     records = []
     subject = "i" if speaker == "user" else "you"
     possessive = "my" if speaker == "user" else "your"
-    personal = re.compile(r"\b" + subject + r"(?:'ve|'d|'re|'m)?\b(?P<body>[^.;!?]{1,240})", re.I)
+    person = r"\b" + subject + r"(?:'ve|'d|'re|'m)?\b"
+    # Each finite USER predicate owns its own history scope. A preceding echo
+    # must not swallow a later 'you have ...' premise into the same record.
+    personal = re.compile(person + r"(?P<body>(?:(?!" + person + r")[^.;!?]){1,240})", re.I)
 
     def add(kind: str, span: str, body: str, mode: str, *, owner: str = "@user", owned_predicate: str = "", extra=None):
         duration = _durations(body)
@@ -773,7 +1154,16 @@ def detect_user_history(text: str, *, speaker: str = "assistant", preserve_occur
         projected_states = _state_projections(clause, speaker, quote_prefix)
         for item in projected_states:
             add(item["kind"], item["span"], item["body"], item["mode"], extra=item["extra"])
-        transitions = _behaviour_transitions(clause, speaker, quote_prefix)
+        for item in _object_event_projections(clause, speaker, quote_prefix,
+                                              owned_items=_owned_items(value, speaker)):
+            add(item["kind"], item["span"], item["body"], item["mode"],
+                owner=item["subject"], extra=item["extra"])
+        for item in _object_condition_projections(clause, speaker, quote_prefix):
+            add(item["kind"], item["span"], item["body"], item["mode"],
+                owner=item["subject"], extra=item["extra"])
+        transitions = tuple(item for item in _behaviour_transitions(clause, speaker, quote_prefix)
+                            if not any(new["kind"] in {"expectation_state", "expectation_cessation", "transaction_relation"}
+                                       and new["start"] <= item["start"] < new["end"] for new in projected_states))
         for transition in transitions:
             premise = transition["activity"]
             if transition["polarity"] == "negative":
@@ -782,7 +1172,7 @@ def detect_user_history(text: str, *, speaker: str = "assistant", preserve_occur
             if transition["completed_body"]:
                 add("prior_activity", transition["span"], transition["completed_body"], transition["mode"])
         for match in personal.finditer(clause):
-            if any(item["kind"] not in {"current_activity_state", "personal_activity_record"}
+            if any(item["kind"] not in {"current_activity_state", "personal_activity_record", "personal_prior_act"}
                    and item["start"] <= match.start() < item["end"] for item in projected_states):
                 continue
             if any(item["start"] <= match.start() < item["activity_start"] for item in transitions):
@@ -791,7 +1181,9 @@ def detect_user_history(text: str, *, speaker: str = "assistant", preserve_occur
                 # consequence into that history proposition's activity key.
                 continue
             body = match.group("body")
-            mode = _scope(clause, match.start(), quote_prefix)
+            scoped = clause[:match.end()] + ("?" if clause.rstrip().endswith("?") else "")
+            mode = _scope(scoped, match.start(), quote_prefix,
+                          conversational_hedge=speaker == "assistant")
             # Expand subject contractions solely for grammatical recognition.
             expanded = match.group(0).replace("'ve", " have").replace("'d", " had")
             history = bool(re.search(
@@ -887,6 +1279,17 @@ def _compatible(candidate: Mapping[str, Any], witness: Mapping[str, Any]) -> boo
         return False
     if candidate["subject"] == "unresolved_item" or candidate["subject"] != witness["subject"]:
         return False
+    if candidate["kind"] == "object_prior_event":
+        return (witness["kind"] == "object_prior_event"
+                and candidate.get("event_key") == witness.get("event_key"))
+    if candidate["kind"] == "object_condition":
+        return (witness["kind"] == "object_condition"
+                and candidate.get("condition_key") == witness.get("condition_key")
+                and candidate.get("condition_temporal") == witness.get("condition_temporal"))
+    if candidate["kind"] in {"expectation_state", "expectation_cessation", "transaction_relation", "personal_prior_act", "user_intention_state"}:
+        return (witness["kind"] == candidate["kind"]
+                and all(candidate.get(field) == witness.get(field) for field in
+                        ("relation_key", "relation_temporal", "relation_predicate", "target_polarity", "target_modals")))
     if candidate["kind"] == "current_activity_state":
         return (witness["kind"] == "current_activity_state"
                 and candidate.get("activity_key") == witness.get("activity_key")
@@ -954,6 +1357,10 @@ def _current_history_contradiction(candidate: Mapping[str, Any], current_user: s
     interruption consequence of re-entry; negative re-entry alone does not
     establish that no interruption happened.
     """
+    if candidate["kind"] in {"expectation_state", "expectation_cessation", "transaction_relation", "personal_prior_act", "user_intention_state"}:
+        # Typed relationship history has its own latest identity/temporal
+        # resolver. A current negation must not erase a distinct past fact.
+        return False
     facets = ("subject", "content_tokens", "duration", "frequency", "ordering",
               "activity_anchor", "owned_predicate", "interruption_only")
     matching = [item for item in detect_user_history(current_user, speaker="user", preserve_occurrences=True)
@@ -983,7 +1390,9 @@ def _latest_typed_state(candidate: Mapping[str, Any], sources: Mapping[str, str]
     mental = candidate["kind"] in {"mental_state_presupposition", "mental_state"}
     task = candidate["kind"] in {"user_task_identity", "task_completion_presupposition"}
     activity = candidate["kind"] == "current_activity_state"
-    if not (mental or task or activity) or (mental and candidate.get("state_temporal") != "current") \
+    object_event = candidate["kind"] in {"object_prior_event", "object_condition"}
+    relationship = candidate["kind"] in {"expectation_state", "expectation_cessation", "transaction_relation", "personal_prior_act", "user_intention_state"}
+    if not (mental or task or activity or relationship or object_event) or (mental and candidate.get("state_temporal") != "current") \
             or (task and candidate.get("task_temporal") != "current"):
         return None
     ordered = sorted((key for key in sources if re.fullmatch(r"prior_user_\d+", key)),
@@ -995,7 +1404,24 @@ def _latest_typed_state(candidate: Mapping[str, Any], sources: Mapping[str, str]
         for item in detect_user_history(sources[key], speaker="user", preserve_occurrences=True):
             if item["mode"] not in {"asserted", "presupposed"}:
                 continue
-            if mental:
+            if relationship:
+                matches = (item["kind"] == candidate["kind"] and item["subject"] == candidate["subject"]
+                           and all(item.get(field) == candidate.get(field) for field in
+                                   ("relation_key", "relation_temporal", "relation_predicate", "target_polarity", "target_modals")))
+                if candidate["kind"] == "expectation_cessation":
+                    matches = matches or (item["kind"] == "expectation_state"
+                                          and item.get("relation_temporal") == "current" and item["polarity"] == "positive"
+                                          and item["subject"] == candidate["subject"]
+                                          and all(item.get(field) == candidate.get(field) for field in
+                                                  ("relation_key", "relation_predicate", "target_polarity", "target_modals")))
+            elif object_event:
+                key_field = "condition_key" if candidate["kind"] == "object_condition" else "event_key"
+                matches = (item["kind"] == candidate["kind"]
+                           and item["subject"] == candidate["subject"]
+                           and item.get(key_field) == candidate.get(key_field)
+                           and (candidate["kind"] != "object_condition"
+                                or item.get("condition_temporal") == candidate.get("condition_temporal")))
+            elif mental:
                 matches = (item["kind"] == "mental_state" and item.get("state_temporal") == "current"
                            and item.get("state_type") == candidate.get("state_type")
                            and item.get("state_target") == candidate.get("state_target")

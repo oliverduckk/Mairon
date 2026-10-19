@@ -467,6 +467,12 @@ def build_consequential_advice_instruction(
         "- If provider, jurisdiction, or account-specific details are unknown, "
         "give verified generally applicable steps first and state uncertainty "
         "briefly.\n"
+        "- Retrieved sources do not select Oliver's jurisdiction, provider or procedure. "
+        "Concrete local/provider-specific rails, recovery powers, legal steps, deadlines "
+        "and follow-up schedules require matching USER-authored applicability as well "
+        "as support from the same readable source. Do not combine rules from different "
+        "providers or jurisdictions into one procedure for him. Useful urgency does not "
+        "establish a numeric deadline or that one action is the only leverage available.\n"
         "- Do not mention routing, guardrails, evidence packets, tools, or model "
         "limitations unless Oliver explicitly asks."
     )

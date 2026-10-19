@@ -104,6 +104,45 @@ def _currentness_issue(candidate, sources, requirements):
     return not sources or any(source.data.get("currentness_established") is not True for source in sources)
 
 
+def _reporting_source_subject(name, identities):
+    """Bound ambiguous report verbs to a source-like nominal subject.
+
+    A mechanism can report, confirm or indicate a state without attributing
+    that state to a webpage. In particular, a later coordinated predicate
+    must not turn the whole preceding factual clause into a source title.
+    Actual retained identities, explicit document nominals and bounded named
+    titles remain provenance claims; this projection grants none authority.
+    """
+    value = _normal(name).strip().rstrip(".,")
+    folded = value.casefold()
+    if any(identity and (folded == identity or folded.startswith(identity + " "))
+           for identity in identities):
+        return True
+    if len(value) >= 2 and (value[0], value[-1]) in {('"', '"'), ('“', '”'), ("'", "'"), ('‘', '’')}:
+        return True
+    # A document head may carry nominal qualifiers ('handbook from Elysia').
+    # Consume the whole bounded nominal, rather than requiring the document
+    # noun to be terminal or searching an arbitrary earlier clause. A trailing
+    # coordinator belongs to another predicate, not to this source label.
+    if re.fullmatch(
+        r"(?:[\w'’\-]+\s+){0,11}(?:source|page|documentation|manual|article|report|"
+        r"guide|handbook|reference|study|paper|journal|website|book|bulletin|notice|"
+        r"record|document|evidence|sources|pages|documents|reports|studies|records)"
+        r"(?:\s+(?:from|by|of|in|on|for|about|with|under|at)\s+"
+        r"(?:[\w'’\-]+\s+){0,7}[\w'’\-]+){0,2}",
+        value, re.I,
+    ) and not re.search(r"\b(?:and|or|but|because|while|so)\s*$", value, re.I):
+        return True
+    # Preserve named titles without a document noun, including unknown titles
+    # which must still be checked against the retained identity. Lowercase
+    # mechanism nominals and clause-length descriptions are not this shape.
+    title = re.sub(r"^(?:the|a|an)\s+", "", value, flags=re.I)
+    return bool(re.fullmatch(
+        r"[A-Z][A-Za-z0-9'’\-]*(?:\s+(?:(?:and|of|the|in|on|for|to|a|an)\s+)?"
+        r"[A-Z][A-Za-z0-9'’\-]*){0,7}", title,
+    ))
+
+
 def _source_attribution_issue(text, sources):
     """Detect bounded explicit load/attribution claims, not arbitrary entailment.
 
@@ -134,10 +173,13 @@ def _source_attribution_issue(text, sources):
     # substantive assertion positively while overlooking a substituted title.
     # The authority of that name still comes from retained source identity.
     for match in re.finditer(
-        r"(?:^|[.!?]\s+)(?:the\s+)?(?P<name>[A-Za-z][^.!?\n:]{0,120}?)\s+"
-        r"(?:says|states|reports|documents|confirms|indicates)\b", text, re.I,
+        r"(?:^|[.!?]\s+)(?:the\s+)?(?P<name>[\"“‘']?[A-Za-z][^.!?\n:]{0,120}?)\s+"
+        r"(?P<verb>says|states|reports|documents|confirms|indicates)\b", text, re.I,
     ):
-        names.append(match.group("name"))
+        name = match.group("name")
+        if (match.group("verb").casefold() in {"says", "states", "documents"}
+                or _reporting_source_subject(name, identities)):
+            names.append(name)
     for match in re.finditer(
         r"\baccording\s+to\s+(?:the\s+)?(?P<name>[^,;.!?\n]+)", text, re.I,
     ):

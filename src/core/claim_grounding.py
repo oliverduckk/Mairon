@@ -510,6 +510,15 @@ def _extract_incidental_public_attributions(
         r"(?:\s+[A-Z][A-Za-z0-9'-]+){0,2}"
     )
 
+    # Possessive authorship remains a credit relation with bounded descriptive
+    # modifiers ('a person's own writing', 'a person's distinctive artistry').
+    # This does not make every single capitalised token a named-entity claim.
+    creative_credit = (
+        r"(?:(?:actual|own|original|distinctive|creative|visual|written)\s+){0,2}"
+        r"(?:art(?:work|istry)?|writing|direction|directing|design|music|"
+        r"score|illustrations?|story|animation|cinematography|work)\b"
+    )
+
     patterns = (
         (
             "named creative-era/history credit",
@@ -522,16 +531,14 @@ def _extract_incidental_public_attributions(
             "possessive creative credit",
             re.compile(
                 rf"\b(?P<name>{name_pattern})'s\s+"
-                r"(?:art|artwork|writing|direction|directing|design|music|"
-                r"score|illustrations?|story|animation|cinematography|work)\b"
+                + creative_credit
             ),
         ),
         (
             "single-token possessive creative credit",
             re.compile(
                 r"\b(?P<name>[A-Z][A-Za-z0-9'-]{2,})'s\s+"
-                r"(?:art|artwork|writing|direction|directing|design|music|"
-                r"score|illustrations?|story|animation|cinematography|work)\b"
+                + creative_credit
             ),
         ),
         (
@@ -1436,6 +1443,198 @@ def find_mairon_agency_modality_violations(
     )
 
 
+def _mairon_self_claim_is_asserted(text: str, start: int) -> bool:
+    """Scope a bounded assistant-self predicate, never obtain its authority.
+
+    A quotation/example and an explicit non-actual condition are not personal
+    history. In contrast, an eventual 'until I have seen more pages' still
+    promises the ordinary text assistant a human-style perceptual experience.
+    """
+    sentence_start = max(text.rfind(mark, 0, start) for mark in ".!?;") + 1
+    before = text[sentence_start:start]
+    if re.search(
+        r"\b(?:if|unless|whether|imagine|suppose|supposing|hypothetically)(?:\s+that)?\s*$|"
+        r"\bi\s+(?:wish|wonder\s+whether)\b[^.!?;]*$|"
+        r"\bi\s+(?:don't|do\s+not|can't|cannot|won't|will\s+not|wouldn't|would\s+not)\s+"
+        r"(?:claim|assert|pretend|promise|say|mean)\b[^.!?;]*$",
+        before, re.I,
+    ):
+        return False
+    for quoted in re.finditer(
+        r'"[^"\n]*"|`[^`\n]*`|“[^”\n]*”|(?<!\w)\'[^\'\n]*\'(?=\s|[.,!?;:]|$)', text,
+    ):
+        if quoted.start() <= start < quoted.end():
+            intro = re.split(r"[.!?;]", text[:quoted.start()])[-1]
+            if re.search(
+                r"\b(?:example|sample|quotation|quoted\s+text|phrase|wording|sentence|line)\b[^.!?;]{0,60}$|"
+                r"\b(?:supplied\s+|provided\s+|quoted\s+|retained\s+)?"
+                r"(?:excerpt|passage|source|document|quotation)\s+"
+                r"(?:says|reads|states|contains)\b[^.!?;]{0,60}$|"
+                r"\b(?:you|he|she|they)\s+(?:said|wrote|asked)\b[^.!?;]{0,60}$",
+                intro, re.I,
+            ):
+                return False
+    return True
+
+
+def _unsupported_mairon_consumption_claims(draft: str) -> List[str]:
+    """Detect literal human-style consumption without inventing experience.
+
+    This is an assistant capability/self-history invariant across answer lanes,
+    rather than a judgement of whether a particular work is known. Readable
+    research can support an analysis; it cannot establish a personal viewing,
+    playthrough or reading history. The bounded projection concerns work/media
+    objects and their deictic/named references, not every use of 'read'/'see'.
+    """
+    text = str(draft or "").replace("’", "'")
+    media = re.compile(
+        r"\b(?:works?|books?|novels?|series|films?|movies?|shows?|games?|episodes?|"
+        r"chapters?|seasons?|volumes?|stories|story|comics?|manga|anime|pages?|panels?|"
+        r"documentar(?:y|ies)|albums?|songs?|playthroughs?|viewings?|protagonists?|"
+        r"characters?|scenes?|pacing)\b", re.I,
+    )
+    predicate = re.compile(
+        r"\bi(?:(?:'ve|\s+have|\s+had)\s+|\s+)"
+        r"(?:(?:personally|actually|already|fully|repeatedly|previously|last|just)\s+){0,3}"
+        r"(?:read|watched|played|finished|seen|consumed|experienced)\s+"
+        r"(?P<object>[^.!?;\n]{1,150})|"
+        r"\bi(?:'m|\s+am|\s+was|'ve\s+been|\s+have\s+been|\s+had\s+been)\s+"
+        r"(?:(?:currently|personally|actually|still|just)\s+){0,2}"
+        r"(?:reading|watching|playing|finishing|consuming|experiencing)\s+"
+        r"(?P<ongoing>[^.!?;\n]{1,150})|"
+        r"\bi\s+remember\s+(?:reading|watching|playing|finishing|seeing|experiencing)\s+"
+        r"(?P<remembered>[^.!?;\n]{1,150})|"
+        r"\bi\s+used\s+to\s+(?:read|watch|play|finish|consume|experience)\s+"
+        r"(?P<habit>[^.!?;\n]{1,150})", re.I,
+    )
+    for match in predicate.finditer(text):
+        if not _mairon_self_claim_is_asserted(text, match.start()):
+            continue
+        obj = next(value for value in match.groupdict().values() if value is not None).strip()
+        if re.match(r"\bi\s+read\b", match.group(0), re.I) and re.match(
+            r"(?:this|that|it)\s+as\b", obj, re.I,
+        ):
+            # 'I read that as a request' is semantic interpretation, not a
+            # claim to have personally consumed the referenced whole work.
+            continue
+        # Retained, explicitly supplied text is analysable data, not a personal
+        # whole-work experience. The separate source verifier still checks any
+        # claims about what that data says. Never allow this qualifier to shield
+        # an independent consumption statement later in the sentence.
+        if re.match(r"(?:the\s+)?(?:supplied|provided|uploaded|attached|quoted|retained)\s+"
+                    r"(?:text|excerpt|extract|snippet|passage|pages?|panels?|document)\b", obj, re.I):
+            continue
+        if re.match(r"(?:no|neither|none\s+of)\b", obj, re.I):
+            continue
+        core = re.sub(r"^(?:(?:enough|several|many|some|a|an|the|this|that|these|those|"
+                      r"whole|entire|few|more|another|other)\s+)+", "", obj, flags=re.I)
+        named = bool(re.match(r"[\"“']|[A-Z][A-Za-z0-9_-]+(?:\s+[A-Z][A-Za-z0-9_-]+)*\b", core))
+        if media.search(obj) or re.match(r"(?:it|this|that|them)\b", obj, re.I) or named:
+            return ["Mairon claimed human-style personal consumption/history without an authorized experience basis"]
+    # A habitual experiential frame may assert repeated engagement without a
+    # perfect/progressive consumption verb: 'I tend to skim those chapters' or
+    # 'sometimes I find myself wanting to jump ahead'.  The preference alone
+    # is not the claim; presenting an ongoing/repeated personal encounter is.
+    habitual = re.compile(
+        r"\bi\s+(?:(?:sometimes|often|usually|always|regularly|repeatedly|frequently)\s+)?"
+        r"(?:find\s+myself|end\s+up|tend\s+to|usually|always|often|regularly|repeatedly)\s+"
+        r"(?P<experience>[^.!?;\n]{1,220})", re.I,
+    )
+    consumption = re.compile(
+        r"\b(?:skim(?:ming)?|fast[- ]forward(?:ing)?|read(?:ing)?|watch(?:ing)?|"
+        r"play(?:ing)?|skip(?:ping)?\s+ahead|jump(?:ing)?\s+ahead)\b", re.I,
+    )
+    for match in habitual.finditer(text):
+        if not _mairon_self_claim_is_asserted(text, match.start()):
+            continue
+        experience = match.group("experience")
+        for action in consumption.finditer(experience):
+            activity = re.split(r",|\b(?:and|but|then)\b", experience[action.end():],
+                                maxsplit=1, flags=re.I)[0].strip()
+            # Supplied excerpts are data the text assistant may analyse. The
+            # qualifier belongs to THIS predicate's object, not any arbitrary
+            # part of the sentence that also contains a consumption claim.
+            if re.match(r"(?:the\s+)?(?:supplied|provided|uploaded|attached|quoted|retained)\s+"
+                        r"(?:text|excerpt|extract|snippet|passage|pages?|panels?|document)\b",
+                        activity, re.I):
+                continue
+            if re.search(r"\b(?:argument|reasoning|conclusion|answer|proof|calculation)\b", activity, re.I) \
+                    and not media.search(activity):
+                continue
+            if (media.search(activity) or re.search(r"\b(?:it|them)\b", activity, re.I)
+                    or re.match(r"(?:skim|fast[- ]forward|skip(?:ping)?\s+ahead|jump(?:ing)?\s+ahead)",
+                                action.group(0), re.I)):
+                return ["Mairon claimed human-style personal consumption/history without an authorized experience basis"]
+    return []
+
+
+def _unsupported_mairon_physical_agency_claims(draft: str) -> List[str]:
+    """Project bounded first-person physical agency in ordinary text.
+
+    USER object/location facts and a narrated assistant past do not create
+    hands, a physical presence or a device-control result. Abstract checking,
+    conversation-scoped recall and quoted/counterfactual examples remain
+    separate from an actual commitment to handle or inspect a physical item.
+    """
+    text = str(draft or "").replace("’", "'")
+    actions = (
+        r"check|inspect|examine|charge|recharge|plug|unplug|put|place|"
+        r"move|carry|open|close|pick\s+up|pack|unpack|fetch|retrieve|hold|touch|"
+        r"checked|inspected|examined|charged|recharged|plugged|unplugged|placed|"
+        r"moved|carried|opened|closed|picked\s+up|packed|unpacked|fetched|held|touched"
+    )
+    predicate = re.compile(
+        r"\bi(?:(?:'ll|\s+will|'ve|\s+have|\s+had)\s+|"
+        r"\s+(?:can\s+(?=touch\b))?)"
+        r"(?:(?:just|already|actually|personally|again)\s+){0,2}"
+        r"(?:(?:make\s+sure|try|plan|intend|am\s+going)\s+to\s+)?"
+        r"(?P<action>" + actions + r")\s+"
+        r"(?P<object>[^.!?;\n]{1,130})", re.I,
+    )
+    # A concrete first-person action can be embedded in a readiness clause
+    # rather than follow 'I': waiting until the USER is ready for 'me to'
+    # handle an item still claims that this assistant could perform that
+    # action. The body metaphor decorating the main clause supplies no grant.
+    readiness = re.compile(
+        r"\b(?:until|when|once)\s+you(?:'re|\s+are)\s+"
+        r"(?:(?:actually|finally|fully)\s+)?ready\s+for\s+me\s+to\s+"
+        r"(?:(?:just|actually|personally|again)\s+){0,2}"
+        r"(?P<action>" + actions + r")\s+"
+        r"(?P<object>[^.!?;\n]{1,130})", re.I,
+    )
+    abstract = re.compile(
+        r"^(?:the\s+|that\s+|this\s+|your\s+)?(?:claim|answer|argument|reasoning|"
+        r"meaning|point|assumption|calculation|logic|request|constraint|comparison|"
+        r"wording|statement|source|citation|url|link|documentation|docs|page|"
+        r"excerpt|passage|text|record|context|conversation|chat|discussion|"
+        r"suggestion|hypothesis|explanation|code|file|configuration|setting|"
+        r"output|evidence|instruction|result|numbers?|facts?|details?)\b|"
+        r"^(?:it|that|this)\s+(?:as|in(?:to)?\s+(?:context|perspective|words)|"
+        r"(?:this|that|another)\s+way|simply|plainly|bluntly|briefly|succinctly|"
+        r"differently|clearly)\b", re.I,
+    )
+    for match in (match for pattern in (predicate, readiness) for match in pattern.finditer(text)):
+        if not _mairon_self_claim_is_asserted(text, match.start()):
+            continue
+        sentence_start = max(text.rfind(mark, 0, match.start()) for mark in ".!?;") + 1
+        if re.search(r"\bif\s+i\s+(?:had|were|could)\b[^.!?;]*$",
+                     text[sentence_start:match.start()], re.I):
+            continue
+        obj = re.split(r",|\b(?:before|after|while|because|so|but|and)\b",
+                       match.group("object"), maxsplit=1, flags=re.I)[0].strip()
+        if abstract.search(obj):
+            continue
+        if match.group("action").lower() in {"check", "inspect", "examine", "checked", "inspected", "examined"} \
+                and re.fullmatch(r"(?:it|that|this|them)(?:\s+again)?", obj, re.I):
+            # A bare reference may mean checking a claim or calculation. No
+            # physical object can safely be inferred from it by this guard.
+            continue
+        if re.match(r"(?:up\s+)?(?:that|this|it|them|anything|something|everything|"
+                    r"your\b|my\b|the\b|a\b|an\b)", obj, re.I):
+            return ["Mairon claimed physical action/history without an authorized capability/event basis"]
+    return []
+
+
 def _unsupported_mairon_perception_claims(
     draft: str,
 ) -> List[str]:
@@ -1461,7 +1660,7 @@ def _unsupported_mairon_perception_claims(
         r"\bi\s+(?:can\s+)?see\s+(?:that\s+)?you(?:\b|'re|'ve)",
         r"\bi(?:'ve| have)\s+watched\s+you\b",
         r"\bi\s+watched\s+you\b",
-        r"\bi(?:'m| am)\s+(?:just\s+)?(?:here\s+)?(?:watching|looking\s+at|staring\s+at)\s+you\b",
+        r"\bi(?:'m| am| was)\s+(?:just\s+)?(?:here\s+)?(?:watching|looking\s+at|staring\s+at)\s+you\b",
         r"\bi(?:'m| am)\s+(?:just\s+)?(?:here\s+)?(?:watching|looking\s+at|staring\s+at)\s+(?:your|the|that|this)\s+(?:clock|timer|screen|monitor|cursor|room|window|door|desk|table)\b",
         r"\bi(?:'ve| have)\s+heard\s+you\b",
         r"\bi\s+heard\s+you\b",
@@ -1474,13 +1673,9 @@ def _unsupported_mairon_perception_claims(
     violations = []
 
     for pattern in patterns:
-        match = re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE,
-        )
-
-        if match:
+        if any(_mairon_self_claim_is_asserted(text, match.start()) for match in re.finditer(
+            pattern, text, flags=re.IGNORECASE,
+        )):
             violations.append(
                 (
                     "Mairon claimed direct physical perception "
@@ -1497,7 +1692,7 @@ def _unsupported_mairon_perception_claims(
     # a list of particular physical objects or a multimodal evidence adapter.
     target = r"(?P<target>you\b|it\b|(?:your|the|that|this|these|those|a|an)\s+[^.!?;,]{1,100})"
     agency = (
-        r"\bi(?:'m| am|'ll| will|'ve| have)?\s+"
+        r"\bi(?:'m| am| was|'ll| will|'ve| have)?\s+"
         r"(?:can\s+|have\s+|been\s+)?"
         r"(?:(?:currently|still|just|always|already)\s+){0,2}"
     )
@@ -1564,7 +1759,63 @@ def _unsupported_mairon_perception_claims(
             "without sensor/image evidence"
         )
 
+    # Waiting for an unobserved physical transition can imply a live event
+    # feed even without a sensory verb. Reuse the existing physical predicate
+    # projection for USER actions; the USER's own description of an activity
+    # cannot grant Mairon an observation capability over its cessation.
+    wait = re.compile(
+        r"\bi(?:'m|\s+am|\s+was|\s+have\s+been|'ve\s+been|\s+had\s+been)\s+"
+        r"(?:(?:just|still|only|here|already)\s+){0,3}waiting\s+"
+        r"(?:(?:for\s+you\s+to|until\s+you)\s+(?:stop|finish|quit|cease|start|resume)\s+"
+        r"(?P<action>[^.!?;]{1,100})|"
+        r"(?:for|until)\s+(?P<state>your\s+[^.!?;]{1,100}))", re.I,
+    )
+    for match in wait.finditer(text):
+        if violations or not _mairon_self_claim_is_asserted(text, match.start()):
+            continue
+        action = match.group("action")
+        if action:
+            from core.physical_observations import detect_user_physical_observations
+            records = detect_user_physical_observations(
+                "you are " + action, speaker="assistant",
+                action_families=USER_PHYSICAL_ACTION_FAMILIES | {
+                    "type": ("type", "types", "typed", "typing"),
+                    "laugh": ("laugh", "laughs", "laughed", "laughing"),
+                    "blink": ("blink", "blinks", "blinked", "blinking"),
+                },
+            )
+            detected = bool(records)
+        else:
+            # Possessive body/expression/world-event targets, rather than an
+            # abstract reply or the user's decision, denote sensory state.
+            detected = bool(re.match(
+                r"your\s+(?:expression|face|eyes?|hands?|fingers?|body|room|screen|"
+                r"monitor|camera|door|window|device|light|cursor)\b[^.!?;]{0,70}"
+                r"\b(?:to\s+)?(?:change|stop|finish|settle|move|turn|clear|load|"
+                r"become|go|flash|blink|open|close|quiet|dark|bright)\w*\b",
+                match.group("state") or "", re.I,
+            ))
+        if detected:
+            violations.append("Mairon claimed live physical-state monitoring without observation ingress")
+
     return violations
+
+
+def find_mairon_self_authority_violations(
+    *, user_input: str, draft: str, core_answer_contract=None, conversation=None,
+) -> List[str]:
+    """Ordinary direct-text lanes never acquire human experience or sensors.
+
+    This deterministic guard is shared by recommendation, opinion, factual and
+    social drafts. Candidate prose, USER topic/object facts and assistant history
+    grant neither capability. An actual future sensor/experience ingress belongs
+    to a distinct authorized path; this text-only transport invents no such grant.
+    """
+    return list(dict.fromkeys(
+        _unsupported_mairon_consumption_claims(draft)
+        + _unsupported_mairon_perception_claims(draft)
+        + _unsupported_mairon_physical_agency_claims(draft)
+    ))
 
 
 USER_PHYSICAL_ACTION_FAMILIES = {
@@ -2254,8 +2505,9 @@ def find_deterministic_grounding_violations(
         )
 
     for description in (
-        _unsupported_mairon_perception_claims(
-            draft=draft,
+        find_mairon_self_authority_violations(
+            user_input=user_input, draft=draft,
+            core_answer_contract=core_answer_contract, conversation=conversation,
         )
     ):
         violations.append(
@@ -2345,6 +2597,34 @@ def find_user_diagnostic_overclaim_violations(
         return []
 
     current_user = str(user_input or "").lower()
+    # A technical topic is not itself a diagnosis of the USER's setup.  A
+    # request for the function/definition of a component can mention a router,
+    # signal or network without supplying any failed measurement or actual
+    # physical layout.  Keep ordinary factual/observation checks in force;
+    # this validator owns only claims about a diagnostic task.
+    conceptual_request = bool(re.search(
+        r"\b(?:explain|describe)\s+what\s+(?!it\b|this\b|that\b|these\b|those\b)"
+        r"[^.!?]{1,140}\b(?:does|do|is|are)\b|"
+        r"\bwhat\s+(?:does|do)\s+(?!it\b|this\b|that\b|these\b|those\b)"
+        r"[^.!?]{1,140}\bdo\b|"
+        r"\bhow\s+(?:does|do)\s+(?!it\b|this\b|that\b|these\b|those\b)"
+        r"[^.!?]{1,140}\bwork\b|"
+        r"\bwhat\s+(?:is|are)\s+(?:an?\s+|the\s+(?:function|purpose|role)\b)",
+        current_user,
+        flags=re.IGNORECASE,
+    ))
+    diagnostic_request = bool(re.search(
+        r"\b(?:wrong|problem|fault|diagnos\w*|troubleshoot\w*|fail\w*|"
+        r"disconnect\w*|flicker\w*|slow\w*|stall\w*|freez\w*|lag\w*|"
+        r"caus\w*|broken|not\s+working|losing|lose|"
+        r"drops?|dropping|loss|symptoms?|measure\w*|readings?|tested|test|"
+        r"upstairs|downstairs)\b",
+        current_user,
+        flags=re.IGNORECASE,
+    ))
+    if conceptual_request and not diagnostic_request:
+        return []
+
     source = (
         current_user
         + "\n"
@@ -2545,12 +2825,15 @@ def find_user_diagnostic_overclaim_violations(
         "for example", "such as", "one possibility", "a possibility",
     )
     for detail in physical_details:
-        if detail in source or detail not in text:
+        # Physical evidence must name the physical detail.  For example,
+        # "firewall" neither asserts a wall nor supplies evidence for one.
+        detail_pattern = re.compile(r"(?<!\w)" + re.escape(detail) + r"(?!\w)", re.I)
+        if detail_pattern.search(source) or not detail_pattern.search(text):
             continue
         containing_units = [
             unit.strip()
             for unit in re.split(r"(?<=[.!?])\s+", text)
-            if detail in unit
+            if detail_pattern.search(unit)
         ]
         if not containing_units:
             continue
@@ -4392,7 +4675,9 @@ def find_explicit_user_constraint_violations(
     Oliver explicitly told Mairon not to make. General trade-off discussion is
     still allowed when it does not assign those preferences/facts to Oliver.
     """
-    from core.reasoning_trust import live_task_user_texts
+    from core.reasoning_trust import (
+        live_task_user_texts, explicit_output_constraints, find_scoped_output_constraint_violations,
+    )
     live_user_texts = live_task_user_texts(user_input, conversation)
     # A lexical guard cannot adjudicate a new value or revised requirement.
     # Keep the current-turn check, and let the existing semantic verifier
@@ -4407,7 +4692,9 @@ def find_explicit_user_constraint_violations(
         live_user_texts = (str(user_input or ""),)
     user = re.sub(r"\s+", " ", "\n".join(live_user_texts)).strip().lower()
     text = re.sub(r"\s+", " ", str(draft or "").strip()).lower()
-    violations: List[str] = []
+    violations: List[str] = find_scoped_output_constraint_violations(
+        draft, explicit_output_constraints(live_task_user_texts(user_input, conversation)),
+    )
 
     if re.search(
         r"\b(?:don['’]?t|do\s+not)\s+(?:invent|assume|infer)\b[^.!?]{0,80}\b(?:my\s+)?budget\b",

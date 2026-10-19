@@ -34,30 +34,72 @@ _DIMENSION = re.compile(
     r"\b(?P<dimension>writing(?:\s+style)?|prose|pacing|world[- ]?building|"
     r"character\s+(?:writing|work|development)|plot|story|dialogue|exposition|"
     r"ending|themes?|combat|romance|appeal|content|narrative|art(?:work)?|"
-    r"animation|acting|soundtrack|gameplay|controls|level\s+design)\b", re.I,
+    r"animation|acting|soundtrack|gameplay|controls|level\s+design|"
+    r"updates?|release\s+schedule)\b", re.I,
 )
 _PREDICATE = re.compile(
     r"^\s*(?:really\s+|actually\s+|generally\s+|mostly\s+|often\s+|usually\s+)*"
     r"(?:(?:is|are|was|were|feels?|seems?|remains?|looks?)\b\s*"
     r"|(?:does|doesn't|does\s+not|doesn['’]?t|does|has|have|had|keeps?|"
     r"drags?|works?|lacks?|uses?|relies|comes?|moves?|spends?|makes?|"
-    r"focuses|repeats|develops|handles|balances|rewards|suffers|offers)\b\s*)"
+    r"focuses|repeats|develops|handles|balances|rewards|suffers|offers|"
+    r"holds?\s+up|stands?\s+up)\b\s*)"
     r"(?P<property>.+)$", re.I,
+)
+_QUALITY_PRESERVATION = re.compile(
+    r"^\s*(?:(?:really|actually|generally|mostly|still)\s+)*"
+    r"(?:holds?|stands?)\s+up(?:\s+.+)?$", re.I,
+)
+_CONSUMPTION_PREDICATE = (
+    r"(?P<copula>\s+(?:is|was)|'s)\s+(?:just\s+|quite\s+|really\s+|"
+    r"a\s+|an\s+)*(?P<quality>[a-z][a-z -]{0,55}?)\s+"
+    r"(?P<experience>read|watch|play|experience|entertainment)\b"
 )
 _CONSUMPTION = re.compile(
     r"\b(?:it|this|that|the\s+(?:book|work|series|film|show|game|story))"
-    r"(?:\s+(?:is|was)|'s)\s+(?:just\s+|quite\s+|really\s+|"
-    r"a\s+|an\s+)*(?P<quality>[a-z][a-z -]{0,55}?)\s+"
-    r"(?P<experience>read|watch|play|experience|entertainment)\b", re.I,
+    + _CONSUMPTION_PREDICATE, re.I,
 )
-_EVALUATIVE = re.compile(
-    r"\b(?:consistent|inconsistent|clear|unclear|engaging|dull|boring|"
-    r"gripping|good|bad|great|poor|strong|weak|slow|fast|uneven|steady|"
-    r"coherent|incoherent|dense|bloated|thin|deep|shallow|competent|"
-    r"functional|adequate|decent|enjoyable|tedious|captivating|excellent|messy|predictable|surprising|"
-    r"satisfying|unsatisfying|original|derivative|subtle|clumsy|"
-    r"doesn't\s+drag|does\s+not\s+drag|doesn['’]?t\s+drag)\b", re.I,
+# Attributive appraisals have the same authority requirement as predicate
+# appraisals: "it has measured pacing" is not less specific than "the pacing
+# is measured". Recognise a bounded grammatical slot rather than a list of
+# approved/disallowed aesthetic adjectives.
+_ATTRIBUTE_BOUNDARY = re.compile(
+    r"\b(?:has|have|had|with|offers?|provides?|features?|boasts?|and)\b|[,;:]|['’]s\b", re.I,
 )
+_ATTRIBUTE_SYNTAX = frozenset({
+    "a", "an", "the", "its", "their", "our", "my", "your", "his", "her",
+    "it", "this", "that", "these", "those", "is", "are", "was", "were",
+    "i", "you", "we", "they", "whether", "what", "which", "whose", "how",
+    "to", "of", "for", "about", "on", "at", "in", "from", "by", "as",
+    "can", "could", "would", "should", "might", "may", "will", "must",
+    "like", "prefer", "enjoy", "want", "value", "need", "needs", "more", "less",
+})
+
+
+def _attributive_property(clause: str, start: int, end: int) -> str:
+    """Bounded nominal work-property assertion, never an adjective witness.
+
+    Only a modifier slot following possession/list grammar or a standalone
+    nominal appraisal is projected. Generic first-person taste and infinitive
+    discussion are not statements that this work possesses the property.
+    """
+    prefix = clause[:start]
+    boundaries = list(_ATTRIBUTE_BOUNDARY.finditer(prefix))
+    modifier = prefix[boundaries[-1].end():] if boundaries else prefix
+    modifier = re.sub(r"^\s*(?:a|an|the)\s+", "", modifier, flags=re.I).strip()
+    words = re.findall(r"[a-z]+(?:[-'][a-z]+)*", modifier, re.I)
+    if not words or len(words) > 4 or " ".join(words).casefold() != modifier.casefold():
+        return ""
+    if any(word.casefold() in _ATTRIBUTE_SYNTAX for word in words):
+        return ""
+    if not boundaries and re.search(r"\S", clause[end:]):
+        return ""  # A bare nominal fragment is bounded at its property noun.
+    # A later list item cannot borrow a property assertion from generic taste.
+    if re.match(r"^\s*i\s+(?:like|prefer|enjoy|want|value)\b", clause, re.I):
+        if not re.search(r"\b(?:it|this|that)\s+(?:has|offers?|provides?|features?|boasts?)\b",
+                         prefix, re.I):
+            return ""
+    return _normal(modifier)
 _NONASSERTIVE = re.compile(
     r"^\s*(?:(?:well|honestly|personally)\s*[,;:]\s*)?"
     r"(?:if\b|unless\b|assuming\b|suppose\b|imagine\b|"
@@ -130,28 +172,37 @@ def asserted_opinion_clauses(draft: str) -> Tuple[str, ...]:
     return tuple(result)
 
 
-def project_work_appraisals(draft: str) -> Tuple[WorkAppraisalObligation, ...]:
+def project_work_appraisals(draft: str, *, subject: str = "") -> Tuple[WorkAppraisalObligation, ...]:
     """Project bounded work properties without inferring knowledge from prose."""
     found = []
     for index, clause in enumerate(asserted_opinion_clauses(draft), 1):
         literal = re.sub(r'"[^"\n]*"|“[^”\n]*”|(?<!\w)\'[^\'\n]*\'(?!\w)',
                          lambda match: " " * len(match.group()), clause)
         for match in _DIMENSION.finditer(literal):
-            predicate = _PREDICATE.match(literal[match.end():])
-            if not predicate:
-                continue
             # Mentioning a property in a nonassertive question is not appraisal.
             prefix = literal[:match.start()]
             if re.search(r"\b(?:whether|if|how)\b", prefix, re.I):
                 continue
-            found.append(WorkAppraisalObligation(
-                index, _normal(match.group("dimension")),
-                _normal(literal[match.end():]), clause,
-            ))
+            dimension = _normal(match.group("dimension"))
+            tail = literal[match.end():]
+            if _PREDICATE.match(tail) or _QUALITY_PRESERVATION.match(tail):
+                found.append(WorkAppraisalObligation(index, dimension, _normal(tail), clause))
+            modifier = _attributive_property(literal, match.start(), match.end())
+            if modifier:
+                copula = "are" if dimension in {"updates", "themes", "controls"} else "is"
+                found.append(WorkAppraisalObligation(index, dimension, copula + " " + modifier, clause))
         experience = _CONSUMPTION.search(literal)
-        if experience and _EVALUATIVE.search(experience.group("quality")):
+        if not experience and subject:
+            experience = re.search(
+                r"(?<!\w)" + re.escape(subject) + r"(?!\w)" + _CONSUMPTION_PREDICATE,
+                literal, re.I,
+            )
+        if experience:
             found.append(WorkAppraisalObligation(
-                index, "consumption_appraisal", _normal(experience.group(0)), clause,
+                index, "consumption_appraisal",
+                ("was" if _normal(experience.group("copula")) == "was" else "is")
+                + " " + _normal(experience.group("quality"))
+                + " " + _normal(experience.group("experience")), clause,
             ))
     return tuple(found)
 
@@ -177,7 +228,7 @@ def _user_property_witnesses(user_input: str, conversation: Any, subject: str):
     for turn in turns[-5:]:
         if not _same_subject(subject, turn):
             continue
-        for item in project_work_appraisals(turn):
+        for item in project_work_appraisals(turn, subject=subject):
             latest[item.dimension] = item.predicate
     return latest
 
@@ -270,7 +321,7 @@ def find_opinion_knowledge_violations(
         return []
     if _claimed_personal_consumption(draft, subject):
         return ["unknown-media opinion claimed human-style media consumption rather than an evidence-backed knowledge basis"]
-    obligations = project_work_appraisals(draft)
+    obligations = project_work_appraisals(draft, subject=subject)
     if not obligations:
         return []
     if _admitted_subject_research(research_evidence, subject):

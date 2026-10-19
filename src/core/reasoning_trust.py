@@ -223,5 +223,112 @@ def render_reasoning_trust_instruction(frame: ReasoningTrustFrame) -> str:
         )
     elif frame.stance_state in {"left", "right"}:
         lines.append("- Preserve or explicitly revise the established subjective side; its old factual justification is not evidence.")
+    constraints = explicit_output_constraints(frame.live_user_turns)
+    if constraints:
+        lines.extend([
+            "CORE EXPLICIT OUTPUT EXCLUSIONS (USER-owned, active task only):",
+            json.dumps([{"kind": item.kind, "target": item.target} for item in constraints], ensure_ascii=False),
+            "Preserve these exclusions on every draft and retry. A no-overall-ranking constraint "
+            "allows criterion-specific trade-offs, not an overall winner or final better-choice verdict. "
+            "A forbidden recommendation or speculation topic is not an invitation to paraphrase it.",
+        ])
     lines.extend(["LIVE USER TASK DATA:", json.dumps(frame.live_user_turns, ensure_ascii=False)])
     return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ExplicitOutputConstraint:
+    """A bounded output exclusion, not evidence about its topic."""
+    kind: str
+    target: str = ""
+
+
+def _constraint_text(value):
+    return re.sub(r"\s+", " ", str(value or "").replace("’", "'")).strip()
+
+
+def _constraint_clauses(value):
+    # Quoted instructions are data. Keep quoted single words (e.g. an adjective)
+    # available, without promoting a quoted directive into a USER instruction.
+    text = _constraint_text(value)
+    text = re.sub(r'"[^"\n]*"|“[^”\n]*”|(?<!\w)\'[^\'\n]*\'(?!\w)',
+                  lambda m: " " * len(m.group()) if re.search(
+                      r"\b(?:don't|do\s+not|never|avoid|recommend|rank|speculate)\b", m.group(), re.I)
+                  else m.group().strip('\"\'“”'), text)
+    return tuple(part.strip() for part in re.split(r"(?<=[.!?;])\s+|;|\bbut\b|\bhowever\b", text, flags=re.I) if part.strip())
+
+
+def explicit_output_constraints(user_turns):
+    """Project three bounded exclusion families with chronological revision.
+
+    USER scope comes from live_task_user_texts. No assistant text or candidate
+    can create/revise an exclusion, and unrelated topics reset that packet.
+    """
+    state = {}
+    for turn in tuple(user_turns or ()):
+        for clause in _constraint_clauses(turn):
+            if re.match(r"^(?:if|unless|suppose|imagine|example)\b", clause, re.I):
+                continue
+            if re.search(r"\b(?:he|she|they|someone)\s+(?:said|told|asked)\b", clause, re.I):
+                continue
+            negative = re.search(r"\b(?:don't|do\s+not|never|avoid)\s+(?P<body>.+)", clause, re.I)
+            if negative:
+                body = negative.group("body")
+                if (re.search(r"\b(?:rank|pick|choose|declare|tell|say|claim|recommend|decide)\b", body, re.I)
+                        and re.search(r"\b(?:overall|universally|outright|winner|in\s+general)\b", body, re.I)):
+                    state[("overall_ranking", "")] = ExplicitOutputConstraint("overall_ranking")
+                for kind, pattern in (
+                    ("recommendation", r"^(?:please\s+)?recommend\s+(?P<target>.+)"),
+                    ("speculation", r"^(?:please\s+)?speculate\s+(?:about|on)\s+(?P<target>.+)"),
+                ):
+                    match = re.match(pattern, body, re.I)
+                    if match:
+                        target = re.split(r",|\b(?:and|please|instead|just)\b", match.group("target"), maxsplit=1, flags=re.I)[0]
+                        target = re.sub(r"\s+(?:to\s+me|at\s+all)$", "", target, flags=re.I).strip(" .,:;\"'")
+                        if target:
+                            state[(kind, target.casefold())] = ExplicitOutputConstraint(kind, target)
+                continue
+            # A new explicit USER permission can revise the corresponding
+            # exclusion. A generic 'actually' or an assistant suggestion cannot.
+            if not re.match(r"^(?:actually|instead|now|correction)[,: ]+", clause, re.I):
+                continue
+            if re.search(r"\b(?:rank|pick|choose|recommend|name)\b.+\b(?:overall|winner)\b", clause, re.I):
+                state.pop(("overall_ranking", ""), None)
+            for key, item in tuple(state.items()):
+                verb = "recommend" if item.kind == "recommendation" else "speculate"
+                if item.target and re.search(r"\b" + verb + r"\b.*(?<!\w)" + re.escape(item.target) + r"(?!\w)", clause, re.I):
+                    state.pop(key, None)
+    return tuple(state.values())
+
+
+def find_scoped_output_constraint_violations(draft, constraints):
+    """Check clear output-act contradictions, without judging topical truth."""
+    failures = []
+    for clause in _constraint_clauses(draft):
+        if re.match(r"^(?:if|suppose|imagine)\b", clause, re.I) or clause.endswith("?"):
+            continue
+        if re.search(r"\b(?:neither|no\s+overall\s+winner|not\s+(?:universally|overall)\s+better)\b", clause, re.I):
+            continue
+        for item in constraints:
+            if item.kind == "overall_ranking":
+                verdict = re.search(r"\b(?:better|best|superior|wins?|winner)\b", clause, re.I)
+                if not verdict:
+                    continue
+                if re.search(r"\b(?:don't|do\s+not|won't|will\s+not|cannot|can't)\s+(?:rank|pick|choose|declare|say|name)\b", clause, re.I):
+                    continue
+                # Specific comparative dimensions are permitted. Broad choice
+                # verdicts and explicit universal/overall claims are not.
+                specific = re.search(r"\bfor\s+(?!you\b|your\b|everyone\b|everything\b|all\b|overall\b)\w+", clause[verdict.end():], re.I)
+                universal = re.search(r"\b(?:overall|universally|outright|in\s+general)\b", clause, re.I)
+                if universal or not specific:
+                    failures.append("explicit_output_constraint_overall_ranking")
+            elif item.target and re.search(r"(?<!\w)" + re.escape(item.target) + r"(?!\w)", clause, re.I):
+                if item.kind == "recommendation":
+                    if re.search(r"\b(?:don't|do\s+not|won't|will\s+not|cannot|can't)\s+(?:recommend|suggest|choose|pick)\b", clause, re.I):
+                        continue
+                    if re.search(r"\b(?:recommend|suggest|choose|pick|opt\s+for|go\s+for)\b|\b(?:should|ought\s+to)\s+(?:use|buy|select)\b|\b(?:best|better)\s+choice\b", clause, re.I):
+                        failures.append("explicit_output_constraint_recommendation")
+                elif re.search(r"\b(?:perhaps|maybe|possibly|might|could|may|suspect|guess|speculat\w*)\b", clause, re.I):
+                    if not re.search(r"\b(?:won't|will\s+not|don't|do\s+not)\s+(?:guess|speculate)\b", clause, re.I):
+                        failures.append("explicit_output_constraint_speculation")
+    return list(dict.fromkeys(failures))

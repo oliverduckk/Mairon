@@ -117,7 +117,41 @@ def admitted_body_sources(packet):
     return {key: value for key, value in result.items() if value is not None}
 
 
-def build_public_claim_obligations(sentences):
+def _purpose_owns_reason(target, value, body="", *, sentences=(), request_antecedent=False):
+    """A nested purpose cannot discharge an independent outer reason claim.
+
+    A need/use-because construction can express the requested purpose itself.
+    Other explicit reason clauses retain their ordinary content obligation,
+    even when a subordinate clause also mentions a valid purpose relationship.
+    The bounded head uses the Core request's roles, never inferred synonyms.
+    """
+    reasons = tuple(_REASON.finditer(value))
+    if not reasons:
+        return True
+    if len(reasons) != 1 or _normal(reasons[0].group()) != "because":
+        return False
+    subject, requirement = target.get("mechanism"), target.get("effect")
+    if not isinstance(subject, str) or not isinstance(requirement, str):
+        return False
+    head = _normal(value[:reasons[0].start()])
+    head = re.sub(r"^(?:(?:first|second|third|finally|also|therefore|however|instead|thus)\s*,\s*)+", "", head)
+    # Permit only a bounded nominal head whose entire predicate is the
+    # requested use/need/require relation. Alias authority comes from body
+    # data, never from a proposed name or a positive verifier flag.
+    match = re.fullmatch(r"(?P<subject>[\w'’() -]+?)\s+"
+                         r"(?:(?:does|do|did)\s+not\s+|(?:can|could|may|might|must|will|would)(?:\s+not)?\s+)?"
+                         r"(?:uses?|needs?|requires?)\s+(?P<requirement>[\w'’() -]+)", head)
+    if not match:
+        return False
+    from research.public_explanation_targets import public_nominal_role_bridge, public_reference_bridge
+    return all(public_nominal_role_bridge(role, nominal, body)
+               or public_reference_bridge(role, nominal, other, sentences,
+                                          request_antecedent=request_antecedent)
+               for role, nominal, other in ((subject, match.group("subject"), requirement),
+                                            (requirement, match.group("requirement"), subject)))
+
+
+def build_public_claim_obligations(sentences, explanation_obligations=(), evidence_packet=None):
     """Recognise bounded relational/reason content; never infer its truth."""
     obligations = []
     for sentence_index, sentence in enumerate(sentences, 1):
@@ -133,7 +167,30 @@ def build_public_claim_obligations(sentences):
         ) and not re.search(r"\b(?:but|however|because|and\s+(?:it|they|the|this))\b", value, re.I):
             continue
         claims = [("entity_relation", relation) for relation in _relations(value)]
-        if _REASON.search(value):
+        # Request-side purpose roles belong to Core, not candidate prose. The
+        # shared target interpreter only recognises whether this candidate
+        # carries that relationship; it supplies no authority or entailment.
+        # Optional advice explaining a different proposition stays on the
+        # ordinary content protocol rather than becoming a purpose exception.
+        purpose_targets = ()
+        if explanation_obligations:
+            from research.public_explanation_targets import purpose_candidate_bound
+            # Retained bodies may establish literal aliases for shape/role
+            # projection. They do not establish candidate entailment here;
+            # every content assessment still selects and proves one body.
+            contexts = ("",) + tuple(source["content_excerpt"]
+                                      for source in admitted_body_sources(evidence_packet).values())
+            purpose_targets = tuple(
+                dict(target) for target in explanation_obligations
+                if isinstance(target, Mapping)
+                and target.get("relation_type") == "purpose_or_necessity"
+                and any(purpose_candidate_bound(target, value, source_quote=body, sentences=sentences,
+                                                request_antecedent=len(explanation_obligations) == 1)
+                        and _purpose_owns_reason(target, value, body, sentences=sentences,
+                                                request_antecedent=len(explanation_obligations) == 1)
+                        for body in contexts)
+            )
+        if _REASON.search(value) or purpose_targets:
             claims.append(("explanation", None))
         if _RECEPTION.search(value):
             claims.append(("reception", None))
@@ -142,6 +199,12 @@ def build_public_claim_obligations(sentences):
                      "kind": kind, "candidate_span": value}
             if relation:
                 entry["relation"] = relation
+            if kind == "explanation" and purpose_targets:
+                entry["explanation_targets"] = purpose_targets
+                # Immediate surviving reference context only. This is still
+                # candidate prose, not an evidence witness or stored memory.
+                entry["candidate_context"] = tuple(sentences[max(0, sentence_index - 2):sentence_index])
+                entry["single_requested_explanation"] = len(explanation_obligations) == 1
             obligations.append(entry)
     return tuple(obligations)
 
@@ -244,16 +307,67 @@ def _reception_propositions(text):
     return found
 
 
-def _content_witness_issue(item, quote):
+def _content_witness_issue(item, quote, source_body=None):
     candidate = item["candidate_span"]
     if _factual_scope(quote) != _factual_scope(candidate):
         return "content_assertion_scope_mismatch"
     # Preserve proper entity anchors. A source about a different named subject
     # cannot satisfy this proposition through a shared popularity/reason verb.
-    names = [name for name in re.findall(_NAME, candidate) if name not in _NON_NAMES]
-    if names and any(_normal(name) not in _normal(quote) for name in names):
+    # Sentence grammar is not a new named subject. Keep complete nominal
+    # names otherwise; do not split them into token-overlap evidence.
+    names = []
+    for match in re.finditer(_NAME, candidate):
+        name = match.group()
+        if name in _NON_NAMES:
+            continue
+        if (re.fullmatch(r"(?:First|Second|Third|Finally|Also|Therefore|However|Instead|Thus)", name)
+                and not candidate[:match.start()].strip()
+                and candidate[match.end():].lstrip().startswith(",")):
+            continue
+        nominal = re.sub(r"^(?:the|a|an)\s+", "", name, flags=re.I)
+        if nominal not in _NON_NAMES:
+            names.append(nominal)
+    identity_context = source_body if isinstance(source_body, str) else quote
+    purpose_targets = item.get("explanation_targets", ()) if item["kind"] == "explanation" else ()
+    for name in names:
+        from research.public_explanation_targets import public_alias_normalize
+        # A literal whole-word identity remains valid even when normalizing a
+        # larger source-established alias would replace the phrase containing
+        # it. Do not turn an already witnessed name into a missing one.
+        if re.search(r"(?<!\w)" + re.escape(_normal(name)) + r"(?!\w)", _normal(quote)):
+            continue
+        canonical_name = _normal(public_alias_normalize(name, identity_context))
+        canonical_quote = _normal(public_alias_normalize(quote, identity_context))
+        if re.search(r"(?<!\w)" + re.escape(canonical_name) + r"(?!\w)", canonical_quote):
+            continue
+        if purpose_targets:
+            from research.public_explanation_targets import public_role_bridge
+            nominal = re.sub(r"^(?:the|a|an)\s+", "", name, flags=re.I)
+            # The old proper-name regex may capture a determiner or a
+            # technical nominal in the opposite word order. Only the two
+            # Core-requested roles and literal source-established aliases
+            # receive this bridge; unrelated new named subjects still fail.
+            if any(public_role_bridge(role, quote, identity_context)
+                   and (public_role_bridge(role, nominal, identity_context)
+                        or public_role_bridge(nominal, role, identity_context))
+                   for target in purpose_targets for role in (target.get("mechanism"), target.get("effect"))):
+                continue
         return "content_subject_mismatch"
     if item["kind"] == "explanation":
+        purpose_targets = item.get("explanation_targets", ())
+        if purpose_targets:
+            # A supported purpose may use allows/lets/uses-to rather than a
+            # literal because clause. Share the same typed role/direction and
+            # body-relation validator as request completion. This never skips
+            # the independent strict claim assessment or admitted witness.
+            from research.public_explanation_targets import purpose_claim_witness_issue
+            for target in purpose_targets:
+                issue = purpose_claim_witness_issue(target, candidate, quote, source_context=identity_context,
+                    sentences=item.get("candidate_context", ()),
+                    request_antecedent=item.get("single_requested_explanation") is True)
+                if issue:
+                    return issue
+            return None
         claim_marker, source_marker = _REASON.search(candidate), _REASON.search(quote)
         if not source_marker:
             return "explanation_witness_missing"
@@ -265,7 +379,9 @@ def _content_witness_issue(item, quote):
                 (candidate[:claim_marker.start()], quote[:source_marker.start()]),
                 (candidate[claim_marker.end():], quote[source_marker.end():]),
             ):
-                wanted, offered = _stem_atoms(_literal_atoms(claim_part)), _stem_atoms(_literal_atoms(source_part))
+                from research.public_explanation_targets import public_alias_normalize
+                wanted = _stem_atoms(_literal_atoms(public_alias_normalize(claim_part, identity_context)))
+                offered = _stem_atoms(_literal_atoms(public_alias_normalize(source_part, identity_context)))
                 if wanted and not wanted.issubset(offered):
                     return "explanation_anchor_mismatch"
     elif item["kind"] == "reception":
@@ -302,6 +418,12 @@ def public_claim_failures(obligations, raw_assessments, packet, annotation_prese
         sources = admitted_body_sources(packet)
         literal = []
         for item in obligations:
+            # Newly composed purpose claims retain their independent typed
+            # assessment even if rendering happens to copy a body clause.
+            # The historical literal proof remains for ordinary callers.
+            if item.get("explanation_targets"):
+                fail(item, "missing_claim_assessments")
+                continue
             match = next(((key, source) for key, source in sources.items()
                           if item["candidate_span"] in _body_clauses(source["content_excerpt"])), None)
             if match:
@@ -339,6 +461,10 @@ def public_claim_failures(obligations, raw_assessments, packet, annotation_prese
                 or len(quote) > 800 or quote not in source["content_excerpt"]):
             fail(item, "missing_admitted_body_witness")
             continue
+        purpose_targets = item.get("explanation_targets", ()) if item["kind"] == "explanation" else ()
+        if len(purpose_targets) == 1:
+            from research.public_explanation_targets import canonical_purpose_witness
+            quote = canonical_purpose_witness(purpose_targets[0], quote, source["content_excerpt"])
         if not _body_quote_scope_matches(source["content_excerpt"], quote, item["candidate_span"]):
             fail(item, "relation_polarity_mismatch" if item["kind"] == "entity_relation"
                  else "content_assertion_scope_mismatch")
@@ -360,7 +486,7 @@ def public_claim_failures(obligations, raw_assessments, packet, annotation_prese
             elif _factual_scope(quote) != _factual_scope(item["candidate_span"]):
                 fail(item, "relation_polarity_mismatch")
         else:
-            issue = _content_witness_issue(item, quote)
+            issue = _content_witness_issue(item, quote, source_body=source["content_excerpt"])
             if issue:
                 fail(item, issue)
     return failures
