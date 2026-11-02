@@ -35,6 +35,11 @@ from core.conversation_claim_boundary import (
 from core.orchestrator import (
     MaironCore,
 )
+from core.authority_handoff import (
+    CORE_UNAVAILABLE_MESSAGE,
+    prepare_core_turn,
+    seal_prepared_turn,
+)
 from core.response_timer import (
     ResponseTimer,
 )
@@ -133,6 +138,7 @@ class _PendingApproval:
     route_mode: Optional[str] = None
     workflow: Optional[str] = None
     agent_action: Optional[str] = None
+    core_authority: Any = None
 
 
 class MaironApplication:
@@ -1026,24 +1032,17 @@ class MaironApplication:
         # Core routing/workflows
         # --------------------------------------------------
 
-        core_decision = None
-
-        try:
-            core_decision = (
-                self.core.prepare_turn(
-                    text
-                )
+        preparation = prepare_core_turn(self.core, text)
+        if preparation.status == "unavailable":
+            self._emit_event("[Core] Preparation unavailable; provider continuation blocked.")
+            return self._finalize_error(
+                user_text=text,
+                answer=CORE_UNAVAILABLE_MESSAGE,
+                timer=response_timer,
+                channel=channel_value,
             )
-
-        except Exception as exc:
-            # Preserve the current terminal behaviour: a Core routing bug
-            # degrades to the provider path rather than killing the session.
-            self._emit_event(
-                "[Core] Pre-routing failed: "
-                + str(
-                    exc
-                )
-            )
+        core_decision = preparation.decision
+        core_authority = None
 
         intent = None
         authority = None
@@ -1178,76 +1177,82 @@ class MaironApplication:
                     agent_action=agent_action,
                 )
 
-            conversational_claim_mode = (
-                apply_conversational_claim_boundary(
-                    turn=turn,
-                    route=route,
-                    contract=(
-                        core_decision
-                        .answer_contract
-                    ),
-                )
-            )
-
-            if conversational_claim_mode:
-                label = (
-                    "social claim ceiling"
-                    if conversational_claim_mode
-                    == "social_claim_ceiling"
-                    else "recommendation detail ceiling"
+            try:
+                conversational_claim_mode = (
+                    apply_conversational_claim_boundary(
+                        turn=turn,
+                        route=route,
+                        contract=(
+                            core_decision
+                            .answer_contract
+                        ),
+                    )
                 )
 
-                self._emit_event(
-                    "[Grounding] Conversational "
-                    + label
-                    + " active."
+                if conversational_claim_mode:
+                    label = (
+                        "social claim ceiling"
+                        if conversational_claim_mode
+                        == "social_claim_ceiling"
+                        else "recommendation detail ceiling"
+                    )
+
+                    self._emit_event(
+                        "[Grounding] Conversational "
+                        + label
+                        + " active."
+                    )
+
+                core_authority = seal_prepared_turn(core_decision)
+                turn_instructions = (
+                    self.instructions
+                    + "\n\n"
+                    + core_authority.runtime.model_instruction
                 )
 
-            turn_instructions = (
-                self.instructions
-                + "\n\n"
-                + (
-                    core_decision
-                    .answer_contract
-                    .to_model_instruction()
-                )
-            )
-
-            claim_boundary_instruction = (
-                build_conversational_claim_boundary_instruction(
-                    turn=turn,
-                    route=route,
-                    mode=conversational_claim_mode,
-                )
-            )
-
-            if claim_boundary_instruction:
-                turn_instructions += (
-                    "\n\n"
-                    + claim_boundary_instruction
+                claim_boundary_instruction = (
+                    build_conversational_claim_boundary_instruction(
+                        turn=turn,
+                        route=route,
+                        mode=conversational_claim_mode,
+                    )
                 )
 
-            continuity_instruction = (
-                build_live_user_continuity_instruction(
-                    turn
-                )
-            )
+                if claim_boundary_instruction:
+                    turn_instructions += (
+                        "\n\n"
+                        + claim_boundary_instruction
+                    )
 
-            if continuity_instruction:
-                turn_instructions += (
-                    "\n\n"
-                    + continuity_instruction
-                )
-
-                self._emit_event(
-                    "[Context] Immediate prior Oliver turn supplied "
-                    "for live continuity."
+                continuity_instruction = (
+                    build_live_user_continuity_instruction(
+                        turn
+                    )
                 )
 
-        else:
-            turn_instructions = (
-                self.instructions
-            )
+                if continuity_instruction:
+                    turn_instructions += (
+                        "\n\n"
+                        + continuity_instruction
+                    )
+
+                    self._emit_event(
+                        "[Context] Immediate prior SampleUser turn supplied "
+                        "for live continuity."
+                    )
+
+            except Exception:
+                self._emit_event("[Core] Contract preparation unavailable; provider continuation blocked.")
+                return self._finalize_error(
+                    user_text=text,
+                    answer=CORE_UNAVAILABLE_MESSAGE,
+                    timer=response_timer,
+                    channel=channel_value,
+                    intent=intent,
+                    authority=authority,
+                    route_mode=route_mode,
+                    workflow=workflow,
+                )
 
         # --------------------------------------------------
         # Provider/router
@@ -1280,6 +1285,7 @@ class MaironApplication:
                     turn_instructions,
                     self.local_state,
                     self.cloud_state,
+                    core_authority=core_authority,
                 )
 
         except Exception as exc:
@@ -1318,6 +1324,7 @@ class MaironApplication:
                     router_result=result,
                     user_text=text,
                     instructions=turn_instructions,
+                    core_authority=core_authority,
                     response_timer=response_timer,
                     channel=channel_value,
                     intent=intent,
@@ -1375,6 +1382,7 @@ class MaironApplication:
                     router_result=result,
                     user_text=text,
                     instructions=turn_instructions,
+                    core_authority=core_authority,
                     response_timer=response_timer,
                     channel=channel_value,
                     intent=intent,
@@ -1479,6 +1487,7 @@ class MaironApplication:
                             pending.instructions,
                             self.local_state,
                             self.cloud_state,
+                            core_authority=pending.core_authority,
                         )
                     )
 
@@ -1490,6 +1499,7 @@ class MaironApplication:
                             pending.instructions,
                             self.local_state,
                             self.cloud_state,
+                            core_authority=pending.core_authority,
                         )
                     )
 
@@ -1556,6 +1566,7 @@ class MaironApplication:
                     instructions=(
                         pending.instructions
                     ),
+                    core_authority=pending.core_authority,
                     response_timer=(
                         pending.response_timer
                     ),

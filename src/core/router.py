@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+from core.authority_handoff import PreparedAuthority, CoreAuthorityUnavailable
+
 from core.action_manager import (
     execute_approved_action,
     format_action_result,
@@ -16,6 +18,7 @@ class RouteResult:
     pending_action: dict | None = None
     local_state: Any = None
     cloud_state: Any = None
+    core_authority: PreparedAuthority | None = None
 
 
 def parse_cloud_command(
@@ -192,14 +195,27 @@ def _local_model_label(
     ).strip()
 
 
+def cloud_authority_supported(core_authority: PreparedAuthority) -> bool:
+    try:
+        core_authority.require_cloud()
+        return True
+    except CoreAuthorityUnavailable:
+        return False
+
+
 def route_message(
     local_ai,
     cloud_ai,
     user_input,
     instructions,
     local_state=None,
-    cloud_state=None
+    cloud_state=None,
+    *,
+    core_authority: PreparedAuthority,
 ):
+    if not isinstance(core_authority, PreparedAuthority):
+        raise CoreAuthorityUnavailable("Trusted Core authority is unavailable.")
+    core_authority.require_local()
     use_cloud, clean_input = (
         parse_cloud_command(
             user_input
@@ -232,6 +248,8 @@ def route_message(
                 cloud_state=cloud_state
             )
 
+        core_authority.require_cloud()
+
         print(
             "[AI] Using cloud: GPT-5.6 Luna"
         )
@@ -241,7 +259,8 @@ def route_message(
                 cloud_ai["client"],
                 clean_input,
                 instructions,
-                cloud_state
+                cloud_state,
+                core_answer_contract=core_authority.runtime,
             )
         )
 
@@ -249,7 +268,8 @@ def route_message(
             status="answered",
             answer=answer,
             local_state=local_state,
-            cloud_state=new_cloud_state
+            cloud_state=new_cloud_state,
+            core_authority=core_authority,
         )
 
     # --------------------------------------------------
@@ -265,13 +285,15 @@ def route_message(
     if (
         recommend_cloud
         and cloud_ai is not None
+        and cloud_authority_supported(core_authority)
     ):
         return RouteResult(
             status="cloud_approval_required",
             reason=recommendation_reason,
             pending_prompt=clean_input,
             local_state=local_state,
-            cloud_state=cloud_state
+            cloud_state=cloud_state,
+            core_authority=core_authority,
         )
 
     # --------------------------------------------------
@@ -295,7 +317,8 @@ def route_message(
         clean_input,
         instructions,
         local_state,
-        allow_cloud_escalation=True
+        allow_cloud_escalation=True,
+        core_answer_contract=core_authority.runtime,
     )
 
     if pending_action:
@@ -304,7 +327,17 @@ def route_message(
             pending_prompt=clean_input,
             pending_action=pending_action,
             local_state=new_local_state,
-            cloud_state=cloud_state
+            cloud_state=cloud_state,
+            core_authority=core_authority,
+        )
+
+    if escalation_reason and not cloud_authority_supported(core_authority):
+        return RouteResult(
+            status="answered",
+            answer=(answer or "The cloud provider cannot satisfy this turn's required Core obligations."),
+            local_state=new_local_state,
+            cloud_state=cloud_state,
+            core_authority=core_authority,
         )
 
     if escalation_reason:
@@ -313,14 +346,16 @@ def route_message(
             reason=escalation_reason,
             pending_prompt=clean_input,
             local_state=new_local_state,
-            cloud_state=cloud_state
+            cloud_state=cloud_state,
+            core_authority=core_authority,
         )
 
     return RouteResult(
         status="answered",
         answer=answer,
         local_state=new_local_state,
-        cloud_state=cloud_state
+        cloud_state=cloud_state,
+        core_authority=core_authority,
     )
 
 
@@ -329,8 +364,13 @@ def approve_cloud_escalation(
     prompt,
     instructions,
     local_state=None,
-    cloud_state=None
+    cloud_state=None,
+    *,
+    core_authority: PreparedAuthority,
 ):
+    if not isinstance(core_authority, PreparedAuthority):
+        raise CoreAuthorityUnavailable("Trusted Core authority is unavailable.")
+    core_authority.require_cloud()
     if cloud_ai is None:
         return RouteResult(
             status="answered",
@@ -338,7 +378,8 @@ def approve_cloud_escalation(
                 "Cloud processing is not configured."
             ),
             local_state=local_state,
-            cloud_state=cloud_state
+            cloud_state=cloud_state,
+            core_authority=core_authority,
         )
 
     print(
@@ -354,7 +395,8 @@ def approve_cloud_escalation(
             cloud_ai["client"],
             prompt,
             instructions,
-            cloud_state
+            cloud_state,
+            core_answer_contract=core_authority.runtime,
         )
     )
 
@@ -362,7 +404,8 @@ def approve_cloud_escalation(
         status="answered",
         answer=answer,
         local_state=local_state,
-        cloud_state=new_cloud_state
+        cloud_state=new_cloud_state,
+        core_authority=core_authority,
     )
 
 
@@ -371,8 +414,13 @@ def decline_cloud_escalation(
     prompt,
     instructions,
     local_state=None,
-    cloud_state=None
+    cloud_state=None,
+    *,
+    core_authority: PreparedAuthority,
 ):
+    if not isinstance(core_authority, PreparedAuthority):
+        raise CoreAuthorityUnavailable("Trusted Core authority is unavailable.")
+    core_authority.require_local()
     print(
         "[Router] Cloud processing declined. "
         "Continuing locally."
@@ -395,7 +443,8 @@ def decline_cloud_escalation(
         prompt,
         instructions,
         local_state,
-        allow_cloud_escalation=False
+        allow_cloud_escalation=False,
+        core_answer_contract=core_authority.runtime,
     )
 
     if pending_action:
@@ -404,14 +453,16 @@ def decline_cloud_escalation(
             pending_prompt=prompt,
             pending_action=pending_action,
             local_state=new_local_state,
-            cloud_state=cloud_state
+            cloud_state=cloud_state,
+            core_authority=core_authority,
         )
 
     return RouteResult(
         status="answered",
         answer=answer,
         local_state=new_local_state,
-        cloud_state=cloud_state
+        cloud_state=cloud_state,
+        core_authority=core_authority,
     )
 
 

@@ -12,6 +12,9 @@ from core.action_manager import describe_action
 from core.acceptance_shadow import emit_shadow_record
 from core.acceptance_publication import emit_publication_record
 from core.orchestrator import MaironCore
+from core.authority_handoff import (
+    CORE_UNAVAILABLE_MESSAGE, prepare_core_turn, seal_prepared_turn,
+)
 from core.conversation_state import (
     append_visible_turn_to_model_history,
 )
@@ -224,7 +227,7 @@ Current interface capabilities:
 - When Mairon is being used through the local voice interface, Mairon Core can render
   your final response aloud through local text-to-speech.
 - Speaking your response is an OUTPUT CHANNEL, not an external action tool.
-- Therefore, if {input_name} says "say Oliver", "repeat this", "say my name", or asks
+- Therefore, if {input_name} says "say SampleUser", "repeat this", "say my name", or asks
   you to speak ordinary text during a voice interaction, simply produce the requested
   words as your response. Do NOT say you lack the ability to speak merely because no
   speech tool appears in the action-tool list.
@@ -335,7 +338,7 @@ def normalise_voice_input(text):
     # There is no Myron. There is only Mairon.
     #
     # Whisper strongly prefers common spellings such as "Myron".
-    # Oliver has explicitly chosen to treat these likely variants as
+    # SampleUser has explicitly chosen to treat these likely variants as
     # Mairon anywhere in voice transcripts rather than only at the
     # beginning of the utterance.
     value = re.sub(
@@ -548,7 +551,7 @@ def deliver_pending_research_results():
 
     input() is intentionally left blocking, so a report that finishes while the
     terminal is idle appears at the next loop boundary rather than printing
-    through the middle of Oliver's prompt.
+    through the middle of SampleUser's prompt.
     """
 
     global local_state
@@ -661,7 +664,7 @@ def emit_final_response(
     response_timer measures ACTIVE processing time only:
     - starts once final user text exists;
     - stops when the answer is ready to display;
-    - excludes STT, TTS playback, and time Oliver spends at approval prompts.
+    - excludes STT, TTS playback, and time SampleUser spends at approval prompts.
     """
 
     global last_user_input
@@ -955,19 +958,17 @@ while True:
     # Mairon Core
     # --------------------------------------------------
 
-    try:
-        core_decision = mairon_core.prepare_turn(
-            user_input
+    preparation = prepare_core_turn(mairon_core, user_input)
+    if preparation.status == "unavailable":
+        print("[Core] Preparation unavailable; provider continuation blocked.")
+        emit_final_response(
+            user_input=user_input,
+            answer=CORE_UNAVAILABLE_MESSAGE,
+            response_timer=response_timer,
         )
-
-    except Exception as error:
-        # Core is still being built. A pre-routing bug should degrade to
-        # the existing provider rather than taking the whole assistant down.
-        print(
-            f"[Core] Pre-routing failed: {error}"
-        )
-
-        core_decision = None
+        continue
+    core_decision = preparation.decision
+    core_authority = None
 
     if core_decision is not None:
         turn = core_decision.turn
@@ -1058,42 +1059,54 @@ while True:
 
         # Normal model turns receive Core's structured per-turn contract as
         # part of the system instructions.
-        turn_instructions = (
-            mairon_instructions
-            + "\n\n"
-            + (
-                core_decision
-                .answer_contract
-                .to_model_instruction()
+        try:
+            core_authority = seal_prepared_turn(core_decision)
+            turn_instructions = (
+                mairon_instructions
+                + "\n\n"
+                + core_authority.runtime.model_instruction
             )
-        )
-
-    else:
-        turn_instructions = (
-            mairon_instructions
-        )
+        except Exception:
+            print("[Core] Contract preparation unavailable; provider continuation blocked.")
+            emit_final_response(
+                user_input=user_input,
+                answer=CORE_UNAVAILABLE_MESSAGE,
+                response_timer=response_timer,
+            )
+            continue
 
     # --------------------------------------------------
     # Existing provider/router path
     # --------------------------------------------------
 
-    with research_request_context(
-        session_id=TERMINAL_SESSION_ID,
-        channel=(
-            "voice"
-            if speak_next_response
-            else "text"
-        ),
-        client="terminal",
-    ):
-        result = route_message(
-            local_ai,
-            cloud_ai,
-            user_input,
-            turn_instructions,
-            local_state,
-            cloud_state
+    try:
+        with research_request_context(
+            session_id=TERMINAL_SESSION_ID,
+            channel=(
+                "voice"
+                if speak_next_response
+                else "text"
+            ),
+            client="terminal",
+        ):
+            result = route_message(
+                local_ai,
+                cloud_ai,
+                user_input,
+                turn_instructions,
+                local_state,
+                cloud_state,
+                core_authority=core_authority,
+            )
+
+    except Exception:
+        print("[Core] Provider continuation unavailable or failed.")
+        emit_final_response(
+            user_input=user_input,
+            answer=CORE_UNAVAILABLE_MESSAGE,
+            response_timer=response_timer,
         )
+        continue
 
     local_state = result.local_state
     cloud_state = result.cloud_state
@@ -1128,26 +1141,38 @@ while True:
         finally:
             response_timer.resume()
 
-        if approval in (
-            "y",
-            "yes"
-        ):
-            result = approve_cloud_escalation(
-                cloud_ai,
-                result.pending_prompt,
-                turn_instructions,
-                local_state,
-                cloud_state
-            )
+        try:
+            if approval in (
+                "y",
+                "yes"
+            ):
+                result = approve_cloud_escalation(
+                    cloud_ai,
+                    result.pending_prompt,
+                    turn_instructions,
+                    local_state,
+                    cloud_state,
+                    core_authority=core_authority,
+                )
 
-        else:
-            result = decline_cloud_escalation(
-                local_ai,
-                result.pending_prompt,
-                turn_instructions,
-                local_state,
-                cloud_state
+            else:
+                result = decline_cloud_escalation(
+                    local_ai,
+                    result.pending_prompt,
+                    turn_instructions,
+                    local_state,
+                    cloud_state,
+                    core_authority=core_authority,
+                )
+
+        except Exception:
+            print("[Core] Approved cloud continuation unavailable; no fallback execution.")
+            emit_final_response(
+                user_input=user_input,
+                answer=CORE_UNAVAILABLE_MESSAGE,
+                response_timer=response_timer,
             )
+            continue
 
         local_state = result.local_state
         cloud_state = result.cloud_state

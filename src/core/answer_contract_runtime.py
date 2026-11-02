@@ -1,6 +1,7 @@
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
+from copy import deepcopy
 
 
 CORE_ANSWER_CONTRACT_MARKER = (
@@ -109,9 +110,13 @@ class AnswerContractRuntime:
         default_factory=dict
     )
 
-    metadata: Dict[str, str] = field(
+    metadata: Dict[str, Any] = field(
         default_factory=dict
     )
+
+    # Core-supplied, unflattened original evidence and its source lineage.
+    # Legacy text cannot reconstruct this field.
+    original_evidence: Any = None
 
     source: str = "structured"
 
@@ -347,17 +352,8 @@ def runtime_from_answer_contract(
             )
             or {}
         ),
-        metadata={
-            str(key): str(value)
-            for key, value in (
-                getattr(
-                    contract,
-                    "metadata",
-                    {},
-                )
-                or {}
-            ).items()
-        },
+        metadata=deepcopy(dict(getattr(contract, "metadata", {}) or {})),
+        original_evidence=getattr(contract, "evidence", None),
         source="structured",
     )
 

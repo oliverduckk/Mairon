@@ -1,3 +1,4 @@
+import ast
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -386,24 +387,60 @@ def run():
         encoding="utf-8",
     )
 
-    apply_position = (
-        application_source.find(
-            "apply_conversational_claim_boundary("
-        )
+    # S1 now seals the Core contract into typed authority before reading
+    # its model-facing instruction. Inspect the submit_text AST rather than
+    # expecting the old formatting-dependent .to_model_instruction() call.
+    application_tree = ast.parse(application_source)
+    application_class = next(
+        node for node in application_tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "MaironApplication"
+    )
+    submit_text = next(
+        node for node in application_class.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "submit_text"
     )
 
-    contract_render_position = (
-        application_source.find(
-            ".answer_contract\n"
-            "                    .to_model_instruction()"
-        )
-    )
+    def calls_named(name):
+        return [
+            node for node in ast.walk(submit_text)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == name
+        ]
 
-    assert apply_position >= 0
-    assert contract_render_position >= 0
+    apply_calls = calls_named("apply_conversational_claim_boundary")
+    seal_calls = calls_named("seal_prepared_turn")
+    router_calls = calls_named("route_message")
+    runtime_instructions = [
+        node for node in ast.walk(submit_text)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "model_instruction"
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "runtime"
+        and isinstance(node.value.value, ast.Name)
+        and node.value.value.id == "core_authority"
+    ]
+
+    assert len(apply_calls) == 1
+    assert len(seal_calls) == 1
+    assert len(runtime_instructions) == 1
+    assert len(router_calls) == 1
     assert (
-        apply_position
-        < contract_render_position
+        apply_calls[0].lineno
+        < seal_calls[0].lineno
+        < runtime_instructions[0].lineno
+        < router_calls[0].lineno
+    )
+
+    # The provider must receive the Core-sealed authority independently
+    # from the rendered instructions, not reconstruct it from model text.
+    assert any(
+        isinstance(keyword.value, ast.Name)
+        and keyword.arg == "core_authority"
+        and keyword.value.id == "core_authority"
+        for keyword in router_calls[0].keywords
     )
 
     assert (

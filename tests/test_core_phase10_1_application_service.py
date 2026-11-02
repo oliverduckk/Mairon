@@ -25,6 +25,7 @@ import application_service as service_module
 from application_service import (
     MaironApplication,
 )
+from core.answer_contract import AnswerContract
 
 
 class FakeCore:
@@ -217,10 +218,14 @@ def run():
                 needs_clarification=False,
                 clarification_question=None,
                 direct_response=None,
-                answer_contract=SimpleNamespace(
-                    to_model_instruction=(
-                        lambda: "test contract"
-                    )
+                answer_contract=AnswerContract(
+                    task="respond",
+                    speech_act="question",
+                    intent="casual_conversation",
+                    subject=None,
+                    authority="conversation_model",
+                    epistemic_mode="conversation",
+                    allow_new_factual_claims=True,
                 ),
             )
 

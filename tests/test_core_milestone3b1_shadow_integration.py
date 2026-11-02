@@ -682,14 +682,17 @@ class ShadowIntegrationTests(unittest.TestCase):
         events = []
         legacy_result = SimpleNamespace(status="answered", answer="Legacy answer remains unchanged.")
 
-        def route(*args):
+        def route(*args, **kwargs):
+            self.assertIs(kwargs["core_authority"], trusted_authority)
             observe_limitation_response(
                 text="The missing material has twelve sections.", contract=_contract(),
                 user_input="The material is missing.", path="neutral.router_limit",
             )
             return legacy_result
 
+        trusted_authority = object()  # AST fixture: forwards without invoking actual router
         namespace = {
+            "core_authority": trusted_authority,
             "self": SimpleNamespace(_emit_event=events.append, session_id="neutral-session",
                 local_ai=object(), cloud_ai=None, local_state=[], cloud_state=None),
             "channel_value": "text", "text": "The material is missing.",

@@ -246,6 +246,7 @@ from core.source_lock import (
     recommended_source_lock_prior_window,
 )
 from core.answer_contract_runtime import (
+    AnswerContractRuntime,
     coerce_answer_contract_runtime,
     contract_field_value,
     render_answer_contract,
@@ -11835,8 +11836,20 @@ def _get_response_impl(
     user_input,
     instructions,
     conversation=None,
-    allow_cloud_escalation=False
+    allow_cloud_escalation=False,
+    core_answer_contract=None,
 ):
+    # The trusted router passes a structured Core contract separately from
+    # the model-facing instruction text. Never parse a second, weaker copy
+    # when typed authority is available.
+    if core_answer_contract is not None:
+        if not (
+            isinstance(core_answer_contract, AnswerContractRuntime)
+            and core_answer_contract.source == "structured"
+            and core_answer_contract.authority not in ("", "unknown")
+        ):
+            raise ValueError("Local provider requires valid structured Core authority.")
+
     # Start the lightweight daemon even when this turn is not creating a new
     # job. That lets durable paused/expired work from an earlier Mairon process
     # resume after Oliver's first interaction, without making the desktop a
@@ -11850,16 +11863,14 @@ def _get_response_impl(
         instructions
     )
 
-    # Phase 6:
-    # The current router still transports the turn contract inside the
-    # instruction string. Convert that legacy transport into ONE structured
-    # runtime object at provider ingress. Every internal policy/validator
-    # below consumes the object rather than reparsing prose.
-    core_answer_contract = (
-        coerce_answer_contract_runtime(
+    # The production router supplies Core's typed runtime explicitly.
+    # Parsing a rendered contract remains only for legacy direct-provider
+    # callers and tests; it never upgrades that text into router authority.
+    if core_answer_contract is None:
+        # Legacy direct provider caller, not an authorised router handoff.
+        core_answer_contract = coerce_answer_contract_runtime(
             core_answer_contract_text
         )
-    )
 
     core_intent = _core_contract_value(
         core_answer_contract, "Intent"
@@ -12990,6 +13001,7 @@ def get_response(
     instructions,
     conversation=None,
     allow_cloud_escalation=False,
+    core_answer_contract=None,
 ):
     """Provider-wide final safety boundary and foreground-interaction lease.
 
@@ -13006,6 +13018,7 @@ def get_response(
             instructions=instructions,
             conversation=conversation,
             allow_cloud_escalation=allow_cloud_escalation,
+            core_answer_contract=core_answer_contract,
         )
 
         answer, updated_history, cloud_reason, pending_action = result

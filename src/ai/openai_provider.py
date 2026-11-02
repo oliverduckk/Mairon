@@ -2,6 +2,8 @@ import json
 
 from openai import OpenAI
 
+from core.answer_contract_runtime import AnswerContractRuntime
+
 from tools.tool_registry import (
     CLOUD_TOOLS,
     execute_tool,
@@ -24,8 +26,25 @@ def get_response(
     user_input,
     instructions,
     previous_response_id=None,
-    allow_cloud_escalation=False
+    allow_cloud_escalation=False,
+    core_answer_contract=None,
 ):
+    # This provider does not run the local grounded-public, spoiler or
+    # conversational acceptance validators. Enforce narrow contract capability
+    # at the router as well; provider ingress cannot silently claim parity.
+    if core_answer_contract is not None:
+        if not isinstance(core_answer_contract, AnswerContractRuntime) or core_answer_contract.source != "structured":
+            raise ValueError("Cloud provider requires structured Core authority.")
+        if (
+            core_answer_contract.required_claims
+            or core_answer_contract.verified_evidence_claims
+            or core_answer_contract.metadata
+            or core_answer_contract.epistemic_mode not in {
+                "conversation", "classify_then_verify", "subjective",
+            }
+        ):
+            raise ValueError("Cloud provider cannot satisfy these mandatory Core obligations.")
+
     response = client.responses.create(
         model=MODEL,
         instructions=instructions,
