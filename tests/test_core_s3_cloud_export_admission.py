@@ -19,6 +19,7 @@ from core.cloud_export import (
     project_cloud_tool_result,
 )
 from core import router
+from core.provider_state import CloudContinuation, eligible_cloud_continuation
 from ai import openai_provider
 from tools.tool_registry import CLOUD_TOOLS
 from tools.tool_admission import provider_turn
@@ -99,8 +100,13 @@ def run():
         local_state=[{"role": "user", "content": PRIVATE}],
         cloud_state=[{"role": "assistant", "content": PRIVATE}],
         core_authority=auth,
+        state_owner_id="s3-fixture-session",
     )
-    assert result.answer == "cloud answer" and result.cloud_state == "resp_accepted"
+    assert result.answer == "cloud answer" and isinstance(result.cloud_state, CloudContinuation)
+    assert result.cloud_state.response_id == "resp_accepted"
+    assert eligible_cloud_continuation(
+        result.cloud_state, owner_id="s3-fixture-session", model_id="gpt-5.6-luna",
+    ) is result.cloud_state
     args, kw = adapter.calls[0]
     assert args[1] == prompt and args[3] is None
     assert PRIVATE not in args[2] and PRIVATE not in str(args)

@@ -3,6 +3,7 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from core.action_approval import consume_calendar_effect
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -400,6 +401,12 @@ def create_calendar_event(
     Mairon Core must obtain explicit user approval before
     this function is ever called.
     """
+
+    if not consume_calendar_effect(summary, start_time, end_time, location, description):
+        return {
+            "success": False,
+            "message": "Calendar event execution requires current, single-use approval."
+        }
 
     if not summary:
         return {

@@ -17,6 +17,7 @@ import application_service as app_module
 from application_service import MaironApplication
 from core import router
 from core.cloud_export import issue_cloud_export_grant, admit_cloud_initial
+from core.provider_state import CloudContinuation, eligible_cloud_continuation
 from core.authority_handoff import (
     CoreAuthorityUnavailable, prepare_core_turn, seal_prepared_turn,
 )
@@ -202,7 +203,11 @@ def run():
         a = app(Core(contract=contract()), Local(), cloud)
         outcome = a.submit_text("/cloud A test question")
         assert outcome.status == "answered" and outcome.answer == "Cloud reply."
-        assert len(cloud.calls) == 1 and a.cloud_state == "resp_123"
+        assert len(cloud.calls) == 1 and isinstance(a.cloud_state, CloudContinuation)
+        assert a.cloud_state.response_id == "resp_123"
+        assert eligible_cloud_continuation(
+            a.cloud_state, owner_id=a.session_id, model_id="gpt-5.6-luna",
+        ) is a.cloud_state
         checks += 1
 
         # Cloud mandatory verified claims / private workflows are unsupported.

@@ -255,6 +255,10 @@ def deterministic_critical_response(current: str, recent_user_turns: Iterable[An
 
 def replace_visible_answer_in_history(history: Any, original: str, replacement: str) -> Any:
     """Remove unsafe assistant content from returned model-visible history."""
+    from core.provider_state import CloudContinuation
+    if isinstance(history, CloudContinuation):
+        # The server-held response cannot be rewritten. Discard its handle.
+        return None
     if not isinstance(history, (tuple, list)):
         return history
     updated = list(history)

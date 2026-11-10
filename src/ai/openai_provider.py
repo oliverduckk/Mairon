@@ -54,6 +54,8 @@ def get_response(
     # request, even if the caller supplied plausible-looking instructions.
     if not isinstance(cloud_export, CloudExportGrant):
         raise CloudExportDenied("Cloud export requires a trusted, approved grant.")
+    if cloud_export._backend_client is not None and cloud_export._backend_client is not client:
+        raise CloudExportDenied("Cloud export grant does not match the provider client.")
     initial = admit_cloud_initial(
         cloud_export, user_input, previous_state=previous_response_id,
     )

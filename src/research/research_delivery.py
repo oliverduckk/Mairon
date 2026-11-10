@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.provider_state import bounded_local_history
+
 from typing import Any, Optional
 
 
@@ -226,4 +228,4 @@ def append_research_delivery_to_model_history(
         ),
     })
 
-    return state
+    return bounded_local_history(state)

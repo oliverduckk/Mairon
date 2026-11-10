@@ -1,6 +1,12 @@
 from dataclasses import dataclass
 from typing import Any
 
+from core.provider_state import (
+    bounded_local_history, eligible_cloud_continuation, make_cloud_continuation,
+    adapt_cloud_provider_reply, adapt_local_provider_reply,
+    requires_prior_cloud_context,
+)
+
 from core.authority_handoff import PreparedAuthority, CoreAuthorityUnavailable
 from tools.tool_admission import provider_turn
 from core.action_approval import issue_calendar_ticket
@@ -25,6 +31,7 @@ class RouteResult:
     local_state: Any = None
     cloud_state: Any = None
     core_authority: PreparedAuthority | None = None
+    provider_kind: str | None = None
 
 
 def parse_cloud_command(
@@ -209,6 +216,26 @@ def cloud_authority_supported(core_authority: PreparedAuthority) -> bool:
         return False
 
 
+def _cloud_model_id(cloud_ai) -> str:
+    module = cloud_ai.get("module") if isinstance(cloud_ai, dict) else None
+    return str(getattr(module, "MODEL", "gpt-5.6-luna"))
+
+
+def _qualified_cloud_state(cloud_ai, state, owner_id):
+    return eligible_cloud_continuation(
+        state, owner_id=owner_id, model_id=_cloud_model_id(cloud_ai),
+        backend_client=cloud_ai.get("client"),
+    )
+
+
+def _state_after_cloud(cloud_ai, response_id, owner_id, predecessor):
+    return make_cloud_continuation(
+        response_id, owner_id=owner_id,
+        model_id=_cloud_model_id(cloud_ai), predecessor=predecessor,
+        backend_client=cloud_ai.get("client"),
+    )
+
+
 def route_message(
     local_ai,
     cloud_ai,
@@ -218,6 +245,7 @@ def route_message(
     cloud_state=None,
     *,
     core_authority: PreparedAuthority,
+    state_owner_id: str | None = None,
 ):
     if not isinstance(core_authority, PreparedAuthority):
         raise CoreAuthorityUnavailable("Trusted Core authority is unavailable.")
@@ -263,20 +291,35 @@ def route_message(
         # S3: explicit /cloud grants only this prompt.  Never send the full
         # application instruction bundle, reconstructed chat, or old cloud
         # state as an unclassified history/continuation handle.
+        prior = _qualified_cloud_state(cloud_ai, cloud_state, state_owner_id)
+        if prior is None and requires_prior_cloud_context(clean_input):
+            return RouteResult(
+                status="answered",
+                answer=(
+                    "I can't safely resume earlier context in cloud processing. "
+                    "Please restate the relevant details after /cloud."
+                ),
+                local_state=local_state, cloud_state=None,
+                core_authority=core_authority,
+            )
         grant = issue_cloud_export_grant(
             core_authority, clean_input, purpose="explicit_cloud_request",
+            previous_state=prior, owner_id=state_owner_id,
+            model_id=_cloud_model_id(cloud_ai),
+            backend_client=cloud_ai.get("client"),
         )
-        initial = admit_cloud_initial(grant, clean_input, previous_state=cloud_state)
+        initial = admit_cloud_initial(grant, clean_input, previous_state=prior)
         try:
             with provider_turn(core_authority):
-                answer, new_cloud_state, _ = cloud_ai["module"].get_response(
+                raw_cloud_result = cloud_ai["module"].get_response(
                     cloud_ai["client"],
                     initial.payload["input"],
                     initial.payload["instructions"],
-                    None,
+                    prior,
                     core_answer_contract=core_authority.runtime,
                     cloud_export=grant,
                 )
+            answer, new_cloud_state = adapt_cloud_provider_reply(raw_cloud_result)
         except Exception:
             # SDK exception text can echo user input or upstream payloads.
             raise CloudExportDenied("Cloud processing failed without an eligible response.") from None
@@ -285,8 +328,11 @@ def route_message(
             status="answered",
             answer=answer,
             local_state=local_state,
-            cloud_state=new_cloud_state,
+            cloud_state=_state_after_cloud(
+                cloud_ai, new_cloud_state, state_owner_id, prior,
+            ),
             core_authority=core_authority,
+            provider_kind="cloud",
         )
 
     # --------------------------------------------------
@@ -325,19 +371,17 @@ def route_message(
     )
 
     with provider_turn(core_authority):
-        (
-            answer,
-            new_local_state,
-            escalation_reason,
-            pending_action,
-        ) = local_ai["module"].get_response(
+        raw_local_result = local_ai["module"].get_response(
             local_ai["client"],
             clean_input,
             instructions,
-            local_state,
+            bounded_local_history(local_state),
             allow_cloud_escalation=True,
             core_answer_contract=core_authority.runtime,
         )
+    answer, new_local_state, escalation_reason, pending_action = (
+        adapt_local_provider_reply(raw_local_result)
+    )
 
     if pending_action:
         ticket = issue_calendar_ticket(pending_action, core_authority)
@@ -345,8 +389,8 @@ def route_message(
             return RouteResult(
                 status="answered",
                 answer="I couldn't safely prepare that calendar approval.",
-                local_state=new_local_state,
-                cloud_state=cloud_state,
+                local_state=bounded_local_history(new_local_state),
+                cloud_state=None,
                 core_authority=core_authority,
             )
         return RouteResult(
@@ -354,8 +398,8 @@ def route_message(
             status="action_approval_required",
             pending_prompt=clean_input,
             pending_action=pending_action,
-            local_state=new_local_state,
-            cloud_state=cloud_state,
+            local_state=bounded_local_history(new_local_state),
+            cloud_state=None,
             core_authority=core_authority,
         )
 
@@ -363,8 +407,8 @@ def route_message(
         return RouteResult(
             status="answered",
             answer=(answer or "The cloud provider cannot satisfy this turn's required Core obligations."),
-            local_state=new_local_state,
-            cloud_state=cloud_state,
+            local_state=bounded_local_history(new_local_state),
+            cloud_state=None,
             core_authority=core_authority,
         )
 
@@ -373,16 +417,16 @@ def route_message(
             status="cloud_approval_required",
             reason=escalation_reason,
             pending_prompt=clean_input,
-            local_state=new_local_state,
-            cloud_state=cloud_state,
+            local_state=bounded_local_history(new_local_state),
+            cloud_state=None,
             core_authority=core_authority,
         )
 
     return RouteResult(
         status="answered",
         answer=answer,
-        local_state=new_local_state,
-        cloud_state=cloud_state,
+        local_state=bounded_local_history(new_local_state),
+        cloud_state=None,
         core_authority=core_authority,
     )
 
@@ -395,6 +439,7 @@ def approve_cloud_escalation(
     cloud_state=None,
     *,
     core_authority: PreparedAuthority,
+    state_owner_id: str | None = None,
 ):
     if not isinstance(core_authority, PreparedAuthority):
         raise CoreAuthorityUnavailable("Trusted Core authority is unavailable.")
@@ -420,20 +465,35 @@ def approve_cloud_escalation(
 
     # Approval grants export of the pending prompt only, not its surrounding
     # private instructions, historical context, local state or saved handle.
+    prior = _qualified_cloud_state(cloud_ai, cloud_state, state_owner_id)
+    if prior is None and requires_prior_cloud_context(prompt):
+        return RouteResult(
+            status="answered",
+            answer=(
+                "I can't safely resume earlier context in cloud processing. "
+                "Please restate the relevant details after /cloud."
+            ),
+            local_state=local_state, cloud_state=None,
+            core_authority=core_authority,
+        )
     grant = issue_cloud_export_grant(
         core_authority, prompt, purpose="approved_cloud_escalation",
+        previous_state=prior, owner_id=state_owner_id,
+        model_id=_cloud_model_id(cloud_ai),
+        backend_client=cloud_ai.get("client"),
     )
-    initial = admit_cloud_initial(grant, prompt, previous_state=cloud_state)
+    initial = admit_cloud_initial(grant, prompt, previous_state=prior)
     try:
         with provider_turn(core_authority):
-            answer, new_cloud_state, _ = cloud_ai["module"].get_response(
+            raw_cloud_result = cloud_ai["module"].get_response(
                 cloud_ai["client"],
                 initial.payload["input"],
                 initial.payload["instructions"],
-                None,
+                prior,
                 core_answer_contract=core_authority.runtime,
                 cloud_export=grant,
             )
+        answer, new_cloud_state = adapt_cloud_provider_reply(raw_cloud_result)
     except Exception:
         # The cloud SDK/adapter may otherwise return sensitive request text in
         # a raw exception, subsequently shown in the application diagnostics.
@@ -443,8 +503,11 @@ def approve_cloud_escalation(
         status="answered",
         answer=answer,
         local_state=local_state,
-        cloud_state=new_cloud_state,
+        cloud_state=_state_after_cloud(
+            cloud_ai, new_cloud_state, state_owner_id, prior,
+        ),
         core_authority=core_authority,
+        provider_kind="cloud",
     )
 
 
@@ -456,6 +519,7 @@ def decline_cloud_escalation(
     cloud_state=None,
     *,
     core_authority: PreparedAuthority,
+    state_owner_id: str | None = None,
 ):
     if not isinstance(core_authority, PreparedAuthority):
         raise CoreAuthorityUnavailable("Trusted Core authority is unavailable.")
@@ -473,19 +537,15 @@ def decline_cloud_escalation(
     )
 
     with provider_turn(core_authority):
-        (
-            answer,
-            new_local_state,
-            _,
-            pending_action,
-        ) = local_ai["module"].get_response(
+        raw_local_result = local_ai["module"].get_response(
             local_ai["client"],
             prompt,
             instructions,
-            local_state,
+            bounded_local_history(local_state),
             allow_cloud_escalation=False,
             core_answer_contract=core_authority.runtime,
         )
+    answer, new_local_state, _, pending_action = adapt_local_provider_reply(raw_local_result)
 
     if pending_action:
         ticket = issue_calendar_ticket(pending_action, core_authority)
@@ -493,8 +553,8 @@ def decline_cloud_escalation(
             return RouteResult(
                 status="answered",
                 answer="I couldn't safely prepare that calendar approval.",
-                local_state=new_local_state,
-                cloud_state=cloud_state,
+                local_state=bounded_local_history(new_local_state),
+                cloud_state=None,
                 core_authority=core_authority,
             )
         return RouteResult(
@@ -502,16 +562,16 @@ def decline_cloud_escalation(
             status="action_approval_required",
             pending_prompt=prompt,
             pending_action=pending_action,
-            local_state=new_local_state,
-            cloud_state=cloud_state,
+            local_state=bounded_local_history(new_local_state),
+            cloud_state=None,
             core_authority=core_authority,
         )
 
     return RouteResult(
         status="answered",
         answer=answer,
-        local_state=new_local_state,
-        cloud_state=cloud_state,
+        local_state=bounded_local_history(new_local_state),
+        cloud_state=None,
         core_authority=core_authority,
     )
 

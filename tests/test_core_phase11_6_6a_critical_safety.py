@@ -150,7 +150,11 @@ def test_provider_boundary_is_attached() -> None:
     assert "should_expose_model_cloud" in entry_calls
     assert "explicit_calendar_write_request" in entry_calls
 
+    from contextlib import nullcontext
     stub = {
+        "admitted_tools": lambda *_args: nullcontext(),
+        "internal_scope": lambda *_args: None,
+        "current_turn_authority": lambda: None,
         "begin_interactive_turn": lambda: None,
         "end_interactive_turn": lambda: None,
         "sanitise_visible_response": sanitise_visible_response,

@@ -47,7 +47,10 @@ def _strip_internal_reasoning_markup(text):
     )
     return value.strip()
 
-from tools.tool_registry import TOOLS, execute_tool
+from tools.tool_registry import TOOLS, execute_tool, validate_tool_arguments
+from tools.tool_admission import (
+    admitted_tools, provider_tool_scope, current_turn_authority, internal_scope,
+)
 
 from personality.personality_engine import (
     build_retry_instruction,
@@ -12795,26 +12798,35 @@ def _get_response_impl(
             ):
                 continue
 
-            arguments = normalise_tool_arguments(
-                tool_call.function.arguments
+            # Validate the original untrusted payload BEFORE any legacy
+            # normaliser converts malformed JSON or lists into {}.
+            arguments, argument_error = validate_tool_arguments(
+                tool_name, tool_call.function.arguments
             )
-
-            # Relative dates such as today/tomorrow are resolved by Core,
-            # never trusted to the model's training-time sense of date.
-            arguments = enforce_core_date_for_tool(
-                tool_name=tool_name,
-                arguments=arguments,
-                user_input=user_input
-            )
+            if argument_error is None:
+                # Relative dates are resolved by Core, not model knowledge.
+                arguments = enforce_core_date_for_tool(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    user_input=user_input
+                )
 
             print(
                 f"[Tool] Mairon requested: {tool_name}"
             )
 
-            tool_result = execute_tool(
-                tool_name,
-                arguments
+            advertised_names = [
+                tool.get("function", {}).get("name") for tool in tools
+            ]
+            scope = provider_tool_scope(
+                "local", current_turn_authority(), advertised_names,
             )
+            with admitted_tools(scope):
+                tool_result = (
+                    {"success": False, "message": argument_error}
+                    if argument_error is not None
+                    else execute_tool(tool_name, arguments)
+                )
 
             tools_used.append(
                 tool_name
@@ -13012,14 +13024,19 @@ def get_response(
     """
     begin_interactive_turn()
     try:
-        result = _get_response_impl(
-            client=client,
-            user_input=user_input,
-            instructions=instructions,
-            conversation=conversation,
-            allow_cloud_escalation=allow_cloud_escalation,
-            core_answer_contract=core_answer_contract,
-        )
+        with admitted_tools(
+            internal_scope("local.specialised")
+            if current_turn_authority() is not None
+            else internal_scope("no_prepared_authority")
+        ):
+            result = _get_response_impl(
+                client=client,
+                user_input=user_input,
+                instructions=instructions,
+                conversation=conversation,
+                allow_cloud_escalation=allow_cloud_escalation,
+                core_answer_contract=core_answer_contract,
+            )
 
         answer, updated_history, cloud_reason, pending_action = result
         # An approval request has no visible model answer to sanitise; Core

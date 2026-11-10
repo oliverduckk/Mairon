@@ -17,6 +17,7 @@ if str(SRC_DIR) not in sys.path:
 
 import tools.gmail_tools as gmail_tools
 import tools.tool_registry as tool_registry
+from tools.tool_admission import admitted_tools, internal_scope
 
 
 def run():
@@ -171,8 +172,11 @@ def run():
     )
 
     try:
-        tool_registry.execute_tool(
-            "find_emails",
+        # A direct model-like registry call is denied without scope. This
+        # integration fixture supplies its explicit, trusted Core caller.
+        with admitted_tools(internal_scope("core.email_search")):
+            tool_registry.execute_tool(
+                "find_emails",
             {
                 "search_text": "Prosple",
                 "days": 2,

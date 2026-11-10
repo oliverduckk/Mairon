@@ -5,8 +5,9 @@ instructions, private Core evidence and provider histories are *not* cloud
 payloads.  This module issues turn-local grants, constructs minimal requests,
 and projects known public tool results; unknown classifications fail closed.
 
-S4 will own historical context projections and response-ID compatibility.  Until
-then no prior response handle or reconstructed provider history is exported.
+S4 admits only qualified, session-bound ephemeral cloud response handles for
+adjacent authorised turns; saved transcripts and local provider histories are
+never silently exported.
 """
 from dataclasses import dataclass, field
 import hashlib
@@ -18,6 +19,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from core.authority_handoff import PreparedAuthority
+from core.provider_state import CloudContinuation, eligible_cloud_continuation
 
 _DESTINATION = "openai.responses"
 _ISSUER = object()
@@ -81,6 +83,8 @@ class CloudExportGrant:
     _initial_used: bool = field(default=False, repr=False)
     _followup_used: bool = field(default=False, repr=False)
     _lock: Lock = field(default_factory=Lock, repr=False)
+    _previous: CloudContinuation | None = field(default=None, repr=False)
+    _backend_client: Any = field(default=None, repr=False)
 
     def revoke(self) -> None:
         with self._lock:
@@ -107,7 +111,10 @@ class CloudExportGrant:
 
 
 def issue_cloud_export_grant(authority: PreparedAuthority, prompt: str,
-                             *, purpose: str) -> CloudExportGrant:
+                             *, purpose: str, previous_state: Any = None,
+                             owner_id: str | None = None,
+                             model_id: str = "gpt-5.6-luna",
+                             backend_client: Any = None) -> CloudExportGrant:
     """Only the router may use this for a verified explicit or approved route.
 
     The grant covers the *current user prompt*, not stored history, app
@@ -122,10 +129,18 @@ def issue_cloud_export_grant(authority: PreparedAuthority, prompt: str,
         raise CloudExportDenied("Core has not authorised cloud export for this turn.") from None
     _safe_text(prompt, maximum=_MAX_PROMPT)
     r = authority.runtime
+    # S4: a previous provider handle is an implicit reference to earlier
+    # cloud context. Admit only the process-issued handle for the current
+    # session/model; do not send a reconstructed/private conversation list.
+    previous = eligible_cloud_continuation(
+        previous_state, owner_id=owner_id, model_id=model_id,
+        backend_client=backend_client,
+    )
     return CloudExportGrant(
         purpose, _digest(prompt), _ISSUER, time.monotonic(),
         policy_flags=(r.allow_recommendations, r.allow_new_factual_claims,
-                      r.allow_follow_up_question),
+                      r.allow_follow_up_question), _previous=previous,
+        _backend_client=backend_client,
     )
 
 
@@ -232,21 +247,30 @@ def admit_cloud_initial(grant: CloudExportGrant, prompt: str,
                         *, previous_state: Any = None) -> CloudExportAdmission:
     """Final outbound request builder: no application prose or history.
 
-    In S3 an old response ID (or restored message list) has no verified egress
-    lineage.  S4 will add qualified handle support; never forward it here.
+    Only S4-qualified ephemeral continuation handles can cross this boundary.
+    An old raw response ID or restored history has no eligible egress lineage.
     """
     if not isinstance(grant, CloudExportGrant):
         _deny()
     grant.require(prompt)
     _safe_text(prompt, maximum=_MAX_PROMPT)
-    # No previous_response_id on the initial request, regardless of the shape
-    # of previous_state.  Avoid forwarding unknown handles rather than treating
-    # them as proof of an approved historical context projection.
-    payload = {"instructions": _instructions_for(grant), "input": prompt,
-               "previous_response_id": None}
-    return _admission(
-        grant, payload, ("user_current_prompt", "reviewed_cloud_instructions")
+    # Only a handle explicitly qualified *when this grant was issued* may
+    # reference a prior cloud response. Legacy strings, restored lists, and
+    # foreign/expired handles cannot become an outbound continuation field.
+    prior = grant._previous
+    eligible = (
+        prior is not None and previous_state is prior
+        and eligible_cloud_continuation(
+            prior, owner_id=prior.owner_id, model_id=prior.model_id,
+            backend_client=grant._backend_client,
+        ) is prior
     )
+    payload = {"instructions": _instructions_for(grant), "input": prompt,
+               "previous_response_id": prior.response_id if eligible else None}
+    classes = ("user_current_prompt", "reviewed_cloud_instructions")
+    if eligible:
+        classes += ("qualified_prior_cloud_response_handle",)
+    return _admission(grant, payload, classes)
 
 
 def admit_cloud_sdk_request(grant: CloudExportGrant, prompt: str,
@@ -266,6 +290,17 @@ def admit_cloud_sdk_request(grant: CloudExportGrant, prompt: str,
         _deny()
     if set(admission.payload) != {"instructions", "input", "previous_response_id"}:
         _deny()
+    if "user_current_prompt" in admission.manifest.data_classes:
+        prior = grant._previous
+        expected = prior.response_id if (
+            prior is not None
+            and eligible_cloud_continuation(
+                prior, owner_id=prior.owner_id, model_id=prior.model_id,
+                backend_client=grant._backend_client,
+            ) is prior
+        ) else None
+        if admission.payload["previous_response_id"] != expected:
+            _deny()
     safe_model = _safe_text(model, maximum=100)
     projected_tools = admit_cloud_tool_definitions(registry_tools)
     payload = {

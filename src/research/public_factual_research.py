@@ -4,7 +4,9 @@ from collections.abc import Mapping
 from datetime import datetime
 from urllib.parse import urlparse
 
-from tools.tool_registry import execute_tool
+from functools import partial
+from tools.tool_admission import run_internal_tool
+execute_tool = partial(run_internal_tool, "research.public")
 
 from core.conversational_research import (
     normalise_public_research_query,

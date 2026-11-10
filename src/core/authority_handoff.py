@@ -65,6 +65,7 @@ class PreparedAuthority:
     verification_required: bool
     private_data_required: bool
     live_data_required: bool
+    turn: Any = None
 
     def require_local(self) -> None:
         _require_typed_authority(self)
@@ -130,6 +131,7 @@ def seal_prepared_turn(decision: Any) -> PreparedAuthority:
         verification_required=bool(getattr(route, "verification_required", False)),
         private_data_required=bool(getattr(route, "private_data_required", False)),
         live_data_required=bool(getattr(route, "live_data_required", False)),
+        turn=turn,
     )
     _require_typed_authority(authority)
     return authority

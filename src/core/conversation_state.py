@@ -13,6 +13,7 @@ from core.debate_state import (
 )
 
 from core.turn_state import TurnState
+from core.provider_state import bounded_local_history
 from core.followup_task import build_bounded_task_instruction
 
 
@@ -2025,4 +2026,4 @@ def append_visible_turn_to_model_history(
         ),
     })
 
-    return state
+    return bounded_local_history(state)

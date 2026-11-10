@@ -23,6 +23,7 @@ from core.critical_response_safety import (
     sanitise_visible_response,
 )
 
+from core.provider_state import bounded_local_history
 from core.conversation_state import (
     ConversationState,
     append_visible_turn_to_model_history,
@@ -455,14 +456,9 @@ class MaironApplication:
                 )
             )
 
-            self.cloud_state = (
-                list(
-                    self.local_state
-                )
-                if self.local_state
-                is not None
-                else None
-            )
+            # A proactive local research delivery is not a cloud Responses
+            # completion. It invalidates any earlier ephemeral cloud handle.
+            self.cloud_state = None
 
             completed = complete_research_delivery(
                 job[
@@ -769,19 +765,12 @@ class MaironApplication:
                 )
             )
 
-        self.local_state = rebuilt_state
+        self.local_state = bounded_local_history(rebuilt_state)
 
-        # Cloud is permission-gated and can reconstruct from the same visible
-        # transcript if it is used later. No historical cloud completion or
-        # hidden provider state is treated as authority.
-        self.cloud_state = (
-            list(
-                rebuilt_state
-            )
-            if rebuilt_state
-            is not None
-            else None
-        )
+        # Reopening a saved chat never revives a cloud response handle. Its
+        # provenance, consent, session ownership and expiry are not stored.
+        # The visible transcript is projected locally, not silently exported.
+        self.cloud_state = None
 
         turns = session.get(
             "turns",
@@ -1286,6 +1275,7 @@ class MaironApplication:
                     self.local_state,
                     self.cloud_state,
                     core_authority=core_authority,
+                    state_owner_id=self.session_id,
                 )
 
         except Exception as exc:
@@ -1488,6 +1478,7 @@ class MaironApplication:
                             self.local_state,
                             self.cloud_state,
                             core_authority=pending.core_authority,
+                            state_owner_id=self.session_id,
                         )
                     )
 
@@ -1500,6 +1491,7 @@ class MaironApplication:
                             self.local_state,
                             self.cloud_state,
                             core_authority=pending.core_authority,
+                            state_owner_id=self.session_id,
                         )
                     )
 
@@ -1736,6 +1728,7 @@ class MaironApplication:
             ),
             agent_action=agent_action,
             action_confirmed=action_confirmed,
+            provider_kind=getattr(result, "provider_kind", None),
         )
 
     def _finalize_error(
@@ -1893,6 +1886,7 @@ class MaironApplication:
         model_used: Optional[str] = None,
         agent_action: Optional[str] = None,
         action_confirmed: bool = False,
+        provider_kind: Optional[str] = None,
     ) -> ApplicationTurn:
         safe_answer, violation = sanitise_visible_response(
             user_text,
@@ -1904,11 +1898,25 @@ class MaironApplication:
             self.local_state = replace_visible_answer_in_history(
                 self.local_state, str(answer), safe_answer,
             )
-            if self.cloud_state is not None:
-                self.cloud_state = replace_visible_answer_in_history(
-                    self.cloud_state, str(answer), safe_answer,
-                )
+            # A sanitised answer diverges from remote provider history.
+            # A cloud handle cannot be edited like a list of messages.
+            self.cloud_state = None
             answer = safe_answer
+
+        if status == "answered" and provider_kind == "cloud":
+            # Project only the final, sanitised visible exchange into local
+            # conversation. No model/tool invocation or historical replay.
+            self.local_state = append_visible_turn_to_model_history(
+                current_state=self.local_state,
+                user_input=user_text,
+                assistant_text=answer,
+                system_instructions=self.instructions,
+            )
+            self.local_state = bounded_local_history(self.local_state)
+        else:
+            # Local, deterministic, approval and error turns all interrupt
+            # the remote continuation chain; they are never cloud context.
+            self.cloud_state = None
 
         response_seconds = (
             timer.stop()

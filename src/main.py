@@ -15,6 +15,8 @@ from core.orchestrator import MaironCore
 from core.authority_handoff import (
     CORE_UNAVAILABLE_MESSAGE, prepare_core_turn, seal_prepared_turn,
 )
+from core.provider_state import bounded_local_history
+from core.critical_response_safety import sanitise_visible_response
 from core.conversation_state import (
     append_visible_turn_to_model_history,
 )
@@ -602,14 +604,8 @@ def deliver_pending_research_results():
                 )
             )
 
-            cloud_state = (
-                list(
-                    local_state
-                )
-                if local_state
-                is not None
-                else None
-            )
+            # Research is not an eligible cloud response continuation.
+            cloud_state = None
 
             last_assistant_answer = answer
 
@@ -657,6 +653,8 @@ def emit_final_response(
     user_input,
     answer,
     response_timer=None,
+    *,
+    source="local",
 ):
     """
     Display, journal, and optionally speak one completed Mairon turn.
@@ -669,6 +667,12 @@ def emit_final_response(
 
     global last_user_input
     global last_assistant_answer
+    global cloud_state
+
+    # Any non-cloud reply interrupts a remote Responses continuation. The
+    # terminal does not export prior local, deterministic or research text.
+    if source != "cloud":
+        cloud_state = None
 
     response_seconds = None
 
@@ -1097,6 +1101,7 @@ while True:
                 local_state,
                 cloud_state,
                 core_authority=core_authority,
+                state_owner_id=TERMINAL_SESSION_ID,
             )
 
     except Exception:
@@ -1153,6 +1158,7 @@ while True:
                     local_state,
                     cloud_state,
                     core_authority=core_authority,
+                    state_owner_id=TERMINAL_SESSION_ID,
                 )
 
             else:
@@ -1163,6 +1169,7 @@ while True:
                     local_state,
                     cloud_state,
                     core_authority=core_authority,
+                    state_owner_id=TERMINAL_SESSION_ID,
                 )
 
         except Exception:
@@ -1232,8 +1239,29 @@ while True:
     # Final response
     # --------------------------------------------------
 
+    published_answer = result.answer
+    if result.provider_kind == "cloud":
+        # The visible history must match what Oliver actually received. If
+        # safety changes cloud text, the server-held response ID is no longer
+        # a faithful continuation of the published conversation.
+        published_answer, safety_reason = sanitise_visible_response(
+            user_input, str(result.answer or ""),
+        )
+        if safety_reason:
+            cloud_state = None
+
     emit_final_response(
         user_input=user_input,
-        answer=result.answer,
+        answer=published_answer,
         response_timer=response_timer,
+        source=("cloud" if result.provider_kind == "cloud" else "local"),
     )
+    if result.provider_kind == "cloud" and result.status == "answered":
+        # Reuse only the sanitised, published cloud reply on the local side.
+        # The cloud SDK never receives this list as previous_response_id.
+        local_state = append_visible_turn_to_model_history(
+            current_state=local_state, user_input=user_input,
+            assistant_text=published_answer,
+            system_instructions=mairon_instructions,
+        )
+        local_state = bounded_local_history(local_state)

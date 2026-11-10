@@ -8,9 +8,9 @@ from core.evidence import (
 from core.workflow_result import (
     WorkflowResult,
 )
-from tools.tool_registry import (
-    execute_tool,
-)
+from functools import partial
+from tools.tool_admission import run_internal_tool
+execute_tool = partial(run_internal_tool, "core.email_search")
 
 
 EMAIL_FIELD_NAMES = {

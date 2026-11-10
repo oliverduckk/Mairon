@@ -3,6 +3,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from tools.calendar_tools import create_calendar_event
+from core.action_approval import authorised_calendar_effect
 
 
 MAIRON_TIMEZONE = os.getenv(
@@ -122,7 +123,7 @@ def describe_action(action):
     )
 
 
-def execute_approved_action(action):
+def execute_approved_action(action, *, approval_ticket=None):
     """
     Execute an action only after the user has approved it.
 
@@ -140,23 +141,19 @@ def execute_approved_action(action):
     )
 
     if action_type == "create_calendar_event":
-        return create_calendar_event(
-            summary=action.get(
-                "summary"
-            ),
-            start_time=action.get(
-                "start_time"
-            ),
-            end_time=action.get(
-                "end_time"
-            ),
-            location=action.get(
-                "location"
-            ),
-            description=action.get(
-                "description"
-            ),
-        )
+        with authorised_calendar_effect(approval_ticket, action) as permitted:
+            if not permitted:
+                return {
+                    "success": False,
+                    "message": "Calendar action approval is missing, changed, expired or already used.",
+                }
+            return create_calendar_event(
+                summary=action.get("summary"),
+                start_time=action.get("start_time"),
+                end_time=action.get("end_time"),
+                location=action.get("location"),
+                description=action.get("description"),
+            )
 
     return {
         "success": False,

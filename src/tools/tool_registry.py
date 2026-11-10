@@ -1,3 +1,7 @@
+import json
+
+from tools.tool_admission import current_tool_scope
+
 from memory.memory_store import (
     delete_memory,
     list_memories,
@@ -672,11 +676,59 @@ TOOLS = LOCAL_TOOLS
 # Tool execution
 # --------------------------------------------------
 
+def validate_tool_arguments(tool_name, arguments):
+    # Validate at execution, not only when announcing an API schema to a model.
+    # Do not treat malformed data as a no-argument request.
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, TypeError):
+            return None, "Malformed tool arguments."
+    if not isinstance(arguments, dict):
+        return None, "Tool arguments must be a JSON object."
+    definitions = {item["name"]: item for item in LOCAL_TOOLS}
+    if tool_name not in definitions:
+        return None, f"Unknown tool: {tool_name}"
+    schema = definitions[tool_name]["parameters"]
+    properties = schema.get("properties", {})
+    if set(arguments) - set(properties):
+        return None, "Tool arguments contain unknown fields."
+    scope = current_tool_scope()
+    # Internal Core/research callers preserve their established adapter defaults.
+    # Model-origin arguments have no such exemption.
+    missing = (set(schema.get("required", [])) - set(arguments)) if (scope and scope.caller in {"local", "cloud"}) else set()
+    if missing:
+        return None, "Tool arguments are missing required fields."
+    for key, value in arguments.items():
+        field = properties[key]
+        kind = field.get("type")
+        valid = (
+            (kind == "string" and isinstance(value, str))
+            or (kind == "integer" and isinstance(value, int) and not isinstance(value, bool))
+            or (kind == "number" and isinstance(value, (int, float)) and not isinstance(value, bool))
+            or (kind == "boolean" and isinstance(value, bool))
+            or kind is None
+        )
+        if not valid:
+            return None, "Tool argument has an incorrect type."
+        if "enum" in field and value not in field["enum"]:
+            return None, "Tool argument is outside the permitted values."
+    return arguments, None
+
+
 def execute_tool(
     tool_name,
     arguments=None
 ):
-    arguments = arguments or {}
+    known_names = {item["name"] for item in LOCAL_TOOLS}
+    if tool_name not in known_names:
+        return {"success": False, "message": f"Unknown tool: {tool_name}"}
+    scope = current_tool_scope()
+    if scope is None or not scope.permits(tool_name):
+        return {"success": False, "message": "Tool invocation was not authorised for this route."}
+    arguments, error = validate_tool_arguments(tool_name, arguments)
+    if error is not None:
+        return {"success": False, "message": error}
 
     if tool_name == "get_system_info":
         return get_system_info()

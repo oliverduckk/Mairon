@@ -586,7 +586,11 @@ class BoundedPublicationTests(unittest.TestCase):
         namespace["build_verification_declined_fallback"] = lambda: invalid
         path, outer = _provider_function("get_response")
         lease = []
+        from contextlib import nullcontext
         outer_namespace = {
+            "admitted_tools": lambda *_args: nullcontext(),
+            "internal_scope": lambda *_args: None,
+            "current_turn_authority": lambda: None,
             "begin_interactive_turn": lambda: lease.append("begin"),
             "end_interactive_turn": lambda: lease.append("end"),
             "_get_response_impl": inner,
