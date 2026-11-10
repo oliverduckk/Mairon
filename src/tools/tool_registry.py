@@ -1,6 +1,7 @@
 import json
 
 from tools.tool_admission import current_tool_scope
+from tools.public_url_policy import public_http_url
 
 from memory.memory_store import (
     delete_memory,
@@ -707,6 +708,10 @@ def validate_tool_arguments(tool_name, arguments):
             or (kind == "integer" and isinstance(value, int) and not isinstance(value, bool))
             or (kind == "number" and isinstance(value, (int, float)) and not isinstance(value, bool))
             or (kind == "boolean" and isinstance(value, bool))
+            or (kind == "array" and isinstance(value, list)
+                and isinstance(field.get("items"), dict)
+                and field["items"].get("type") == "string"
+                and all(isinstance(item, str) for item in value))
             or kind is None
         )
         if not valid:
@@ -872,6 +877,8 @@ def execute_tool(
         url = arguments.get("url")
         if not url:
             return {"success": False, "message": "No webpage URL was provided."}
+        if public_http_url(url) is None:
+            return {"success": False, "message": "Web read requires a public HTTP(S) URL."}
 
         focus = arguments.get("focus", "")
         if isinstance(focus, str):

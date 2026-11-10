@@ -16,7 +16,7 @@ import re
 import time
 from threading import Lock
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from tools.public_url_policy import public_http_url
 
 from core.authority_handoff import PreparedAuthority
 from core.provider_state import CloudContinuation, eligible_cloud_continuation
@@ -315,14 +315,10 @@ def admit_cloud_sdk_request(grant: CloudExportGrant, prompt: str,
 
 def _public_url(value: Any) -> str:
     text = _safe_text(value, maximum=1800)
-    try:
-        p = urlsplit(text)
-        if (p.scheme not in {"https", "http"} or not p.hostname or p.username
-                or p.password or p.query or p.fragment):
-            _deny()
-        return urlunsplit((p.scheme, p.netloc, p.path, "", ""))
-    except ValueError:
+    projected = public_http_url(text, strip_query=True)
+    if projected is None:
         _deny()
+    return projected
 
 
 def _project_number(data: dict, name: str, output: dict) -> None:
