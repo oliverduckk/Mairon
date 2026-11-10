@@ -16,6 +16,7 @@ import s1_offline_bootstrap  # noqa: F401
 import application_service as app_module
 from application_service import MaironApplication
 from core import router
+from core.cloud_export import issue_cloud_export_grant, admit_cloud_initial
 from core.authority_handoff import (
     CoreAuthorityUnavailable, prepare_core_turn, seal_prepared_turn,
 )
@@ -231,9 +232,13 @@ def run():
         checks += 1
 
         # 1B:T9 local four-field pending-action stays pending until approval.
-        pending_action = {"type":"create_calendar_event", "summary":"Fixture"}
+        pending_action = {
+            "type": "create_calendar_event", "summary": "Fixture",
+            "start_time": "2026-11-10T10:00:00", "end_time": "2026-11-10T11:00:00",
+        }
+        calendar_contract = contract(intent="calendar_event_creation_request")
         pending_local = Local(pending=pending_action)
-        a = app(Core(contract=contract()), pending_local)
+        a = app(Core(contract=calendar_contract), pending_local)
         approval = a.submit_text("Please create an appointment")
         assert approval.status == "action_approval_required" and a.has_pending_approval
         refused = a.resolve_pending_approval(False)
@@ -242,7 +247,7 @@ def run():
         checks += 1
 
         # Actual approval is fake and goes through the original approval branch.
-        a = app(Core(contract=contract()), Local(pending=pending_action))
+        a = app(Core(contract=calendar_contract), Local(pending=pending_action))
         assert a.submit_text("Please create an appointment").status == "action_approval_required"
         with mock.patch.object(router, "execute_approved_action", return_value={"success": True}) as execute, \
              mock.patch.object(router, "format_action_result", return_value="Approved fixture action."):
@@ -278,12 +283,15 @@ def run():
                         )], output_text="",
                     )
                 return SimpleNamespace(id="two",output=[],output_text="Done")
+        cloud_authority = seal_prepared_turn(Core(contract=contract()).prepare_turn("weather"))
+        export_grant = issue_cloud_export_grant(
+            cloud_authority, "weather", purpose="explicit_cloud_request",
+        )
+        cloud_instructions = admit_cloud_initial(export_grant, "weather").payload["instructions"]
         with mock.patch.object(openai_provider, "execute_tool", return_value={"success":True}):
             response = openai_provider.get_response(
-                SimpleNamespace(responses=Responses()),"weather","safe instructions",
-                core_answer_contract=seal_prepared_turn(
-                    Core(contract=contract()).prepare_turn("weather")
-                ).runtime,
+                SimpleNamespace(responses=Responses()), "weather", cloud_instructions,
+                core_answer_contract=cloud_authority.runtime, cloud_export=export_grant,
             )
         assert response == ("Done", "two", None)
         assert len(outputs) == 2 and outputs[1]["previous_response_id"] == "one"

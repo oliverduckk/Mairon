@@ -2,6 +2,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from core.authority_handoff import PreparedAuthority, CoreAuthorityUnavailable
+from tools.tool_admission import provider_turn
+from core.action_approval import issue_calendar_ticket
+from core.cloud_export import (
+    CloudExportDenied, issue_cloud_export_grant, admit_cloud_initial,
+)
 
 from core.action_manager import (
     execute_approved_action,
@@ -16,6 +21,7 @@ class RouteResult:
     reason: str | None = None
     pending_prompt: str | None = None
     pending_action: dict | None = None
+    approval_ticket: Any = None
     local_state: Any = None
     cloud_state: Any = None
     core_authority: PreparedAuthority | None = None
@@ -254,15 +260,26 @@ def route_message(
             "[AI] Using cloud: GPT-5.6 Luna"
         )
 
-        answer, new_cloud_state, _ = (
-            cloud_ai["module"].get_response(
-                cloud_ai["client"],
-                clean_input,
-                instructions,
-                cloud_state,
-                core_answer_contract=core_authority.runtime,
-            )
+        # S3: explicit /cloud grants only this prompt.  Never send the full
+        # application instruction bundle, reconstructed chat, or old cloud
+        # state as an unclassified history/continuation handle.
+        grant = issue_cloud_export_grant(
+            core_authority, clean_input, purpose="explicit_cloud_request",
         )
+        initial = admit_cloud_initial(grant, clean_input, previous_state=cloud_state)
+        try:
+            with provider_turn(core_authority):
+                answer, new_cloud_state, _ = cloud_ai["module"].get_response(
+                    cloud_ai["client"],
+                    initial.payload["input"],
+                    initial.payload["instructions"],
+                    None,
+                    core_answer_contract=core_authority.runtime,
+                    cloud_export=grant,
+                )
+        except Exception:
+            # SDK exception text can echo user input or upstream payloads.
+            raise CloudExportDenied("Cloud processing failed without an eligible response.") from None
 
         return RouteResult(
             status="answered",
@@ -307,22 +324,33 @@ def route_message(
         )
     )
 
-    (
-        answer,
-        new_local_state,
-        escalation_reason,
-        pending_action,
-    ) = local_ai["module"].get_response(
-        local_ai["client"],
-        clean_input,
-        instructions,
-        local_state,
-        allow_cloud_escalation=True,
-        core_answer_contract=core_authority.runtime,
-    )
+    with provider_turn(core_authority):
+        (
+            answer,
+            new_local_state,
+            escalation_reason,
+            pending_action,
+        ) = local_ai["module"].get_response(
+            local_ai["client"],
+            clean_input,
+            instructions,
+            local_state,
+            allow_cloud_escalation=True,
+            core_answer_contract=core_authority.runtime,
+        )
 
     if pending_action:
+        ticket = issue_calendar_ticket(pending_action, core_authority)
+        if ticket is None:
+            return RouteResult(
+                status="answered",
+                answer="I couldn't safely prepare that calendar approval.",
+                local_state=new_local_state,
+                cloud_state=cloud_state,
+                core_authority=core_authority,
+            )
         return RouteResult(
+            approval_ticket=ticket,
             status="action_approval_required",
             pending_prompt=clean_input,
             pending_action=pending_action,
@@ -390,15 +418,26 @@ def approve_cloud_escalation(
         "[AI] Using cloud: GPT-5.6 Luna"
     )
 
-    answer, new_cloud_state, _ = (
-        cloud_ai["module"].get_response(
-            cloud_ai["client"],
-            prompt,
-            instructions,
-            cloud_state,
-            core_answer_contract=core_authority.runtime,
-        )
+    # Approval grants export of the pending prompt only, not its surrounding
+    # private instructions, historical context, local state or saved handle.
+    grant = issue_cloud_export_grant(
+        core_authority, prompt, purpose="approved_cloud_escalation",
     )
+    initial = admit_cloud_initial(grant, prompt, previous_state=cloud_state)
+    try:
+        with provider_turn(core_authority):
+            answer, new_cloud_state, _ = cloud_ai["module"].get_response(
+                cloud_ai["client"],
+                initial.payload["input"],
+                initial.payload["instructions"],
+                None,
+                core_answer_contract=core_authority.runtime,
+                cloud_export=grant,
+            )
+    except Exception:
+        # The cloud SDK/adapter may otherwise return sensitive request text in
+        # a raw exception, subsequently shown in the application diagnostics.
+        raise CloudExportDenied("Cloud processing failed without an eligible response.") from None
 
     return RouteResult(
         status="answered",
@@ -433,22 +472,33 @@ def decline_cloud_escalation(
         )
     )
 
-    (
-        answer,
-        new_local_state,
-        _,
-        pending_action,
-    ) = local_ai["module"].get_response(
-        local_ai["client"],
-        prompt,
-        instructions,
-        local_state,
-        allow_cloud_escalation=False,
-        core_answer_contract=core_authority.runtime,
-    )
+    with provider_turn(core_authority):
+        (
+            answer,
+            new_local_state,
+            _,
+            pending_action,
+        ) = local_ai["module"].get_response(
+            local_ai["client"],
+            prompt,
+            instructions,
+            local_state,
+            allow_cloud_escalation=False,
+            core_answer_contract=core_authority.runtime,
+        )
 
     if pending_action:
+        ticket = issue_calendar_ticket(pending_action, core_authority)
+        if ticket is None:
+            return RouteResult(
+                status="answered",
+                answer="I couldn't safely prepare that calendar approval.",
+                local_state=new_local_state,
+                cloud_state=cloud_state,
+                core_authority=core_authority,
+            )
         return RouteResult(
+            approval_ticket=ticket,
             status="action_approval_required",
             pending_prompt=prompt,
             pending_action=pending_action,
@@ -477,7 +527,7 @@ def approve_pending_action(
 
     action_result = (
         execute_approved_action(
-            action
+            action, approval_ticket=result.approval_ticket,
         )
     )
 
@@ -500,6 +550,9 @@ def decline_pending_action(
     """
     Reject the pending action without changing anything.
     """
+
+    if result.approval_ticket is not None:
+        result.approval_ticket.revoke()
 
     action = (
         result.pending_action
