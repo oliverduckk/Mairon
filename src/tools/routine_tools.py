@@ -31,6 +31,7 @@ from routine.daily_context_resolver import (
 from routine.routine_store import (
     clear_daily_context,
 )
+from core.night_routine_authority import perform_night_effect
 
 
 # --------------------------------------------------
@@ -66,7 +67,8 @@ def get_routine_context(
 
 def sync_routine_wake_alarm(
     date,
-    resolved_context
+    resolved_context,
+    *, night_authority=None,
 ):
     """
     Synchronise a workday's routine-derived wake alarm.
@@ -183,7 +185,14 @@ def sync_routine_wake_alarm(
     else:
         label = "Wake up"
 
-    alarm_result = set_wake_alarm(
+    alarm_adapter = set_wake_alarm
+    if night_authority is not None:
+        def alarm_adapter(**payload):
+            return perform_night_effect(
+                night_authority, "alarm", set_wake_alarm, **payload
+            )
+
+    alarm_result = alarm_adapter(
         date=date,
         time=recommended_wake_time,
         label=label,

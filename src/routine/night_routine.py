@@ -39,6 +39,7 @@ from routine.routine_store import (
 from tools.routine_tools import (
     sync_routine_wake_alarm,
 )
+from core.night_routine_authority import night_workflow, perform_night_effect
 
 
 # --------------------------------------------------
@@ -140,9 +141,11 @@ def describe_alarm_state(
 # Night routine preparation
 # --------------------------------------------------
 
+@night_workflow
 def prepare_night_routine(
     date=None,
-    record_bedtime=True
+    record_bedtime=True,
+    *, authority=None,
 ):
     """
     Resolve everything Mairon needs to know before Oliver
@@ -167,7 +170,7 @@ def prepare_night_routine(
 
     target_date = (
         date
-        or get_tomorrow_date()
+        or authority.target_date
     )
 
     routine_context = (
@@ -239,9 +242,13 @@ def prepare_night_routine(
                 date=target_date,
                 resolved_context=(
                     routine_context
-                )
+                ),
+                night_authority=authority,
             )
         )
+
+        if alarm_sync.get("status") == "not_authorised":
+            return alarm_sync
 
     # --------------------------------------------------
     # Read authoritative alarm state
@@ -268,7 +275,8 @@ def prepare_night_routine(
     if record_bedtime:
 
         bedtime_context = (
-            record_recent_context(
+            perform_night_effect(
+                authority, "bedtime", record_recent_context,
                 event_type="bedtime",
                 details={
                     "next_date": (
@@ -307,6 +315,9 @@ def prepare_night_routine(
             )
         )
 
+        if bedtime_context.get("status") == "not_authorised":
+            return bedtime_context
+
     return {
         "success": True,
         "status": "ready",
@@ -340,10 +351,12 @@ def prepare_night_routine(
 # Complete missing work-location context
 # --------------------------------------------------
 
+@night_workflow
 def complete_night_routine_work_location(
     date,
     location,
-    record_bedtime=True
+    record_bedtime=True,
+    *, authority=None,
 ):
     """
     Complete a night routine that was blocked because
@@ -362,7 +375,8 @@ def complete_night_routine_work_location(
     """
 
     location_result = (
-        set_work_location_for_date(
+        perform_night_effect(
+            authority, "location", set_work_location_for_date,
             date_string=date,
             location=location
         )
@@ -383,7 +397,8 @@ def complete_night_routine_work_location(
 
     return prepare_night_routine(
         date=date,
-        record_bedtime=record_bedtime
+        record_bedtime=record_bedtime,
+        authority=authority,
     )
 
 

@@ -280,6 +280,17 @@ def route_epistemic_authority(
     This is intentionally deterministic for high-value/private workflows.
     """
 
+    if turn.intent == "night_routine_request":
+        return EpistemicRoute(
+            authority="routine",
+            mode="tool_verified",
+            verification_required=True,
+            allow_model_memory=False,
+            live_data_required=True,
+            private_data_required=True,
+            reason="Night-routine effects require the current trusted routine decision.",
+        )
+
     if turn.intent == "reason_from_supplied_premises":
         return EpistemicRoute(
             authority="user_turn_reasoning",

@@ -32,6 +32,10 @@ from core.turn_state import (
 from core.workflow_result import (
     WorkflowResult,
 )
+from core.desktop_action_authority import (
+    desktop_action_turn, dispatch_desktop_action,
+)
+
 from core.workflows.application_launch import (
     launch_approved_application,
 )
@@ -1020,11 +1024,12 @@ class MaironCore:
                 )
             ).strip().lower()
 
-            workflow_result = (
-                launch_approved_application(
-                    app_name=app_name
+            with desktop_action_turn(turn, user_input, self.conversation_state) as authority:
+                workflow_result = dispatch_desktop_action(
+                    authority, turn=turn, conversation_state=self.conversation_state,
+                    action="open", target_id=app_name,
+                    launch=launch_approved_application, control=control_approved_application,
                 )
-            )
 
             contract = build_answer_contract(
                 turn=turn,
@@ -1421,12 +1426,12 @@ class MaironCore:
                 else "focus"
             )
 
-            workflow_result = (
-                control_approved_application(
-                    app_name=app_name,
-                    action=action,
+            with desktop_action_turn(turn, user_input, self.conversation_state) as authority:
+                workflow_result = dispatch_desktop_action(
+                    authority, turn=turn, conversation_state=self.conversation_state,
+                    action=action, target_id=app_name,
+                    launch=launch_approved_application, control=control_approved_application,
                 )
-            )
 
             contract = build_answer_contract(
                 turn=turn,

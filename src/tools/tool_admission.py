@@ -133,15 +133,17 @@ def run_internal_tool(caller, tool_name, arguments=None):
 
 
 @contextmanager
-def provider_turn(core_authority):
+def provider_turn(core_authority, *, state_owner_id=None):
     """Only the router may establish a trusted Core→provider session."""
     from core.authority_handoff import PreparedAuthority
     if not isinstance(core_authority, PreparedAuthority):
         raise ValueError("Missing trusted prepared authority.")
     core_authority.require_local()
+    from core.night_routine_authority import night_provider_turn
     token = _ACTIVE_TURN.set(core_authority)
     try:
-        yield
+        with night_provider_turn(core_authority, state_owner_id):
+            yield
     finally:
         _ACTIVE_TURN.reset(token)
 

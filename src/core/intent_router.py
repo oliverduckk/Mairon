@@ -2,6 +2,7 @@ import re
 from typing import Optional
 
 from core.turn_state import TurnState
+from core.night_routine_authority import is_affirmative_night_request
 from core.seriousness import (
     assess_consequential_advice,
 )
@@ -1219,6 +1220,24 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.confidence = 1.0
         state.should_answer_directly = False
         state.add_reason("empty input")
+        return state
+
+    # SEC-01: only a complete affirmative current utterance can authorise
+    # bedtime effects. The provider and final routine bridges recheck this
+    # typed decision; routine vocabulary inside ordinary prose grants nothing.
+    if is_affirmative_night_request(raw):
+        state.speech_act = "request_action"
+        state.intent = "night_routine_request"
+        state.requested_action = "night_routine"
+        state.requires_private_data = True
+        state.requires_live_data = True
+        state.factuality = "action_result"
+        state.preferred_authority = "routine"
+        state.should_use_tools = True
+        state.should_answer_directly = False
+        state.should_continue_conversation = False
+        state.confidence = 1.0
+        state.add_reason("affirmative present night-routine request")
         return state
 
     if conversation_state is not None:

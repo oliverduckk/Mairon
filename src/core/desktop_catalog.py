@@ -282,6 +282,53 @@ def _active_desktop_target(
     return value
 
 
+# A desktop mention is not action authority. Match the complete present user
+# request before resolving its bounded target; narration and quoted material
+# cannot supply the imperative by appearing later in a sentence.
+_DESKTOP_REQUEST = re.compile(
+    r"^(?:(?:hey\s+)?(?:mairon|bro)[, ]+)?"
+    r"(?:(?:actually|okay|ok|right|well|then)[, ]+)?"
+    r"(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|"
+    r"(?:please|i\s+want\s+you\s+to|i'd\s+like\s+you\s+to)\s+)?"
+    r"(?:(?P<open>open|launch|start|run)(?:\s+up)?|"
+    r"(?P<close>close|quit|exit)|(?P<focus>focus|switch\s+to)|"
+    r"(?P<bring>bring))\s+(?P<target>.+?)"
+    r"(?:\s+(?:for\s+me|please|now|again)){0,2}[.!?]*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _positive_desktop_command(text):
+    match = _DESKTOP_REQUEST.fullmatch(_normalise(text))
+    if match is None:
+        return None
+    target_text = match.group("target").strip()
+    if match.group("bring"):
+        bring = re.fullmatch(
+            r"(.+?)\s+(?:to\s+(?:the\s+)?front|forward)", target_text,
+        )
+        if bring is None:
+            return None
+        target_text = bring.group(1).strip()
+    action = ("open" if match.group("open") else
+              "close" if match.group("close") else "focus")
+    return action, target_text
+
+
+def _exact_desktop_target(target_text):
+    matches = set()
+    for target_id, metadata in DESKTOP_TARGETS.items():
+        for alias in metadata.get("aliases", ()):
+            candidate = r"(?:the\s+)?" + re.escape(_normalise(alias))
+            if metadata.get("kind") == "project":
+                candidate += r"(?:\s+in\s+(?:visual\s+studio\s+code|vs\s+code|vscode))?"
+            else:
+                candidate += r"(?:\s+(?:app|application|window))?"
+            if re.fullmatch(candidate, target_text):
+                matches.add(target_id)
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
 def extract_desktop_action_request(
     text: str,
     conversation_state=None,
@@ -293,41 +340,16 @@ def extract_desktop_action_request(
     never becomes executable text, a shell command, or an arbitrary path.
     """
 
-    value = _normalise(
-        text
-    )
-
-    if not value:
+    command = _positive_desktop_command(text)
+    if command is None:
         return None
-
-    action = None
-
-    if FOCUS_PATTERN.search(value):
-        action = "focus"
-    elif CLOSE_PATTERN.search(value):
-        action = "close"
-    elif OPEN_PATTERN.search(value):
-        action = "open"
-
-    if action is None:
-        return None
-
-    # Never silently execute only half of a compound action.
-    if (
-        action == "open"
-        and UNSUPPORTED_OPEN_COMPOUND_PATTERN.search(value)
-    ):
-        return None
-
-    target_id = find_named_desktop_target(
-        value
-    )
-
+    action, target_text = command
+    target_id = _exact_desktop_target(target_text)
     inherited = False
 
     if (
         target_id is None
-        and DEICTIC_TARGET_PATTERN.search(value)
+        and DEICTIC_TARGET_PATTERN.fullmatch(target_text)
     ):
         target_id = _active_desktop_target(
             conversation_state

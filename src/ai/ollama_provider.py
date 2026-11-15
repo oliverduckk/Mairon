@@ -48,6 +48,11 @@ def _strip_internal_reasoning_markup(text):
     return value.strip()
 
 from tools.tool_registry import TOOLS, execute_tool, validate_tool_arguments
+from core.night_routine_authority import (
+    is_affirmative_night_request, affirmative_work_location,
+    issue_night_authority, issue_night_completion, attach_night_pending,
+    pending_night_authority,
+)
 from tools.tool_admission import (
     admitted_tools, provider_tool_scope, current_turn_authority, internal_scope,
 )
@@ -261,6 +266,7 @@ from core.answer_candidate import CandidateOrigin
 from routine.night_routine import (
     complete_night_routine_work_location,
     prepare_night_routine,
+    get_tomorrow_date,
 )
 
 from routine.morning_routine import (
@@ -2620,10 +2626,7 @@ def is_night_routine_request(
         "night mairon",
     ]
 
-    return any(
-        phrase in text
-        for phrase in bedtime_phrases
-    )
+    return is_affirmative_night_request(user_input)
 
 
 def parse_work_location_reply(
@@ -2660,21 +2663,7 @@ def parse_work_location_reply(
         "at home",
     ]
 
-    if (
-        text in office_phrases
-        or "office" in text.split()
-    ):
-        return "office"
-
-    if (
-        text in home_phrases
-        or "wfh" in text.split()
-        or "work from home" in text
-        or "working from home" in text
-    ):
-        return "home"
-
-    return None
+    return affirmative_work_location(user_input)
 
 
 def get_pending_night_routine(
@@ -2689,51 +2678,8 @@ def get_pending_night_routine(
     rather than trusting stale conversational state.
     """
 
-    if not conversation:
-        return None
-
-    for message in reversed(
-        conversation
-    ):
-        if get_message_role(
-            message
-        ) != "system":
-            continue
-
-        content = get_message_content(
-            message
-        )
-
-        if content.startswith(
-            RESOLVED_NIGHT_ROUTINE_PREFIX
-        ):
-            return None
-
-        if content.startswith(
-            PENDING_NIGHT_ROUTINE_PREFIX
-        ):
-            payload_text = content[
-                len(
-                    PENDING_NIGHT_ROUTINE_PREFIX
-                ):
-            ].strip()
-
-            try:
-                payload = json.loads(
-                    payload_text
-                )
-            except Exception:
-                return None
-
-            if isinstance(
-                payload,
-                dict
-            ):
-                return payload
-
-            return None
-
-    return None
+    # Historical/model-authored system prose cannot recreate permission.
+    return pending_night_authority(conversation)
 
 
 def get_calendar_for_night_routine(
@@ -2912,8 +2858,10 @@ def handle_night_routine_request(
         "[Core] Night routine: preparing tomorrow."
     )
 
+    authority = issue_night_authority(user_input, get_tomorrow_date())
     result = prepare_night_routine(
-        record_bedtime=True
+        record_bedtime=True,
+        authority=authority,
     )
 
     if not result.get(
@@ -2987,10 +2935,10 @@ def handle_night_routine_request(
             )
         })
 
-        working_conversation.append({
+        working_conversation.append(attach_night_pending({
             "role": "assistant",
             "content": answer
-        })
+        }, authority))
 
         return (
             answer,
@@ -3026,12 +2974,10 @@ def handle_pending_night_routine_reply(
     if not location:
         return None
 
-    target_date = pending.get(
-        "date"
-    )
-
-    if not target_date:
+    authority = issue_night_completion(user_input, pending, get_tomorrow_date())
+    if authority is None:
         return None
+    target_date = authority.target_date
 
     print(
         "[Core] Night routine: completing work-location context "
@@ -3041,7 +2987,8 @@ def handle_pending_night_routine_reply(
     result = complete_night_routine_work_location(
         date=target_date,
         location=location,
-        record_bedtime=True
+        record_bedtime=True,
+        authority=authority,
     )
 
     if not result.get(

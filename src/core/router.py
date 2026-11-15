@@ -310,7 +310,7 @@ def route_message(
         )
         initial = admit_cloud_initial(grant, clean_input, previous_state=prior)
         try:
-            with provider_turn(core_authority):
+            with provider_turn(core_authority, state_owner_id=state_owner_id):
                 raw_cloud_result = cloud_ai["module"].get_response(
                     cloud_ai["client"],
                     initial.payload["input"],
@@ -370,7 +370,7 @@ def route_message(
         )
     )
 
-    with provider_turn(core_authority):
+    with provider_turn(core_authority, state_owner_id=state_owner_id):
         raw_local_result = local_ai["module"].get_response(
             local_ai["client"],
             clean_input,
@@ -484,7 +484,7 @@ def approve_cloud_escalation(
     )
     initial = admit_cloud_initial(grant, prompt, previous_state=prior)
     try:
-        with provider_turn(core_authority):
+        with provider_turn(core_authority, state_owner_id=state_owner_id):
             raw_cloud_result = cloud_ai["module"].get_response(
                 cloud_ai["client"],
                 initial.payload["input"],
@@ -536,7 +536,7 @@ def decline_cloud_escalation(
         )
     )
 
-    with provider_turn(core_authority):
+    with provider_turn(core_authority, state_owner_id=state_owner_id):
         raw_local_result = local_ai["module"].get_response(
             local_ai["client"],
             prompt,
