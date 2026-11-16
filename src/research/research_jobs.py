@@ -1245,6 +1245,13 @@ def create_research_job(
         metadata
         or {}
     )
+    # Incoming metadata, a model plan or a historical permission marker may
+    # not mint outbound consent. Only the current public task may supply it.
+    from core.external_data_admission import research_job_export_record
+    job_metadata.pop("sec02_public_export", None)
+    export_record = research_job_export_record(topic_value, original_request_value)
+    if export_record is not None:
+        job_metadata["sec02_public_export"] = export_record
 
     request_context = (
         _RESEARCH_REQUEST_CONTEXT.get()

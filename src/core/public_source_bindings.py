@@ -116,7 +116,11 @@ _SYSTEM = (
 
 def _new_local_client(*, host, headers, timeout):
     from ollama import Client
-    return Client(host=host, headers=headers, timeout=timeout)
+    from core.local_endpoint_policy import local_http_endpoint
+    endpoint = local_http_endpoint(host)
+    if endpoint is None:
+        raise ValueError("Local source verification requires a loopback endpoint.")
+    return Client(host=endpoint, headers=headers, timeout=timeout, follow_redirects=False, trust_env=False)
 
 
 def _bounded_client(client):

@@ -882,11 +882,13 @@ def _run_public_research_pass(
     research_fn: Callable,
     packet_builder: Callable,
 ) -> tuple[dict, str]:
-    research_result = _call_research_function(
-        research_fn=research_fn,
-        query=query,
-        job=job,
-    )
+    from core.external_data_admission import research_external_job
+    with research_external_job(job):
+        research_result = _call_research_function(
+            research_fn=research_fn,
+            query=query,
+            job=job,
+        )
 
     if not isinstance(
         research_result,
@@ -1250,10 +1252,12 @@ def _handle_iterative_deep_stage(
             job
         )
 
-        plan = planner_fn(
-            planner_job,
-            accumulated,
-        )
+        from core.external_data_admission import research_external_job
+        with research_external_job(job):
+            plan = planner_fn(
+                planner_job,
+                accumulated,
+            )
 
         if not isinstance(
             plan,

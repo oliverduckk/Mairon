@@ -140,9 +140,10 @@ def provider_turn(core_authority, *, state_owner_id=None):
         raise ValueError("Missing trusted prepared authority.")
     core_authority.require_local()
     from core.night_routine_authority import night_provider_turn
+    from core.external_data_admission import external_provider_turn
     token = _ACTIVE_TURN.set(core_authority)
     try:
-        with night_provider_turn(core_authority, state_owner_id):
+        with night_provider_turn(core_authority, state_owner_id), external_provider_turn(core_authority):
             yield
     finally:
         _ACTIVE_TURN.reset(token)

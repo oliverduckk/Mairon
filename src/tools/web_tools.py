@@ -2,6 +2,10 @@ import os
 
 from dotenv import load_dotenv
 from tavily import TavilyClient
+from core.external_data_admission import (
+    admit_external, dispatch_external, safe_external_errors, ExternalDataDenied, public_service_result, canonical_external_text,
+)
+from tools.public_url_policy import public_http_url
 
 
 load_dotenv()
@@ -32,6 +36,7 @@ def create_client():
     )
 
 
+@safe_external_errors
 def web_search(
     query,
     topic="general",
@@ -54,6 +59,7 @@ def web_search(
         }
 
     query = query.strip()
+    query = canonical_external_text(query, 'query')
 
     if not query:
         return {
@@ -98,9 +104,8 @@ def web_search(
         if time_range is not None:
             search_arguments["time_range"] = time_range
 
-        response = client.search(
-            **search_arguments
-        )
+        admission = admit_external('tavily.search', search_arguments)
+        response = dispatch_external(admission, search_arguments, client.search)
 
         raw_results = response.get(
             "results",
@@ -110,9 +115,12 @@ def web_search(
         results = []
 
         for result in raw_results:
+            checked_result_url = public_http_url(result.get("url")) if isinstance(result, dict) else None
+            if checked_result_url is None:
+                continue
             cleaned_result = {
                 "title": result.get("title"),
-                "url": result.get("url"),
+                "url": checked_result_url,
                 "content": result.get("content"),
                 "score": result.get("score"),
             }
@@ -130,21 +138,25 @@ def web_search(
                 "message": "The web search returned no results."
             }
 
-        return {
+        return public_service_result(admission, {
             "success": True,
             "query": query,
             "topic": topic,
             "time_range": time_range,
             "results": results
-        }
+        })
 
+    except ExternalDataDenied:
+        raise
     except Exception as error:
+        error = "The external service was unavailable."
         return {
             "success": False,
             "message": f"Web search failed: {error}"
         }
 
 
+@safe_external_errors
 def web_read(
     url,
     focus=None
@@ -166,6 +178,10 @@ def web_read(
         }
 
     url = url.strip()
+    checked_url = public_http_url(url)
+    if checked_url is None:
+        raise ExternalDataDenied("A public, non-credential-bearing URL is required.")
+    url = checked_url
 
     if not url:
         return {
@@ -194,12 +210,12 @@ def web_read(
             focus = focus.strip()
 
             if focus:
+                focus = canonical_external_text(focus, 'query')
                 extract_arguments["query"] = focus
                 extract_arguments["chunks_per_source"] = 3
 
-        response = client.extract(
-            **extract_arguments
-        )
+        admission = admit_external('tavily.extract', extract_arguments)
+        response = dispatch_external(admission, extract_arguments, client.extract)
 
         results = response.get(
             "results",
@@ -218,7 +234,7 @@ def web_read(
                     "message": (
                         "The webpage could not be extracted."
                     ),
-                    "details": failed_results
+                    "details": []
                 }
 
             return {
@@ -227,6 +243,8 @@ def web_read(
             }
 
         result = results[0]
+        if public_http_url(result.get("url", url)) is None:
+            raise ExternalDataDenied("The extracted source is not eligible public evidence.")
 
         content = result.get(
             "raw_content",
@@ -249,14 +267,17 @@ def web_read(
                 :MAX_CONTENT_CHARACTERS
             ]
 
-        return {
+        return public_service_result(admission, {
             "success": True,
             "url": result.get("url", url),
             "focus": focus,
             "content": content
-        }
+        })
 
+    except ExternalDataDenied:
+        raise
     except Exception as error:
+        error = "The external service was unavailable."
         return {
             "success": False,
             "message": f"Webpage extraction failed: {error}"

@@ -17,6 +17,7 @@ import time
 from threading import Lock
 from typing import Any
 from tools.public_url_policy import public_http_url
+from core.external_data_admission import contains_secret, current_external_task, eligible_public_service_result
 
 from core.authority_handoff import PreparedAuthority
 from core.provider_state import CloudContinuation, eligible_cloud_continuation
@@ -46,7 +47,7 @@ def _deny() -> None:
 def _safe_text(value: Any, *, maximum: int) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > maximum:
         _deny()
-    if "\x00" in value or _SENSITIVE_PATTERN.search(value):
+    if "\x00" in value or _SENSITIVE_PATTERN.search(value) or contains_secret(value):
         _deny()
     return value
 
@@ -85,6 +86,18 @@ class CloudExportGrant:
     _lock: Lock = field(default_factory=Lock, repr=False)
     _previous: CloudContinuation | None = field(default=None, repr=False)
     _backend_client: Any = field(default=None, repr=False)
+    _source_authority: Any = field(default=None, repr=False)
+    _external_task: Any = field(default=None, repr=False)
+
+    def require_current_task(self) -> None:
+        if self._source_authority is not None:
+            task = current_external_task()
+            if task is None or task.authority is not self._source_authority:
+                _deny()
+            if self._external_task is None:
+                self._external_task = task
+            elif task is not self._external_task:
+                _deny()
 
     def revoke(self) -> None:
         with self._lock:
@@ -94,6 +107,7 @@ class CloudExportGrant:
         """One initial SDK request and at most one same-turn follow-up."""
         with self._lock:
             self.require(prompt)
+            self.require_current_task()
             if stage == "initial" and not self._initial_used:
                 self._initial_used = True
             elif stage == "followup" and self._initial_used and not self._followup_used:
@@ -141,6 +155,7 @@ def issue_cloud_export_grant(authority: PreparedAuthority, prompt: str,
         policy_flags=(r.allow_recommendations, r.allow_new_factual_claims,
                       r.allow_follow_up_question), _previous=previous,
         _backend_client=backend_client,
+        _source_authority=authority if getattr(authority.turn, "raw_text", None) else None,
     )
 
 
@@ -284,6 +299,7 @@ def admit_cloud_sdk_request(grant: CloudExportGrant, prompt: str,
     if not isinstance(grant, CloudExportGrant) or not isinstance(admission, CloudExportAdmission):
         _deny()
     grant.require(prompt)
+    grant.require_current_task()
     if admission._issuer is not _ISSUER or _payload_digest(admission.payload) != admission._payload_hash:
         _deny()
     if admission.payload.get("instructions") != _instructions_for(grant):
@@ -432,6 +448,13 @@ def admit_cloud_tool_followup(grant: CloudExportGrant, prompt: str,
     """Re-check original grant before every request, including tool output."""
     if not isinstance(grant, CloudExportGrant): _deny()
     grant.require(prompt)
+    # Shape projection alone does not establish where an alleged public
+    # result came from. Real prepared turns require this task's sink receipt.
+    grant.require_current_task()
+    if (grant._source_authority is not None and isinstance(tool_result, dict)
+            and tool_result.get("success") is True
+            and not eligible_public_service_result(tool_name, tool_result)):
+        _deny()
     if not isinstance(call_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", call_id):
         _deny()
     if not isinstance(response_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", response_id):

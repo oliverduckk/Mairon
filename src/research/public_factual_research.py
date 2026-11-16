@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 from functools import partial
 from tools.tool_admission import run_internal_tool
+from core.external_data_admission import register_query_derivation, current_public_query
 execute_tool = partial(run_internal_tool, "research.public")
 
 from core.conversational_research import (
@@ -1294,6 +1295,7 @@ def gather_public_factual_research(
     original_query = _normalise(
         user_input
     )
+    original_query = current_public_query(original_query) or original_query
 
     query = (
         normalise_public_research_query(
@@ -1303,6 +1305,7 @@ def gather_public_factual_research(
     )
 
     strict_relevance = research_identity is not None
+    register_query_derivation(original_query, query)
     query_resolution_required = bool(require_query_resolution)
     quality_evidence_required = bool(require_quality_evidence)
     relevance_gate_enabled = bool(
@@ -1339,6 +1342,7 @@ def gather_public_factual_research(
         time_range = "year"
 
     search_query = _augment_fresh_lookup_search_query(query)
+    register_query_derivation(query, search_query)
 
     # A near-future horizon such as "next year" is still a live public-fact
     # task even without "today"/"this month" wording. Constrain those forecast

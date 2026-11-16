@@ -1,4 +1,5 @@
 import requests
+from core.external_data_admission import admit_external, dispatch_external, safe_external_errors, public_service_result, canonical_external_text
 
 
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -34,25 +35,27 @@ def weather_code_description(code):
     return WEATHER_CODES.get(code, "unknown conditions")
 
 
+@safe_external_errors
 def get_weather(location):
+    location = canonical_external_text(location, 'weather')
     # --------------------------------------------------
     # Convert location name into coordinates
     # --------------------------------------------------
 
-    geocoding_response = requests.get(
-        GEOCODING_URL,
-        params={
+    geocoding_arguments = {
             "name": location,
             "count": 1,
             "language": "en",
             "format": "json"
-        },
-        timeout=10
-    )
-
-    geocoding_response.raise_for_status()
-
-    geocoding_data = geocoding_response.json()
+        }
+    admission = admit_external('open-meteo.geocode', geocoding_arguments)
+    def geocode(**params):
+        response = requests.get(GEOCODING_URL, params=params, timeout=10, allow_redirects=False)
+        response.raise_for_status()
+        if getattr(response, 'status_code', 200) in range(300, 400):
+            raise ValueError('Redirect refused.')
+        return response.json()
+    geocoding_data = dispatch_external(admission, geocoding_arguments, geocode)
     results = geocoding_data.get("results", [])
 
     if not results:
@@ -70,9 +73,7 @@ def get_weather(location):
     # Retrieve weather data
     # --------------------------------------------------
 
-    forecast_response = requests.get(
-        FORECAST_URL,
-        params={
+    forecast_arguments = {
             "latitude": latitude,
             "longitude": longitude,
             "current": (
@@ -90,13 +91,15 @@ def get_weather(location):
             ),
             "timezone": "auto",
             "forecast_days": 3
-        },
-        timeout=10
-    )
-
-    forecast_response.raise_for_status()
-
-    weather = forecast_response.json()
+        }
+    admission = admit_external('open-meteo.forecast', forecast_arguments)
+    def forecast(**params):
+        response = requests.get(FORECAST_URL, params=params, timeout=10, allow_redirects=False)
+        response.raise_for_status()
+        if getattr(response, 'status_code', 200) in range(300, 400):
+            raise ValueError('Redirect refused.')
+        return response.json()
+    weather = dispatch_external(admission, forecast_arguments, forecast)
 
     current = weather["current"]
     daily = weather["daily"]
@@ -117,7 +120,7 @@ def get_weather(location):
             }
         )
 
-    return {
+    return public_service_result(admission, {
         "success": True,
         "location": {
             "name": place["name"],
@@ -136,4 +139,4 @@ def get_weather(location):
             "wind_speed_kmh": current["wind_speed_10m"],
         },
         "forecast": forecast_days
-    }
+    })

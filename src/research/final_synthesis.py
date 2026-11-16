@@ -8,6 +8,7 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from ollama import Client
+from core.local_endpoint_policy import local_http_endpoint
 
 from research.public_factual_grounding import verify_public_factual_draft
 
@@ -129,7 +130,10 @@ def _synthesis_think_setting(model: str):
 
 
 def create_final_synthesis_client() -> Client:
-    return Client(host=_research_ollama_host())
+    endpoint = local_http_endpoint(_research_ollama_host())
+    if endpoint is None:
+        raise ValueError("Research inference requires an approved loopback endpoint.")
+    return Client(host=endpoint, follow_redirects=False, trust_env=False)
 
 
 def _source_provenance(result: dict) -> list[dict]:

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
+from core.external_data_admission import admit_external, dispatch_external, safe_external_errors, register_route_departure
 
 
 load_dotenv()
@@ -213,6 +214,7 @@ def format_departure_time(dt):
     )
 
 
+@safe_external_errors
 def request_route(
     origin,
     destination,
@@ -270,16 +272,14 @@ def request_route(
         )
     }
 
-    response = requests.post(
-        ROUTES_URL,
-        json=request_body,
-        headers=headers,
-        timeout=15
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
+    admission = admit_external('google.routes', request_body)
+    def request(**body):
+        response = requests.post(ROUTES_URL, json=body, headers=headers, timeout=15, allow_redirects=False)
+        response.raise_for_status()
+        if getattr(response, 'status_code', 200) in range(300, 400):
+            raise ValueError('Redirect refused.')
+        return response.json()
+    data = dispatch_external(admission, request_body, request)
     routes = data.get(
         "routes",
         []
@@ -462,6 +462,8 @@ def calculate_driving_route(
         if not route.get(
             "success"
         ):
+            if route.get("status") == "external_data_not_authorised":
+                return route
             return {
                 "success": False,
                 "message": (
@@ -518,6 +520,8 @@ def calculate_driving_route(
             )
         )
 
+        if preferred_route.get("status") == "external_data_not_authorised":
+            return preferred_route
         if preferred_route.get(
             "success"
         ):
@@ -558,6 +562,8 @@ def calculate_driving_route(
             )
         )
 
+        if preferred_stop_route.get("status") == "external_data_not_authorised":
+            return preferred_stop_route
         if preferred_stop_route.get(
             "success"
         ):
@@ -587,6 +593,8 @@ def calculate_driving_route(
             "DRIVE"
         )
 
+        if google_route.get("status") == "external_data_not_authorised":
+            return google_route
         if google_route.get(
             "success"
         ):
@@ -625,6 +633,8 @@ def calculate_driving_route(
     if not route.get(
         "success"
     ):
+        if route.get("status") == "external_data_not_authorised":
+            return route
         return {
             "success": False,
             "message": (
@@ -744,6 +754,8 @@ def get_route(
             if not route.get(
                 "success"
             ):
+                if route.get("status") == "external_data_not_authorised":
+                    return route
                 return {
                     "success": False,
                     "message": (
@@ -788,6 +800,8 @@ def get_route(
         if not driving_leg.get(
             "success"
         ):
+            if driving_leg.get("status") == "external_data_not_authorised":
+                return driving_leg
             return {
                 "success": False,
                 "message": (
@@ -818,6 +832,7 @@ def get_route(
             )
         )
 
+        register_route_departure(format_departure_time(transit_departure_time))
         transit_leg = request_route(
             train_station,
             resolved_destination,
@@ -830,6 +845,8 @@ def get_route(
         if not transit_leg.get(
             "success"
         ):
+            if transit_leg.get("status") == "external_data_not_authorised":
+                return transit_leg
             return {
                 "success": False,
                 "message": (

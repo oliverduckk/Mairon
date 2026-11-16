@@ -48,6 +48,8 @@ def _strip_internal_reasoning_markup(text):
     return value.strip()
 
 from tools.tool_registry import TOOLS, execute_tool, validate_tool_arguments
+from core.external_data_admission import allow_weather_default
+from core.local_endpoint_policy import local_http_endpoint
 from core.night_routine_authority import (
     is_affirmative_night_request, affirmative_work_location,
     issue_night_authority, issue_night_completion, attach_night_pending,
@@ -347,7 +349,8 @@ MAIRON_WEATHER_LOCATION = os.getenv(
 
 def create_client():
     return Client(
-        host="http://localhost:11434"
+        host=local_http_endpoint("http://localhost:11434"),
+        follow_redirects=False, trust_env=False,
     )
 
 
@@ -2438,6 +2441,7 @@ def handle_weather_request(
     """
 
     location = MAIRON_WEATHER_LOCATION
+    allow_weather_default(MAIRON_WEATHER_LOCATION)
 
     if WEATHER_ONLY_TOOL:
         extraction_messages = get_isolated_system_context(

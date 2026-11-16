@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 
 from functools import partial
 from tools.tool_admission import run_internal_tool
+from core.external_data_admission import current_external_task, current_public_query
 execute_tool = partial(run_internal_tool, "research.media")
 
 
@@ -1276,6 +1277,13 @@ def gather_media_research(
         research_mode=research_mode,
         requested_medium=requested_medium,
     )
+
+    if current_external_task() is not None:
+        # Private spoiler/history state may shape LOCAL synthesis, never the
+        # external query. The current explicit public task supplies both fields.
+        public_query = current_public_query(user_input)
+        if public_query is not None:
+            query = read_focus = public_query
 
     search_result = execute_tool(
         "web_search",

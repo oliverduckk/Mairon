@@ -8,8 +8,11 @@ from urllib.error import (
 )
 from urllib.request import (
     Request,
-    urlopen,
+    build_opener,
+    ProxyHandler,
+    HTTPRedirectHandler,
 )
+from core.local_endpoint_policy import local_http_endpoint
 
 
 from core.desktop_agent_protocol import (
@@ -27,6 +30,19 @@ from core.desktop_agent_protocol import (
 
 
 DEFAULT_TIMEOUT_SECONDS = 4.0
+
+
+class _NoAgentRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, newurl):
+        # An authenticated Agent request never delegates its token to a new
+        # request, even when that redirect appears to be another local URL.
+        return None
+
+
+def urlopen(request, *, timeout):
+    """Existing fakeable transport seam, with no environment proxy/redirect."""
+    opener = build_opener(ProxyHandler({}), _NoAgentRedirect())
+    return opener.open(request, timeout=timeout)
 
 
 def get_desktop_agent_url() -> str:
@@ -61,6 +77,14 @@ def call_desktop_agent(
     """
     Send one authenticated structured request to the local Desktop Agent.
     """
+
+    endpoint = local_http_endpoint(base_url if base_url is not None else get_desktop_agent_url())
+    if endpoint is None:
+        return {
+            "success": False,
+            "status": "agent_endpoint_not_authorised",
+            "message": "Desktop Agent requires an approved local loopback endpoint.",
+        }
 
     request_id = str(
         uuid.uuid4()
@@ -97,8 +121,7 @@ def call_desktop_agent(
 
     url = (
         str(
-            base_url
-            or get_desktop_agent_url()
+            endpoint
         ).rstrip(
             "/"
         )
@@ -132,6 +155,12 @@ def call_desktop_agent(
             )
 
     except HTTPError as exc:
+        if 300 <= exc.code < 400:
+            return {
+                "success": False,
+                "status": "agent_redirect_denied",
+                "message": "Desktop Agent redirects are not permitted.",
+            }
         try:
             response_raw = exc.read(
                 MAX_REQUEST_BYTES
