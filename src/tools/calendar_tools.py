@@ -384,6 +384,48 @@ def get_next_calendar_event():
         }
 
 
+def calendar_creation_unknown():
+    """A dispatched request may have committed; its consumed approval stays spent."""
+    return {
+        "success": False,
+        "status": "outcome_unknown",
+        "dispatch_attempted": True,
+        "retryable": False,
+        "message": (
+            "Calendar creation could not be confirmed. Check your calendar before "
+            "approving another attempt; this approval cannot be retried."
+        ),
+    }
+
+
+def _calendar_not_attempted(message, *, approval_rejected=False):
+    return {
+        "success": False,
+        "status": "not_attempted",
+        "dispatch_attempted": False,
+        "retryable": False,
+        "approval_rejected": approval_rejected,
+        "message": message,
+    }
+
+
+def _confirmed_insert_response(response, approved_body):
+    """Require an event acknowledgement, not an empty/error/malformed response."""
+    if (not isinstance(response, dict) or "error" in response
+            or response.get("status") not in (None, "confirmed", "tentative")):
+        return False
+    event_id = response.get("id")
+    if isinstance(event_id, str) and event_id.strip():
+        return True
+    # A response omitting its ID must at least acknowledge all approved identity
+    # fields. Never invent an ID/link from approved details alone.
+    return (response.get("summary") == approved_body["summary"]
+            and isinstance(response.get("start"), dict)
+            and isinstance(response.get("end"), dict)
+            and response["start"].get("dateTime") == approved_body["start"]["dateTime"]
+            and response["end"].get("dateTime") == approved_body["end"]["dateTime"])
+
+
 def create_calendar_event(
     summary,
     start_time,
@@ -403,24 +445,16 @@ def create_calendar_event(
     """
 
     if not consume_calendar_effect(summary, start_time, end_time, location, description):
-        return {
-            "success": False,
-            "message": "Calendar event execution requires current, single-use approval."
-        }
+        return _calendar_not_attempted(
+            "Calendar event execution requires current, single-use approval.",
+            approval_rejected=True,
+        )
 
     if not summary:
-        return {
-            "success": False,
-            "message": "Event summary is required."
-        }
+        return _calendar_not_attempted("Event summary is required.")
 
     if not start_time or not end_time:
-        return {
-            "success": False,
-            "message": (
-                "Event start and end times are required."
-            )
-        }
+        return _calendar_not_attempted("Event start and end times are required.")
 
     try:
         start_datetime = datetime.fromisoformat(
@@ -442,12 +476,7 @@ def create_calendar_event(
             )
 
         if end_datetime <= start_datetime:
-            return {
-                "success": False,
-                "message": (
-                    "Event end time must be after its start time."
-                )
-            }
+            return _calendar_not_attempted("Event end time must be after its start time.")
 
         event_body = {
             "summary": summary,
@@ -467,48 +496,58 @@ def create_calendar_event(
         if description:
             event_body["description"] = description
 
+    except (ValueError, TypeError):
+        return _calendar_not_attempted("Invalid event date/time format.")
+
+    # Google discovery resource construction creates an HttpRequest; only
+    # execute() dispatches the insertion. Credential/client/build failures here
+    # are confirmed non-insertion, irrespective of account setup activity.
+    try:
         service = create_calendar_service()
+        request = service.events().insert(calendarId="primary", body=event_body)
+        execute = request.execute
+    except HttpError:
+        error = "Calendar service was unavailable before insertion."
+        return _calendar_not_attempted(f"Google Calendar API error: {error}")
+    except Exception:
+        error = "Calendar service was unavailable before insertion."
+        return _calendar_not_attempted(f"Calendar event creation failed: {error}")
 
-        created_event = (
-            service.events()
-            .insert(
-                calendarId="primary",
-                body=event_body
-            )
-            .execute()
-        )
+    # From this point onward an exception cannot prove that the server did not
+    # commit. Never retry, including HTTP errors whose dispatch is uncertain.
+    try:
+        created_event = execute()
+    except Exception:
+        return calendar_creation_unknown()
+    if not _confirmed_insert_response(created_event, event_body):
+        return calendar_creation_unknown()
 
-        return {
-            "success": True,
-            "message": "Calendar event created.",
-            "event": normalise_event(
-                created_event
-            )
+    # Acknowledged creation is irreversible by presentation/enrichment errors.
+    details_unavailable = False
+    try:
+        event = normalise_event(created_event)
+        if not isinstance(event, dict):
+            raise ValueError("Unavailable event details.")
+    except Exception:
+        details_unavailable = True
+        event = {
+            "summary": summary,
+            "start": event_body["start"]["dateTime"],
+            "end": event_body["end"]["dateTime"],
+            "all_day": False,
         }
-
-    except ValueError:
-        return {
-            "success": False,
-            "message": (
-                "Invalid event date/time format."
-            )
-        }
-
-    except HttpError as error:
-        return {
-            "success": False,
-            "message": (
-                f"Google Calendar API error: {error}"
-            )
-        }
-
-    except Exception as error:
-        return {
-            "success": False,
-            "message": (
-                f"Calendar event creation failed: {error}"
-            )
-        }
+    result = {
+        "success": True,
+        "status": "confirmed_created",
+        "dispatch_attempted": True,
+        "retryable": False,
+        "message": "Calendar event created.",
+        "event": event,
+        "details_unavailable": details_unavailable,
+    }
+    if details_unavailable:
+        result["note"] = "Additional event details are unavailable."
+    return result
 
 
 if __name__ == "__main__":

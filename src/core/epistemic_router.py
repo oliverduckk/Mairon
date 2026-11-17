@@ -317,6 +317,13 @@ def route_epistemic_authority(
             ),
         )
 
+    if turn.intent in {"local_write_request", "local_write_clarification"}:
+        return EpistemicRoute(
+            authority="local_tools", mode="tool_result", verification_required=True,
+            allow_model_memory=False, private_data_required=True,
+            reason="Only the exact prepared local write may change its private store.",
+        )
+
     if turn.intent == "consequential_advice":
         return EpistemicRoute(
             authority="public_web",

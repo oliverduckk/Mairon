@@ -5318,9 +5318,22 @@ def handle_route_request(
     if route_call is None:
         return None
 
-    arguments = normalise_tool_arguments(
-        route_call.function.arguments
+    # SEC-03: model proposals retain model-origin schema requirements even
+    # inside the specialised workflow. Validate before defaults/coercion.
+    arguments, argument_error = validate_tool_arguments(
+        "get_route", route_call.function.arguments, model_origin=True,
     )
+    authority = current_turn_authority()
+    model_scope = provider_tool_scope("local", authority, ["get_route"])
+    if (argument_error is not None or len(tool_calls) != 1
+            or not model_scope.permits("get_route")
+            or getattr(getattr(authority, "turn", None), "raw_text", None) != user_input.strip()):
+        return finalise_route_request(
+            client=client, user_input=user_input, conversation=conversation,
+            arguments={}, previous_context=None,
+            route_result={"success": False, "status": "invalid_model_route",
+                "message": "I need a valid origin, destination and travel mode before calculating that route."},
+        )
 
     arguments = normalise_route_arguments(
         arguments
@@ -11865,6 +11878,11 @@ def _get_response_impl(
         conversation = strip_ephemeral_core_contracts(
             conversation
         )
+
+    from core.local_write_authority import handle_prepared_local_write
+    local_write_result = handle_prepared_local_write(user_input, conversation)
+    if local_write_result is not None:
+        return local_write_result
 
     # verification_declined is a provider-ingress invariant, not merely a
     # direct-conversation behaviour. Some no-browse prompts do not satisfy the

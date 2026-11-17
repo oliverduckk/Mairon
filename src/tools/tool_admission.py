@@ -96,7 +96,8 @@ def provider_tool_scope(provider, core_authority, advertised_names):
         ):
             allowed = allowed | _LOCAL_PRIVATE_READS
         # Core must have resolved an action before a model may ask for a write.
-        if action in _WRITES:
+        from core.local_write_authority import WRITE_TOOLS, authorised_local_write
+        if action in _WRITES and (action not in WRITE_TOOLS or authorised_local_write(core_authority) is not None):
             allowed = allowed | {action}
     from tools.tool_registry import LOCAL_TOOLS, CLOUD_TOOLS
     provider_names = {
@@ -141,9 +142,10 @@ def provider_turn(core_authority, *, state_owner_id=None):
     core_authority.require_local()
     from core.night_routine_authority import night_provider_turn
     from core.external_data_admission import external_provider_turn
+    from core.local_write_authority import local_write_turn
     token = _ACTIVE_TURN.set(core_authority)
     try:
-        with night_provider_turn(core_authority, state_owner_id), external_provider_turn(core_authority):
+        with night_provider_turn(core_authority, state_owner_id), external_provider_turn(core_authority), local_write_turn(core_authority):
             yield
     finally:
         _ACTIVE_TURN.reset(token)

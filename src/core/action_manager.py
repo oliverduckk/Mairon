@@ -2,7 +2,7 @@ import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from tools.calendar_tools import create_calendar_event
+from tools.calendar_tools import create_calendar_event, calendar_creation_unknown
 from core.action_approval import authorised_calendar_effect
 
 
@@ -130,9 +130,11 @@ def execute_approved_action(action, *, approval_ticket=None):
     The AI model never calls this function directly.
     """
 
-    if not action:
+    if not isinstance(action, dict) or not action:
         return {
             "success": False,
+            "status": "not_attempted",
+            "dispatch_attempted": False,
             "message": "No pending action exists."
         }
 
@@ -145,23 +147,46 @@ def execute_approved_action(action, *, approval_ticket=None):
             if not permitted:
                 return {
                     "success": False,
+                    "status": "not_attempted",
+                    "dispatch_attempted": False,
+                    "approval_rejected": True,
+                    "retryable": False,
                     "message": "Calendar action approval is missing, changed, expired or already used.",
                 }
-            return create_calendar_event(
-                summary=action.get("summary"),
-                start_time=action.get("start_time"),
-                end_time=action.get("end_time"),
-                location=action.get("location"),
-                description=action.get("description"),
-            )
+            try:
+                return create_calendar_event(
+                    summary=action.get("summary"),
+                    start_time=action.get("start_time"),
+                    end_time=action.get("end_time"),
+                    location=action.get("location"),
+                    description=action.get("description"),
+                )
+            except Exception:
+                # A replacement adapter escaping its own guard cannot prove
+                # non-execution. Keep the approval spent and suppress details.
+                return calendar_creation_unknown()
 
     return {
         "success": False,
+        "status": "not_attempted",
+        "dispatch_attempted": False,
         "message": (
             f"Action type '{action_type}' "
             "is not approved by Mairon Core."
         )
     }
+
+
+def calendar_action_outcome(result):
+    """One conservative interpretation for visible text and application state."""
+    if isinstance(result, dict):
+        if (result.get("status") == "confirmed_created" and result.get("success") is True
+                and result.get("dispatch_attempted") is True):
+            return "confirmed_created"
+        if (result.get("status") == "not_attempted" and result.get("success") is False
+                and result.get("dispatch_attempted") is False):
+            return "not_attempted"
+    return "outcome_unknown"
 
 
 def format_action_result(
@@ -172,6 +197,19 @@ def format_action_result(
     Turn the result of an approved action into a
     concise response for Oliver.
     """
+
+    if not isinstance(result, dict) or result.get("status") == "outcome_unknown":
+        return calendar_creation_unknown()["message"]
+    if isinstance(action, dict) and action.get("type") == "create_calendar_event":
+        if calendar_action_outcome(result) == "outcome_unknown":
+            return calendar_creation_unknown()["message"]
+    if not result.get("success") and result.get("status") != "not_attempted":
+        # Unclassified old/custom adapter failures are not proof of no effect.
+        return calendar_creation_unknown()["message"]
+    if result.get("approval_rejected"):
+        # A spent approval may already have created an event. Do not negate
+        # that earlier outcome when refusing a replay.
+        return "No additional calendar insertion was attempted. " + result["message"]
 
     if not result.get(
         "success"
@@ -196,10 +234,13 @@ def format_action_result(
             )
         )
 
-        return (
+        answer = (
             f"Added {summary} to your calendar "
             f"for {start_time}."
         )
+        if result.get("details_unavailable"):
+            answer += " Additional event details are unavailable."
+        return answer
 
     return result.get(
         "message",

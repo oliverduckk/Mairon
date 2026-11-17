@@ -1,4 +1,5 @@
 import sqlite3
+import re
 from pathlib import Path
 
 
@@ -134,3 +135,29 @@ def delete_memory(query):
         "message": "Memory deleted.",
         "deleted_memory": memory_to_delete["memory"]
     }
+
+
+def delete_explicit_memory(query):
+    """SEC-03 tool bridge: one current literal match, then conditional ID delete.
+
+    Preserve the existing no-match/multiple-match policy. A lone weak keyword
+    overlap is not enough to bind an explicitly requested deletion target.
+    """
+    matches = search_memories(query)
+    if not matches:
+        return {"success": False, "message": "No matching memory was found."}
+    if len(matches) != 1:
+        return {"success": False, "message": "Multiple memories matched. Nothing was deleted.", "matches": matches}
+    selected = matches[0]
+    phrase = re.sub(r'\s+', ' ', query).strip(' .!?').casefold()
+    content = re.sub(r'\s+', ' ', selected['memory']).casefold()
+    if not phrase or not re.search(r'(?<!\w)' + re.escape(phrase) + r'(?!\w)', content):
+        return {"success": False, "message": "Please identify the specific stored memory to forget. Nothing was deleted."}
+    with sqlite3.connect(DB_PATH) as connection:
+        cursor = connection.execute(
+            "DELETE FROM memories WHERE id = ? AND memory = ?",
+            (selected['id'], selected['memory']),
+        )
+    if cursor.rowcount != 1:
+        return {"success": False, "message": "The selected memory changed. Nothing was deleted."}
+    return {"success": True, "message": "Memory deleted.", "deleted_memory": selected['memory']}

@@ -4,7 +4,7 @@ from tools.tool_admission import current_tool_scope
 from tools.public_url_policy import public_http_url
 
 from memory.memory_store import (
-    delete_memory,
+    delete_explicit_memory as delete_memory,
     list_memories,
     save_memory,
     search_memories,
@@ -677,12 +677,19 @@ TOOLS = LOCAL_TOOLS
 # Tool execution
 # --------------------------------------------------
 
-def validate_tool_arguments(tool_name, arguments):
+def validate_tool_arguments(tool_name, arguments, *, model_origin=False):
     # Validate at execution, not only when announcing an API schema to a model.
     # Do not treat malformed data as a no-argument request.
     if isinstance(arguments, str):
         try:
-            arguments = json.loads(arguments)
+            def unique_fields(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("Repeated model argument field.")
+                    result[key] = value
+                return result
+            arguments = json.loads(arguments, object_pairs_hook=unique_fields) if model_origin else json.loads(arguments)
         except (ValueError, TypeError):
             return None, "Malformed tool arguments."
     if not isinstance(arguments, dict):
@@ -697,7 +704,7 @@ def validate_tool_arguments(tool_name, arguments):
     scope = current_tool_scope()
     # Internal Core/research callers preserve their established adapter defaults.
     # Model-origin arguments have no such exemption.
-    missing = (set(schema.get("required", [])) - set(arguments)) if (scope and scope.caller in {"local", "cloud"}) else set()
+    missing = (set(schema.get("required", [])) - set(arguments)) if (model_origin or (scope and scope.caller in {"local", "cloud"})) else set()
     if missing:
         return None, "Tool arguments are missing required fields."
     for key, value in arguments.items():
@@ -718,6 +725,11 @@ def validate_tool_arguments(tool_name, arguments):
             return None, "Tool argument has an incorrect type."
         if "enum" in field and value not in field["enum"]:
             return None, "Tool argument is outside the permitted values."
+        if model_origin and tool_name == "get_route" and (
+            (kind == "string" and not value.strip())
+            or (kind == "array" and any(not item.strip() for item in value))
+        ):
+            return None, "Route arguments must identify explicit locations and a mode."
     return arguments, None
 
 
@@ -816,7 +828,8 @@ def execute_tool(
             return {"success": False, "message": "No work date was provided."}
         if not location:
             return {"success": False, "message": "No work location was provided."}
-        return set_work_location(date=date, location=location)
+        from core.local_write_authority import perform_local_write
+        return perform_local_write(tool_name, arguments, lambda: set_work_location(date=date, location=location))
 
     if tool_name == "get_wake_alarm":
         date = arguments.get("date")
@@ -838,18 +851,20 @@ def execute_tool(
         # control routine metadata such as "Work - Home" or
         # "Work - Office"; those labels belong only to routine-derived
         # alarms and would become stale when plans change.
-        return set_alarm_for_date(
+        from core.local_write_authority import perform_local_write
+        return perform_local_write(tool_name, arguments, lambda: set_alarm_for_date(
             date=date,
             time=time,
             label="Wake up",
             source="manual"
-        )
+        ))
 
     if tool_name == "disable_wake_alarm":
         date = arguments.get("date")
         if not date:
             return {"success": False, "message": "No alarm date was provided."}
-        return disable_alarm_for_date(date=date)
+        from core.local_write_authority import perform_local_write
+        return perform_local_write(tool_name, arguments, lambda: disable_alarm_for_date(date=date))
 
     if tool_name == "get_upcoming_alarms":
         return get_upcoming_alarms(
@@ -892,7 +907,8 @@ def execute_tool(
         memory = arguments.get("memory")
         if not memory:
             return {"success": False, "message": "No memory content was provided."}
-        return save_memory(memory)
+        from core.local_write_authority import perform_local_write
+        return perform_local_write(tool_name, arguments, lambda: save_memory(memory))
 
     if tool_name == "search_memory":
         query = arguments.get("query")
@@ -907,7 +923,8 @@ def execute_tool(
         query = arguments.get("query")
         if not query:
             return {"success": False, "message": "No memory deletion query was provided."}
-        return delete_memory(query)
+        from core.local_write_authority import perform_local_write
+        return perform_local_write(tool_name, arguments, lambda: delete_memory(query))
 
     return {
         "success": False,

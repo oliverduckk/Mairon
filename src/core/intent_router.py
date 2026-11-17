@@ -1222,6 +1222,26 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.add_reason("empty input")
         return state
 
+    # SEC-03: Core owns exact values for the five explicit local writes.
+    # The opaque request is omitted from TurnState.to_dict/persisted history.
+    from core.local_write_authority import parse_local_write, bind_local_write
+    local_write = parse_local_write(raw)
+    if local_write is not None:
+        state.speech_act = "request_action"
+        state.intent = "local_write_request" if local_write.tool else "local_write_clarification"
+        state.requested_action = local_write.tool
+        state.requires_private_data = True
+        state.factuality = "action_result"
+        state.preferred_authority = "local_tools"
+        state.should_use_tools = local_write.tool is not None
+        state.should_answer_directly = False
+        state.confidence = 1.0
+        if local_write.clarification:
+            state.entities["local_write_clarification"] = local_write.clarification
+        bind_local_write(state, local_write)
+        state.add_reason("explicit local write with Core-bound values or required clarification")
+        return state
+
     # SEC-01: only a complete affirmative current utterance can authorise
     # bedtime effects. The provider and final routine bridges recheck this
     # typed decision; routine vocabulary inside ordinary prose grants nothing.

@@ -1631,7 +1631,10 @@ class MaironApplication:
                 )
             ),
             agent_action=pending.agent_action,
-            action_confirmed=bool(pending.kind == "action" and approved),
+            action_confirmed=bool(
+                pending.kind == "action" and approved
+                and result.action_outcome == "confirmed_created"
+            ),
         )
 
     # --------------------------------------------------

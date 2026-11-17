@@ -17,6 +17,7 @@ from core.cloud_export import (
 from core.action_manager import (
     execute_approved_action,
     format_action_result,
+    calendar_action_outcome,
 )
 
 
@@ -32,6 +33,7 @@ class RouteResult:
     cloud_state: Any = None
     core_authority: PreparedAuthority | None = None
     provider_kind: str | None = None
+    action_outcome: str | None = None
 
 
 def parse_cloud_command(
@@ -600,7 +602,8 @@ def approve_pending_action(
         status="answered",
         answer=answer,
         local_state=result.local_state,
-        cloud_state=result.cloud_state
+        cloud_state=result.cloud_state,
+        action_outcome=calendar_action_outcome(action_result),
     )
 
 
