@@ -251,6 +251,10 @@ def current_public_query(value):
 def research_job_export_record(topic, original_request):
     """Persist only the actual current user's bounded public task, not an offer marker."""
     task = current_external_task()
+    from core.workflow_continuity import approved_research_record
+    continuation = approved_research_record(topic, original_request) if task is not None else None
+    if continuation is not None:
+        return continuation
     if (task is None or _key(original_request) != _key(task.raw)
             or current_public_query(topic) is None):
         return None
@@ -426,6 +430,10 @@ def eligible_public_service_result(tool_name, result):
 def _route_payload_allowed(task, payload):
     """Exact current-route fields; configured aliases never become generic public data."""
     raw = task.raw
+    from core.workflow_continuity import route_request_text
+    continuation = route_request_text()
+    if continuation is not None:
+        raw = continuation
     if (_NEGATIVE.search(raw) or any(c in raw for c in ('"', '“', '”', '`', '\n', '\r', ';'))
             or not re.match(r'^(?:(?:please|mairon|bro)[, ]+)?(?:(?:can|could|would) you (?:please )?)?'
                             r'(?:how long|how far|what(?:\x27s| is)|give me|show me|calculate|find|plan|drive|driving|directions|route)\b', raw, re.I)

@@ -2682,6 +2682,9 @@ def get_pending_night_routine(
     rather than trusting stale conversational state.
     """
 
+    from core.workflow_continuity import managed, pending_night
+    if managed():
+        return pending_night()
     # Historical/model-authored system prose cannot recreate permission.
     return pending_night_authority(conversation)
 
@@ -2982,6 +2985,9 @@ def handle_pending_night_routine_reply(
     if authority is None:
         return None
     target_date = authority.target_date
+    from core.workflow_continuity import active
+    if active() is not None:
+        active().clear('night')
 
     print(
         "[Core] Night routine: completing work-location context "
@@ -4318,6 +4324,9 @@ def get_latest_route_context(
     without asking Qwen to reconstruct them from scratch.
     """
 
+    from core.workflow_continuity import managed, route_context
+    if managed():
+        return route_context()
     if not conversation:
         return None
 
@@ -4392,6 +4401,7 @@ def is_route_request(
         "what is the eta",
         "directions to",
         "route to",
+        "route from",
     ]
 
     if any(
@@ -5041,6 +5051,8 @@ def finalise_route_request(
     # follow-ups such as "what if I go through X instead?"
     # --------------------------------------------------
 
+    from core.workflow_continuity import publish_route
+    publish_route(arguments, route_result)
     route_context = (
         build_route_context_marker(
             arguments=arguments,
@@ -5145,7 +5157,9 @@ def handle_route_followup_request(
     if not origin or not destination:
         return None
 
-    if is_normal_route_followup(
+    from core.workflow_continuity import current_entry, _route_reply
+    trusted_reply = _route_reply(user_input) if current_entry('route') is not None else None
+    if trusted_reply == [] or is_normal_route_followup(
         user_input
     ):
         return execute_core_route(
@@ -8163,6 +8177,9 @@ def get_pending_research_proposal(
     in another chat cannot make a short "yeah" launch research unexpectedly.
     """
 
+    from core.workflow_continuity import managed, research_proposal
+    if managed():
+        return research_proposal()
     resolved_ids = set()
 
     for message in reversed(
@@ -8232,6 +8249,9 @@ def _build_research_marker_result(
     marker_prefix=None,
     marker_payload=None,
 ):
+    from core.workflow_continuity import publish_research
+    if marker_prefix == PENDING_RESEARCH_PROPOSAL_PREFIX:
+        publish_research(marker_payload)
     working_conversation = list(
         conversation
     )
@@ -8287,6 +8307,12 @@ def handle_pending_research_permission_reply(
     if decision is None:
         return None
 
+    from core.workflow_continuity import consume_research
+    workflow_authority = consume_research(pending, decision)
+    if workflow_authority is None:
+        return _build_research_marker_result(conversation=conversation, user_input=user_input,
+            answer="Please restate the public research topic so I can ask for fresh permission.")
+
     proposal_id = str(
         pending.get(
             "proposal_id"
@@ -8313,6 +8339,7 @@ def handle_pending_research_permission_reply(
         )
 
     job = create_research_job(
+        workflow_authority=workflow_authority,
         topic=pending.get(
             "topic"
         ),
@@ -11864,6 +11891,8 @@ def _get_response_impl(
     )
 
 
+    from core.provider_state import bounded_local_history
+    conversation = bounded_local_history(conversation)
     if conversation is None:
         conversation = [
             {
@@ -11960,6 +11989,14 @@ def _get_response_impl(
         )
     )
 
+    from core.workflow_continuity import active
+    workflow = active()
+    if (pending_research_proposal is None and workflow is not None
+            and workflow.research_restatement_required
+            and classify_research_permission_reply(user_input)):
+        return _build_research_marker_result(conversation=conversation, user_input=user_input,
+            answer="Please restate the public research topic so I can ask for fresh permission.")
+
     if pending_research_proposal:
         research_permission_result = (
             handle_pending_research_permission_reply(
@@ -12013,6 +12050,11 @@ def _get_response_impl(
         )
     )
 
+    from core.workflow_continuity import active, _route_reply
+    if active() is not None and _route_reply(user_input) is not None and not previous_route_context:
+        return _build_research_marker_result(conversation=conversation, user_input=user_input,
+            answer="Please restate the route's origin, destination and travel mode so I can calculate that safely.")
+
     if previous_route_context:
         route_followup_result = (
             handle_route_followup_request(
@@ -12027,6 +12069,11 @@ def _get_response_impl(
 
         if route_followup_result is not None:
             return route_followup_result
+
+        from core.workflow_continuity import current_entry
+        if current_entry('route') is not None:
+            return _build_research_marker_result(conversation=conversation, user_input=user_input,
+                answer="Via stops are supported for driving. Please restate the origin, destination and travel mode for a different trip.")
 
     # --------------------------------------------------
     # New route/travel-time questions use a constrained

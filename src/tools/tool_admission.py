@@ -58,6 +58,7 @@ _WRITES = frozenset({
     "disable_wake_alarm", "save_memory", "delete_memory",
 })
 _NO_TOOL_INTENTS = frozenset({
+    "workflow_continuation",
     "calendar_event_creation_request", "launch_application", "order_status",
     "email_search", "self_correction", "conversation_recall", "acknowledge",
     "casual_conversation", "share_context", "share_opinion",

@@ -1197,6 +1197,7 @@ def create_research_job(
     priority: str = "background",
     depth: str = "deep",
     metadata: Optional[dict] = None,
+    workflow_authority=None,
 ) -> dict:
     topic_value = _normalise_space(
         topic
@@ -1225,6 +1226,10 @@ def create_research_job(
         original_request_value = (
             goal_value
         )
+
+    if workflow_authority is not None:
+        from core.workflow_continuity import require_research_creation
+        require_research_creation(workflow_authority, topic_value, goal_value, original_request_value)
 
     existing = find_active_research_job(
         topic_value
@@ -1284,6 +1289,9 @@ def create_research_job(
     )
 
     with _connect() as connection:
+        if workflow_authority is not None:
+            require_research_creation(workflow_authority, topic_value, goal_value,
+                original_request_value, export_record=export_record, final=True)
         connection.execute(
             """
             INSERT INTO research_jobs (

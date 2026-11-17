@@ -24,6 +24,8 @@ from core.critical_response_safety import (
 )
 
 from core.provider_state import bounded_local_history
+from core.workflow_continuity import WorkflowState, preparing
+from core.history_projection import ActionProjection
 from core.conversation_state import (
     ConversationState,
     append_visible_turn_to_model_history,
@@ -268,6 +270,10 @@ class MaironApplication:
             new_session_id()
         )
 
+        self.workflow_state = WorkflowState(self.session_id)
+        self._delivery_projected = set()
+        self._delivery_notified = set()
+
         self._research_delivery_consumer_id = (
             "application-"
             + str(
@@ -276,6 +282,8 @@ class MaironApplication:
             + "-"
             + self.session_id
         )
+
+        self._pending_history_records = {}
 
         self._pending: Optional[
             _PendingApproval
@@ -340,6 +348,9 @@ class MaironApplication:
         if self._pending is not None:
             return None
 
+        if not self.retry_pending_history():
+            return None
+
         consumer_id = (
             self._research_delivery_consumer_id
         )
@@ -399,12 +410,15 @@ class MaironApplication:
                     )
                     == marker
                     for turn in existing_turns
-                    if isinstance(
-                        turn,
-                        dict,
-                    )
+                    if is_research_delivery_turn(turn)
                 )
             )
+
+            if already_persisted:
+                persisted = [t for t in existing_turns if is_research_delivery_turn(t) and t.get('user_text') == marker]
+                if len(persisted) != 1 or persisted[0].get('assistant_text') != answer:
+                    raise RuntimeError("Persisted research delivery does not match the verified report.")
+                answer = persisted[0]['assistant_text']
 
             session_was_empty = (
                 len(
@@ -417,6 +431,7 @@ class MaironApplication:
                 record_chat_turn(
                     session_id=self.session_id,
                     user_text=marker,
+                    operation_id=marker,
                     assistant_text=answer,
                     channel="research",
                     response_seconds=0.0,
@@ -444,17 +459,15 @@ class MaironApplication:
                         ],
                     )
 
-            self.local_state = (
-                append_research_delivery_to_model_history(
-                    current_state=(
-                        self.local_state
-                    ),
-                    assistant_text=answer,
-                    system_instructions=(
-                        self.instructions
-                    ),
+            if marker not in self._delivery_projected or self.local_state is None:
+                self.local_state = (
+                    append_research_delivery_to_model_history(
+                        current_state=self.local_state,
+                        assistant_text=answer,
+                        system_instructions=self.instructions,
+                    )
                 )
-            )
+                self._delivery_projected.add(marker)
 
             # A proactive local research delivery is not a cloud Responses
             # completion. It invalidates any earlier ephemeral cloud handle.
@@ -470,7 +483,20 @@ class MaironApplication:
                 ),
             )
 
+            # A nonthrowing trusted completion call is the incumbent commit
+            # contract. Legacy adapters return only presentation metadata; if
+            # lifecycle fields are supplied, they must agree with this claim.
+            if (not isinstance(completed, dict)
+                    or ('id' in completed and completed['id'] != job['id'])
+                    or ('delivery_status' in completed and completed['delivery_status'] != 'delivered')
+                    or ('delivered_session_id' in completed and completed['delivered_session_id'] != self.session_id)):
+                raise RuntimeError("Research delivery acknowledgement could not be confirmed.")
             self.last_assistant_answer = answer
+            if marker in self._delivery_notified:
+                return None
+            # Set immediately before publication. An interrupted UI return can
+            # be recovered from the durable transcript, never re-notified twice.
+            self._delivery_notified.add(marker)
 
             self._emit_event(
                 "[Research] Delivered verified report: "
@@ -523,6 +549,16 @@ class MaironApplication:
     # Chat sessions
     # --------------------------------------------------
 
+    def retry_pending_history(self):
+        """Retry persistence only, never Calendar insertion or visible projection."""
+        for operation, payload in list(self._pending_history_records.items()):
+            try:
+                record_chat_turn(**payload)
+            except Exception:
+                continue
+            self._pending_history_records.pop(operation, None)
+        return not self._pending_history_records
+
     def new_chat(
         self,
     ) -> dict:
@@ -539,6 +575,8 @@ class MaironApplication:
                 "Resolve the pending approval before starting a new chat."
             )
 
+        if not self.retry_pending_history():
+            raise RuntimeError("A visible calendar outcome is not saved yet. Retry before switching chats.")
         self.core.reset_conversation_state()
 
         self.local_state = None
@@ -550,6 +588,10 @@ class MaironApplication:
         self.session_id = (
             new_session_id()
         )
+
+        self.workflow_state = WorkflowState(self.session_id)
+        self._delivery_projected = set()
+        self._delivery_notified = set()
 
         self._research_delivery_consumer_id = (
             "application-"
@@ -655,6 +697,9 @@ class MaironApplication:
             == self.session_id
         )
 
+        if not self.retry_pending_history():
+            raise RuntimeError("The previous action outcome must be saved before deleting a chat.")
+
         deleted = delete_chat_session(
             session_value
         )
@@ -703,6 +748,8 @@ class MaironApplication:
                 "Resolve the pending approval before switching chats."
             )
 
+        if not self.retry_pending_history():
+            raise RuntimeError("A visible calendar outcome is not saved yet. Retry before switching chats.")
         session = load_chat_session(
             session_id
         )
@@ -824,6 +871,10 @@ class MaironApplication:
             ]
         )
 
+        self.workflow_state = WorkflowState(self.session_id)
+        self._delivery_projected = {turn['user_text'] for turn in turns if is_research_delivery_turn(turn)}
+        self._delivery_notified = set(self._delivery_projected)
+
         self._research_delivery_consumer_id = (
             "application-"
             + str(
@@ -877,6 +928,12 @@ class MaironApplication:
                 ),
                 channel=channel_value,
             )
+
+        if not self.retry_pending_history():
+            return ApplicationTurn(status="error", user_text=text,
+                answer="The previous action outcome is still waiting to be saved. Please retry before continuing this chat.",
+                channel=channel_value)
+        self.workflow_state.begin(text, self.session_id)
 
         # P0: Do not fetch the web or ask the model to decide whether to
         # ignore an explicit spoiler boundary, suggest destructive recovery
@@ -1021,7 +1078,8 @@ class MaironApplication:
         # Core routing/workflows
         # --------------------------------------------------
 
-        preparation = prepare_core_turn(self.core, text)
+        with preparing(self.workflow_state, self.session_id, text):
+            preparation = prepare_core_turn(self.core, text)
         if preparation.status == "unavailable":
             self._emit_event("[Core] Preparation unavailable; provider continuation blocked.")
             return self._finalize_error(
@@ -1276,6 +1334,7 @@ class MaironApplication:
                     self.cloud_state,
                     core_authority=core_authority,
                     state_owner_id=self.session_id,
+                    workflow_state=getattr(self, 'workflow_state', None),
                 )
 
         except Exception as exc:
@@ -1296,7 +1355,8 @@ class MaironApplication:
             )
 
         self.local_state = (
-            result.local_state
+            result.history_projection.base if result.status == "action_approval_required" and isinstance(result.history_projection, ActionProjection)
+            else result.local_state
         )
 
         self.cloud_state = (
@@ -1466,6 +1526,10 @@ class MaironApplication:
         result = (
             pending.router_result
         )
+        if isinstance(result.history_projection, ActionProjection):
+            result.history_projection.base = bounded_local_history(self.local_state)
+        if pending.kind == "cloud" and approved:
+            self.workflow_state.clear()
 
         try:
             if pending.kind == "cloud":
@@ -1479,6 +1543,7 @@ class MaironApplication:
                             self.cloud_state,
                             core_authority=pending.core_authority,
                             state_owner_id=self.session_id,
+                            workflow_state=getattr(self, 'workflow_state', None),
                         )
                     )
 
@@ -1492,6 +1557,7 @@ class MaironApplication:
                             self.cloud_state,
                             core_authority=pending.core_authority,
                             state_owner_id=self.session_id,
+                            workflow_state=getattr(self, 'workflow_state', None),
                         )
                     )
 
@@ -1534,7 +1600,8 @@ class MaironApplication:
             )
 
         self.local_state = (
-            result.local_state
+            result.history_projection.base if result.status == "action_approval_required" and isinstance(result.history_projection, ActionProjection)
+            else result.local_state
         )
 
         self.cloud_state = (
@@ -1732,6 +1799,7 @@ class MaironApplication:
             agent_action=agent_action,
             action_confirmed=action_confirmed,
             provider_kind=getattr(result, "provider_kind", None),
+            history_projection=getattr(result, "history_projection", None),
         )
 
     def _finalize_error(
@@ -1890,6 +1958,7 @@ class MaironApplication:
         agent_action: Optional[str] = None,
         action_confirmed: bool = False,
         provider_kind: Optional[str] = None,
+        history_projection=None,
     ) -> ApplicationTurn:
         safe_answer, violation = sanitise_visible_response(
             user_text,
@@ -1905,6 +1974,11 @@ class MaironApplication:
             # A cloud handle cannot be edited like a list of messages.
             self.cloud_state = None
             answer = safe_answer
+
+        if isinstance(history_projection, ActionProjection):
+            self.local_state = history_projection.project(user_text, safe_answer, self.instructions)
+            answer = safe_answer
+            self.cloud_state = None
 
         if status == "answered" and provider_kind == "cloud":
             # Project only the final, sanitised visible exchange into local
@@ -1943,8 +2017,14 @@ class MaironApplication:
                 )
             )
 
+        operation = history_projection.operation_id if isinstance(history_projection, ActionProjection) else None
+        if operation:
+            self._pending_history_records[operation] = dict(session_id=self.session_id, user_text=user_text,
+                assistant_text=answer, channel=channel, response_seconds=response_seconds,
+                core_state=self.core.conversation_state, operation_id=operation)
         try:
             record_chat_turn(
+                **({"operation_id": operation} if operation else {}),
                 session_id=(
                     self.session_id
                 ),
@@ -1960,6 +2040,8 @@ class MaironApplication:
                 ),
             )
 
+            if operation:
+                self._pending_history_records.pop(operation, None)
             self._schedule_semantic_title_if_first_turn(
                 session_id=(
                     self.session_id

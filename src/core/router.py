@@ -9,6 +9,8 @@ from core.provider_state import (
 
 from core.authority_handoff import PreparedAuthority, CoreAuthorityUnavailable
 from tools.tool_admission import provider_turn
+from core.workflow_continuity import workflow_turn
+from core.history_projection import ActionProjection
 from core.action_approval import issue_calendar_ticket
 from core.cloud_export import (
     CloudExportDenied, issue_cloud_export_grant, admit_cloud_initial,
@@ -34,6 +36,8 @@ class RouteResult:
     core_authority: PreparedAuthority | None = None
     provider_kind: str | None = None
     action_outcome: str | None = None
+    history_projection: Any = None
+    _resolved: Any = None
 
 
 def parse_cloud_command(
@@ -248,6 +252,7 @@ def route_message(
     *,
     core_authority: PreparedAuthority,
     state_owner_id: str | None = None,
+    workflow_state=None,
 ):
     if not isinstance(core_authority, PreparedAuthority):
         raise CoreAuthorityUnavailable("Trusted Core authority is unavailable.")
@@ -372,7 +377,7 @@ def route_message(
         )
     )
 
-    with provider_turn(core_authority, state_owner_id=state_owner_id):
+    with workflow_turn(workflow_state, state_owner_id, core_authority), provider_turn(core_authority, state_owner_id=state_owner_id):
         raw_local_result = local_ai["module"].get_response(
             local_ai["client"],
             clean_input,
@@ -396,6 +401,7 @@ def route_message(
                 core_authority=core_authority,
             )
         return RouteResult(
+            history_projection=ActionProjection(bounded_local_history(local_state), clean_input),
             approval_ticket=ticket,
             status="action_approval_required",
             pending_prompt=clean_input,
@@ -442,10 +448,14 @@ def approve_cloud_escalation(
     *,
     core_authority: PreparedAuthority,
     state_owner_id: str | None = None,
+    workflow_state=None,
 ):
     if not isinstance(core_authority, PreparedAuthority):
         raise CoreAuthorityUnavailable("Trusted Core authority is unavailable.")
     core_authority.require_cloud()
+    from core.workflow_continuity import WorkflowState
+    if isinstance(workflow_state, WorkflowState) and workflow_state.valid(state_owner_id):
+        workflow_state.clear()
     if cloud_ai is None:
         return RouteResult(
             status="answered",
@@ -522,6 +532,7 @@ def decline_cloud_escalation(
     *,
     core_authority: PreparedAuthority,
     state_owner_id: str | None = None,
+    workflow_state=None,
 ):
     if not isinstance(core_authority, PreparedAuthority):
         raise CoreAuthorityUnavailable("Trusted Core authority is unavailable.")
@@ -538,7 +549,7 @@ def decline_cloud_escalation(
         )
     )
 
-    with provider_turn(core_authority, state_owner_id=state_owner_id):
+    with workflow_turn(workflow_state, state_owner_id, core_authority), provider_turn(core_authority, state_owner_id=state_owner_id):
         raw_local_result = local_ai["module"].get_response(
             local_ai["client"],
             prompt,
@@ -560,6 +571,7 @@ def decline_cloud_escalation(
                 core_authority=core_authority,
             )
         return RouteResult(
+            history_projection=ActionProjection(bounded_local_history(local_state), prompt),
             approval_ticket=ticket,
             status="action_approval_required",
             pending_prompt=prompt,
@@ -585,6 +597,8 @@ def approve_pending_action(
     Execute an action only after explicit user approval.
     """
 
+    if result._resolved is not None:
+        return result._resolved
     action = result.pending_action
 
     action_result = (
@@ -598,13 +612,13 @@ def approve_pending_action(
         action_result
     )
 
-    return RouteResult(
-        status="answered",
-        answer=answer,
-        local_state=result.local_state,
-        cloud_state=result.cloud_state,
-        action_outcome=calendar_action_outcome(action_result),
+    projection = result.history_projection or ActionProjection(result.local_state, result.pending_prompt or getattr(getattr(result.core_authority, 'turn', None), 'raw_text', ''))
+    result._resolved = RouteResult(
+        status="answered", answer=answer, local_state=result.local_state,
+        cloud_state=None, action_outcome=calendar_action_outcome(action_result),
+        history_projection=projection,
     )
+    return result._resolved
 
 
 def decline_pending_action(
@@ -614,6 +628,8 @@ def decline_pending_action(
     Reject the pending action without changing anything.
     """
 
+    if result._resolved is not None:
+        return result._resolved
     if result.approval_ticket is not None:
         result.approval_ticket.revoke()
 
@@ -637,9 +653,9 @@ def decline_pending_action(
             "Action cancelled. Nothing was changed."
         )
 
-    return RouteResult(
-        status="answered",
-        answer=answer,
-        local_state=result.local_state,
-        cloud_state=result.cloud_state
+    projection = result.history_projection or ActionProjection(result.local_state, result.pending_prompt or getattr(getattr(result.core_authority, 'turn', None), 'raw_text', ''))
+    result._resolved = RouteResult(
+        status="answered", answer=answer, local_state=result.local_state,
+        cloud_state=None, action_outcome="not_attempted", history_projection=projection,
     )
+    return result._resolved

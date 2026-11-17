@@ -309,6 +309,8 @@ def attach_night_pending(message, grant):
         grant._pending_issued = True
         result = NightClarificationMessage(message)
         result._night_pending = _PendingNight(grant.target_date, grant._turn.owner, grant._created, _ISSUER)
+        from core.workflow_continuity import publish_night
+        publish_night(result._night_pending)
         return result
 
 

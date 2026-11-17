@@ -317,6 +317,13 @@ def route_epistemic_authority(
             ),
         )
 
+    if turn.intent == "workflow_continuation":
+        return EpistemicRoute(
+            authority="local_tools", mode="tool_result", verification_required=True,
+            allow_model_memory=False, private_data_required=True,
+            reason="Trusted pending workflow; current-turn final effect admission remains required.",
+        )
+
     if turn.intent in {"local_write_request", "local_write_clarification"}:
         return EpistemicRoute(
             authority="local_tools", mode="tool_result", verification_required=True,

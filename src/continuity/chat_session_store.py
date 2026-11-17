@@ -170,6 +170,10 @@ def initialise_chat_sessions(
         )
 
 
+def _ensure_projection_receipts(connection):
+    connection.execute("CREATE TABLE IF NOT EXISTS chat_projection_receipts (session_id TEXT NOT NULL, operation_id TEXT NOT NULL, turn_id INTEGER NOT NULL, PRIMARY KEY(session_id, operation_id))")
+
+
 def _clean_title_text(
     value: str,
 ) -> str:
@@ -517,6 +521,7 @@ def record_chat_turn(
     response_seconds=None,
     core_state=None,
     db_path=None,
+    operation_id=None,
 ) -> int:
     user_value = str(
         user_text
@@ -577,6 +582,16 @@ def record_chat_turn(
     with _connection(
         db_path
     ) as connection:
+        if operation_id is not None:
+            if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 200:
+                raise ValueError("Invalid projection operation identity.")
+            _ensure_projection_receipts(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            prior = connection.execute("SELECT t.id, t.user_text, t.assistant_text, t.channel FROM chat_projection_receipts r JOIN chat_turns t ON t.id=r.turn_id WHERE r.session_id=? AND r.operation_id=?", (session_value, operation_id)).fetchone()
+            if prior is not None:
+                if (prior['user_text'],prior['assistant_text'],prior['channel']) != (user_value,assistant_value,str(channel or 'text')):
+                    raise ValueError("Projection identity was reused with changed visible content.")
+                return int(prior['id'])
         existing = connection.execute(
             """
             SELECT
@@ -666,6 +681,8 @@ def record_chat_turn(
             ),
         )
 
+        if operation_id is not None:
+            connection.execute("INSERT INTO chat_projection_receipts (session_id, operation_id, turn_id) VALUES (?, ?, ?)", (session_value, operation_id, cursor.lastrowid))
         return int(
             cursor.lastrowid
         )
@@ -816,6 +833,8 @@ def delete_chat_session(
     with _connection(
         db_path
     ) as connection:
+        _ensure_projection_receipts(connection)
+        connection.execute("DELETE FROM chat_projection_receipts WHERE session_id = ?", (session_value,))
         connection.execute(
             """
             DELETE FROM chat_turns

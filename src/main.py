@@ -16,6 +16,8 @@ from core.authority_handoff import (
     CORE_UNAVAILABLE_MESSAGE, prepare_core_turn, seal_prepared_turn,
 )
 from core.provider_state import bounded_local_history
+from core.workflow_continuity import WorkflowState, preparing
+from core.history_projection import project_action_history
 from core.critical_response_safety import sanitise_visible_response
 from core.conversation_state import (
     append_visible_turn_to_model_history,
@@ -545,6 +547,9 @@ last_assistant_answer = None
 # The language model is downstream of Core rather than being allowed to
 # decide every task from scratch.
 mairon_core = MaironCore()
+workflow_state = WorkflowState(TERMINAL_SESSION_ID)
+terminal_delivery_projected = set()
+terminal_delivery_printed = set()
 
 
 def deliver_pending_research_results():
@@ -589,20 +594,23 @@ def deliver_pending_research_results():
                 )
                 return delivered_count
 
-            print(
-                f"Mairon: {answer}"
-            )
-            print()
-
-            local_state = (
-                append_research_delivery_to_model_history(
-                    current_state=local_state,
-                    assistant_text=answer,
-                    system_instructions=(
-                        mairon_instructions
-                    ),
+            delivery_id = str(job['id'])
+            if delivery_id not in terminal_delivery_printed:
+                terminal_delivery_printed.add(delivery_id)
+                print(
+                    f"Mairon: {answer}"
                 )
-            )
+                print()
+
+            if delivery_id not in terminal_delivery_projected:
+                local_state = (
+                    append_research_delivery_to_model_history(
+                        current_state=local_state,
+                        assistant_text=answer,
+                        system_instructions=mairon_instructions,
+                    )
+                )
+                terminal_delivery_projected.add(delivery_id)
 
             # Research is not an eligible cloud response continuation.
             cloud_state = None
@@ -873,6 +881,7 @@ while True:
         continue
 
     response_timer = ResponseTimer()
+    workflow_state.begin(user_input, TERMINAL_SESSION_ID)
 
     # --------------------------------------------------
     # Typed user preference state
@@ -962,7 +971,8 @@ while True:
     # Mairon Core
     # --------------------------------------------------
 
-    preparation = prepare_core_turn(mairon_core, user_input)
+    with preparing(workflow_state, TERMINAL_SESSION_ID, user_input):
+        preparation = prepare_core_turn(mairon_core, user_input)
     if preparation.status == "unavailable":
         print("[Core] Preparation unavailable; provider continuation blocked.")
         emit_final_response(
@@ -1102,6 +1112,7 @@ while True:
                 cloud_state,
                 core_authority=core_authority,
                 state_owner_id=TERMINAL_SESSION_ID,
+                    workflow_state=workflow_state,
             )
 
     except Exception:
@@ -1159,6 +1170,7 @@ while True:
                     cloud_state,
                     core_authority=core_authority,
                     state_owner_id=TERMINAL_SESSION_ID,
+                    workflow_state=workflow_state,
                 )
 
             else:
@@ -1170,6 +1182,7 @@ while True:
                     cloud_state,
                     core_authority=core_authority,
                     state_owner_id=TERMINAL_SESSION_ID,
+                    workflow_state=workflow_state,
                 )
 
         except Exception:
@@ -1240,6 +1253,11 @@ while True:
     # --------------------------------------------------
 
     published_answer = result.answer
+    if result.history_projection is not None:
+        published_answer, _ = sanitise_visible_response(user_input, str(result.answer or ""),
+            action_confirmed=result.action_outcome == "confirmed_created")
+        local_state = project_action_history(result, user_input, published_answer, mairon_instructions)
+        cloud_state = None
     if result.provider_kind == "cloud":
         # The visible history must match what Oliver actually received. If
         # safety changes cloud text, the server-held response ID is no longer

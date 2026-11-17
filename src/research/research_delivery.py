@@ -48,6 +48,8 @@ def is_research_delivery_turn(
     ):
         return False
 
+    if turn.get('channel') != 'research':
+        return False
     return str(
         turn.get(
             "user_text"

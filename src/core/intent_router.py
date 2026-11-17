@@ -1222,6 +1222,10 @@ def classify_turn(user_input: str, conversation_state=None) -> TurnState:
         state.add_reason("empty input")
         return state
 
+    from core.workflow_continuity import bind_followup
+    if bind_followup(state):
+        return state
+
     # SEC-03: Core owns exact values for the five explicit local writes.
     # The opaque request is omitted from TurnState.to_dict/persisted history.
     from core.local_write_authority import parse_local_write, bind_local_write
